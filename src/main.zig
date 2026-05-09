@@ -1,9 +1,12 @@
 const std = @import("std");
 const gguf_reader = @import("gguf/reader.zig");
+const vocab_mod = @import("tokenizer/vocab.zig");
+const bpe = @import("tokenizer/bpe.zig");
 
-// Pull gguf tests into the test binary.
+// Pull tests from sub-modules into the test binary.
 comptime {
     _ = @import("gguf/reader.zig");
+    _ = @import("tokenizer/bpe.zig");
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -29,6 +32,12 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingArg;
         }
         try cmdInfo(out, args[2], io, gpa);
+    } else if (std.mem.eql(u8, args[1], "tokenize")) {
+        if (args.len < 4) {
+            std.debug.print("usage: llmtoy tokenize <model.gguf> <text>\n", .{});
+            return error.MissingArg;
+        }
+        try cmdTokenize(out, args[2], args[3], io, gpa);
     } else {
         try usagePrint(out);
     }
@@ -38,7 +47,8 @@ fn usagePrint(out: *std.Io.Writer) !void {
     try out.writeAll(
         \\llmtoy-zig  —  educational LLM inference
         \\
-        \\  llmtoy info <model.gguf>    print model metadata and tensor summary
+        \\  llmtoy info <model.gguf>              print model metadata and tensor summary
+        \\  llmtoy tokenize <model.gguf> <text>   BPE-encode text, print IDs and decoded tokens
         \\
     );
 }
@@ -99,5 +109,34 @@ fn cmdInfo(out: *std.Io.Writer, path: []const u8, io: std.Io, gpa: std.mem.Alloc
         try out.print("  [{s}] {s}  dims={any}  offset={}\n", .{
             tensor.type_.label(), tensor.name, tensor.dims, tensor.offset,
         });
+    }
+}
+
+fn cmdTokenize(out: *std.Io.Writer, path: []const u8, text: []const u8, io: std.Io, gpa: std.mem.Allocator) !void {
+    var reader = try gguf_reader.GgufReader.open(path, io, gpa);
+    defer reader.deinit();
+
+    var vocab = try vocab_mod.fromGguf(&reader, gpa);
+    defer vocab.deinit();
+
+    try out.print("tokenizer: {s}  vocab: {}  merges: {}\n", .{
+        vocab.model, vocab.tokens.len, vocab.merge_rank.count(),
+    });
+
+    const ids = try bpe.encode(text, &vocab, gpa);
+    defer gpa.free(ids);
+
+    const decoded = try bpe.decode(ids, &vocab, gpa);
+    defer gpa.free(decoded);
+
+    try out.print("input:   \"{s}\"\n", .{text});
+    try out.print("ids:     {any}\n", .{ids});
+    try out.print("decoded: \"{s}\"\n", .{decoded});
+
+    try out.print("\ntokens:\n", .{});
+    for (ids) |id| {
+        if (id < vocab.tokens.len) {
+            try out.print("  {:6}  {s}\n", .{ id, vocab.tokens[id] });
+        }
     }
 }
