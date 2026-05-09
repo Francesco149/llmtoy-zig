@@ -58,6 +58,84 @@ All CI-equivalent checks must pass before committing: `zig build test`.
 Next: Phase 2 — Tokenization (`src/tokenizer/`).
 Load BPE vocab from GGUF metadata, implement encode/decode.
 
+## Zig 0.16 API patterns
+
+We're on Zig **0.16.0**. Many tutorials and older code use pre-0.14 APIs. Key differences:
+
+**Entry point** — main now receives I/O + allocators:
+```zig
+pub fn main(init: std.process.Init) !void {
+    const io  = init.io;           // std.Io context
+    const gpa = init.gpa;          // general-purpose allocator
+    const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena); // []const [:0]const u8
+}
+```
+
+**Stdout/stderr**:
+```zig
+var buf: [8192]u8 = undefined;
+var fw = std.Io.File.stdout().writer(io, &buf);
+const out = &fw.interface;         // *std.Io.Writer
+try out.print("hello {s}\n", .{name});
+try out.flush();                   // always flush before exit
+// stderr: std.debug.print() still works, no io needed
+```
+
+**File I/O** (`std.fs` is deprecated → `std.Io.Dir`):
+```zig
+// open (absolute)
+const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+// open (relative)
+const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+const stat = try std.Io.File.stat(f, io);  // .size: u64
+std.Io.File.close(f, io);
+```
+
+**mmap** — alignment changed, PROT is a packed struct literal:
+```zig
+const mmap = try std.posix.mmap(null, size, .{ .READ = true },
+    .{ .TYPE = .PRIVATE }, file.handle, 0);
+// type: []align(std.heap.page_size_min) u8
+std.posix.munmap(mmap);
+```
+
+**Hash maps** — `std.StringArrayHashMap` gone; use `std.StringHashMap` (managed, unchanged API):
+```zig
+var m = std.StringHashMap(V).init(allocator);
+defer m.deinit();
+try m.put(key, value);
+```
+
+**ArrayList** — `.init()` gone; use `.empty` then pass allocator per-call, or just use `std.ArrayListUnmanaged`:
+```zig
+var list = std.ArrayListUnmanaged(T){};
+defer list.deinit(allocator);
+try list.append(allocator, item);
+```
+
+**Writer in tests** — no `std.io.fixedBufferStream`; use `std.Io.Writer.fixed`:
+```zig
+var buf: [4096]u8 = undefined;
+var w: std.Io.Writer = .fixed(&buf);
+try w.writeAll("hello");
+```
+
+**Testing I/O** — `std.testing.io` available inside tests.
+
+**build.zig** — `root_source_file` moved into `root_module`:
+```zig
+b.addExecutable(.{
+    .name = "foo",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target, .optimize = optimize,
+    }),
+});
+```
+
+**build.zig.zon** — requires `fingerprint` field (run `zig build` once to get the suggested value).
+
 ## Model paths
 
 ```
