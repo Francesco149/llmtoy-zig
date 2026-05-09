@@ -12,7 +12,7 @@
         zig
         zls
         gdb
-        linuxPackages.perf
+        perf
         hyperfine
       ];
 
