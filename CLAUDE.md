@@ -141,6 +141,17 @@ b.addExecutable(.{
 });
 ```
 
+**Block expressions** — blocks produce values via `break :label value`, not "last expression":
+```zig
+const TABLE: [N]T = blk: {
+    var t: [N]T = undefined;
+    // ... fill t ...
+    break :blk t;   // "the value of blk is t"
+};
+```
+Module-level `const` initialisers are implicitly comptime. The label is required because bare
+`break` only exits loops — the label disambiguates block vs. loop.
+
 **build.zig.zon** — requires `fingerprint` field (run `zig build` once to get the suggested value).
 
 ## Model paths
