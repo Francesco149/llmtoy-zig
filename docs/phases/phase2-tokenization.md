@@ -58,6 +58,31 @@ const CP_TO_BYTE: [324]u8 = blk: { ... };
 
 `CP_TO_BYTE` is indexed by codepoint value. `cpIsByteEncoded(cp)` guards the decode path for codepoints that fall outside the 256 valid outputs (e.g. literal unicode in special tokens like `<|im_end|>`).
 
+### Zig aside — `blk: { ... break :blk value }`
+
+Blocks are expressions in Zig. `break :label value` is the only way to produce a value from a block — Zig does not use Rust's "last expression is the return value" convention.
+
+```zig
+const TABLE: [256]u21 = blk: {   // blk: labels this block as an expression
+    var t: [256]u21 = undefined;
+    for (0..256) |i| t[i] = ...;
+    break :blk t;                 // "the value of blk is t"
+};
+```
+
+`blk` is just a conventional name; any identifier works. The label is required because `break` already means "exit a loop" — without a label there would be no way to distinguish "break the enclosing loop" from "break this block and return a value". Labels make the target explicit:
+
+```zig
+blk: {
+    while (true) {
+        break;         // exits the while loop, not blk
+    }
+    break :blk t;     // exits blk with value t
+}
+```
+
+Module-level `const` initialisers are always evaluated at compile time, so the `blk:` block runs at comptime automatically. Writing `comptime blk: { ... }` would be equivalent but redundant at module scope.
+
 ## BPE encoding algorithm
 
 Given a word (a pre-tokenized piece):
