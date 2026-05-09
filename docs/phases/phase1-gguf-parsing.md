@@ -78,6 +78,33 @@ Gemma4 26B A4B (APEX-I-Mini):
   Quants: Q4_K(65) Q3_K(138) Q5_0(48) IQ4_NL(10) Q5_K(2) Q5_1(2) Q6_K(1) F32(392)
 ```
 
+## Zig comptime — two patterns we used
+
+### `comptime _: []const u8` in `MetaValue.format`
+
+`std.fmt` requires any type that wants to be printable to implement a `format` method with this exact signature:
+
+```zig
+pub fn format(self: T, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void
+```
+
+The `comptime fmt` parameter is the format specifier string — whatever you write between `{}` in a format string. `{s}` passes `"s"`, `{d}` passes `"d"`, `{}` passes `""`. It's `comptime` because Zig's format machinery is entirely compile-time: `std.fmt.format` unrolls the whole dispatch tree at compile time, so there's no runtime overhead and format errors are caught at compile time rather than at runtime.
+
+The callee can branch on it: `if (comptime std.mem.eql(u8, fmt, "s")) { ... }`. In `MetaValue.format` we name it `_` because we intentionally ignore the specifier — `MetaValue` always prints the same way regardless of whether you write `{s}` or `{}`. The `comptime` on the parameter is part of the interface contract, not optional.
+
+### `comptime { _ = @import(...); }` in `main.zig`
+
+In Zig, `test` blocks only end up in the test binary if the file that contains them is transitively reachable from the test root (`main.zig`). Every module-level `@import` is already followed by the compiler, so the existing `const gguf_reader = @import("gguf/reader.zig");` would include `reader.zig`'s tests on its own.
+
+The explicit `comptime { _ = @import("gguf/reader.zig"); }` block is a second, named-nothing reference. It says: "include this file's declarations (including its `test` blocks) as a side effect of compilation, and I'm not keeping the result." The practical difference:
+
+| form | creates a binding | intent communicated |
+|------|------------------|---------------------|
+| `const gguf_reader = @import(...)` | yes — `gguf_reader.T` is usable | "I need this module's API" |
+| `comptime { _ = @import(...); }` | no | "include this for its tests, nothing else" |
+
+Both are evaluated at compile time (all `@import` calls are inherently comptime). The comptime block is a guard: if the runtime import were removed later during a refactor, the tests would silently disappear without it. The explicit block makes the test-inclusion intent survive independently.
+
 ## Next
 
 Phase 2: tokenization — load the BPE vocabulary from GGUF metadata and implement
