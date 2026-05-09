@@ -53,9 +53,10 @@ All CI-equivalent checks must pass before committing: `zig build test`.
 
 ## Current phase
 
-**Phase 0 — Foundation.** See `docs/roadmap.md` for the full plan.
+**Phase 1 complete.** See `docs/roadmap.md` for the full plan.
 
-Next: Phase 1 — GGUF parsing (`src/gguf/`).
+Next: Phase 2 — Tokenization (`src/tokenizer/`).
+Load BPE vocab from GGUF metadata, implement encode/decode.
 
 ## Model paths
 

@@ -7,7 +7,7 @@ Each phase is a self-contained educational unit: runnable, tested, and documente
 - [x] Git repo, conventions, CLAUDE.md
 - [ ] `scripts/build.sh` convenience wrapper
 
-## Phase 1 — GGUF Parsing
+## Phase 1 — GGUF Parsing ✓
 - Parse GGUF v3 header + metadata
 - Memory-map model weights (zero-copy)
 - CLI: `llmtoy info <model.gguf>` — print model metadata
