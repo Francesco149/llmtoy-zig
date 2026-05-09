@@ -25,12 +25,16 @@ Root stays clean — no extra files at the top level.
 
 ## Build & test
 
+**Always use the Nix flake dev shell** — `zig` is not on PATH outside it.
+Claude Code must prefix every zig invocation with `nix develop --command`:
+
 ```sh
-nix develop          # enter dev shell (once per terminal)
-zig build            # compile
-zig build run        # run
-zig build test       # unit tests
+nix develop --command zig build
+nix develop --command zig build test
+nix develop --command ./zig-out/bin/llmtoy info <model>
 ```
+
+In a human terminal, `nix develop` (or direnv with `.envrc`) enters the shell once.
 
 All CI-equivalent checks must pass before committing: `zig build test`.
 
@@ -40,7 +44,10 @@ All CI-equivalent checks must pass before committing: `zig build test`.
 - **Comments**: only write one when the WHY is non-obvious. No what/how narration.
 - **Tests**: write regression tests for every path as we add it. Old paths get integration tests so we can verify they still work as we restructure.
 - **Benchmarks**: document with hyperfine. Store results in `docs/benchmarks/` so we can track the progression.
-- **Commits**: co-author with Claude (`Co-Authored-By: Claude <noreply@anthropic.com>`).
+- **Commits**: use the user's **global** git identity (never set local git config). Co-author every commit with Claude:
+  ```
+  Co-Authored-By: Claude <noreply@anthropic.com>
+  ```
 - **Phases**: each phase has its own doc in `docs/phases/phaseN-*.md` explaining the concepts and implementation choices.
 
 ## Philosophy
@@ -53,10 +60,10 @@ All CI-equivalent checks must pass before committing: `zig build test`.
 
 ## Current phase
 
-**Phase 1 complete.** See `docs/roadmap.md` for the full plan.
+**Phase 2 complete.** See `docs/roadmap.md` for the full plan.
 
-Next: Phase 2 — Tokenization (`src/tokenizer/`).
-Load BPE vocab from GGUF metadata, implement encode/decode.
+Next: Phase 3 — Naive CPU Inference (`src/ops/`).
+Naive matmul, RMSNorm, softmax, SiLU; single-head attention + FFN forward pass; greedy sampling; synthetic tiny-model tests to validate numerics.
 
 ## Zig 0.16 API patterns
 
@@ -107,9 +114,9 @@ defer m.deinit();
 try m.put(key, value);
 ```
 
-**ArrayList** — `.init()` gone; use `.empty` then pass allocator per-call, or just use `std.ArrayListUnmanaged`:
+**ArrayList** — `.init()` gone; pass allocator per-call. `std.ArrayListUnmanaged` requires explicit field init (bare `{}` fails in 0.16):
 ```zig
-var list = std.ArrayListUnmanaged(T){};
+var list: std.ArrayListUnmanaged(T) = .{ .items = &.{}, .capacity = 0 };
 defer list.deinit(allocator);
 try list.append(allocator, item);
 ```

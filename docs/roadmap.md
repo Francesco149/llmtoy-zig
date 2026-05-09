@@ -2,7 +2,7 @@
 
 Each phase is a self-contained educational unit: runnable, tested, and documented in `docs/phases/`.
 
-## Phase 0 — Foundation (current)
+## Phase 0 — Foundation ✓
 - [x] Nix dev shell (zig, zls, perf, gdb, hyperfine)
 - [x] Git repo, conventions, CLAUDE.md
 - [ ] `scripts/build.sh` convenience wrapper
@@ -12,12 +12,12 @@ Each phase is a self-contained educational unit: runnable, tested, and documente
 - Memory-map model weights (zero-copy)
 - CLI: `llmtoy info <model.gguf>` — print model metadata
 
-## Phase 2 — Tokenization
+## Phase 2 — Tokenization ✓
 - Load BPE vocab from GGUF
 - Encode / decode text
 - CLI: `llmtoy tokenize <model.gguf> "hello world"`
 
-## Phase 3 — Naive CPU Inference
+## Phase 3 — Naive CPU Inference (current)
 - Naive (no SIMD) matmul, RMSNorm, softmax, SiLU
 - Single-head attention + FFN forward pass
 - Greedy sampling
