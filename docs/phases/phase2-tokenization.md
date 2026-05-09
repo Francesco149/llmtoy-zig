@@ -79,6 +79,18 @@ Our phase 2 uses a simple whitespace split: words are space-separated, and every
 - numbers (`"42"` may be split differently by tiktoken's digit rules)
 - non-ASCII text
 
+**Concrete artifact — Gemma4 splits `jumps` into `j` + `umps`:**
+
+```
+  245237  Ġ          ← space is its own token
+  236804  j
+   12909  umps
+```
+
+This happens because Gemma4's merge table was trained with the space *included* in the token — `Ġjumps` is a single high-frequency unit in the training corpus. Presented with bare `jumps` (no leading space), the merge `j` + `umps` → `jumps` ranks lower than the merges that build `umps` first (`u`+`m`→`um`, `um`+`p`→`ump`, `ump`+`s`→`umps`), so `j` is left stranded.
+
+The real Gemma4 pre-tokenizer feeds `Ġjumps` as the atomic piece to BPE and gets a single token. Our implementation emits Ġ as a standalone token and strips it from the following piece, producing the artifact above. Qwen3 doesn't exhibit this because it folds the space *into* the word before BPE (`Ġjumps` is the input, not `Ġ` + `jumps`), which is exactly the GPT-2 convention its merge table was trained on.
+
 This is enough to demonstrate the BPE algorithm correctly. A full regex pre-tokenizer is a separate phase.
 
 ## What we built
