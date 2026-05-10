@@ -1,7 +1,11 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Default to native CPU so AVX2/FMA are available out of the box on our
+    // Ryzen 3600/5900x hardware. Override with -Dtarget=<triple> if needed.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .cpu_model = .native },
+    });
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{

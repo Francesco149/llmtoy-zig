@@ -88,55 +88,55 @@ clear the min-rows threshold and gain little. Large FFN matrices (w_gate/w_up/w_
 
 ---
 
-## Step 2: AVX2 SIMD dot product *(planned)*
+## Step 2: AVX2 SIMD dot product
 
-### What it does
+### Changes
 
-Replace the scalar dot-product loop:
+**`build.zig`**: Set default CPU model to `.native` so AVX2/FMA are available
+without a special build flag. This is correct for a single-machine project.
 
-```zig
-var sum: f32 = 0;
-for (row, vec) |w, x| sum += w * x;
-```
-
-with an 8-wide Zig `@Vector` loop that compiles to AVX2 FMA instructions:
+**`math.zig`**: Added `dotf32(a, b)`:
 
 ```zig
-var acc: @Vector(8, f32) = @splat(0);
-var i: usize = 0;
-while (i + 8 <= n) : (i += 8) {
-    const w8: @Vector(8, f32) = row[i..][0..8].*;
-    const x8: @Vector(8, f32) = vec[i..][0..8].*;
-    acc += w8 * x8;
+pub inline fn dotf32(a: []const f32, b: []const f32) f32 {
+    var acc0: @Vector(8, f32) = @splat(0.0);
+    var acc1: @Vector(8, f32) = @splat(0.0);
+    var acc2: @Vector(8, f32) = @splat(0.0);
+    var acc3: @Vector(8, f32) = @splat(0.0);
+    var i: usize = 0;
+    while (i + 32 <= n) : (i += 32) {
+        acc0 += a[i+ 0..][0..8].* * b[i+ 0..][0..8].*;
+        acc1 += a[i+ 8..][0..8].* * b[i+ 8..][0..8].*;
+        acc2 += a[i+16..][0..8].* * b[i+16..][0..8].*;
+        acc3 += a[i+24..][0..8].* * b[i+24..][0..8].*;
+    }
+    // ... 8-element tail, scalar tail ...
 }
-var sum = @reduce(.Add, acc);
-// handle tail
 ```
 
-Each VFMADD instruction processes 8 f32 values per cycle. The Ryzen 3600 has two
-256-bit FMA units → up to 16 FMAs per cycle. The scalar loop does 1 per cycle.
+4 accumulators because Zen 2 has 5-cycle FMA latency + 2 FMA units per cycle →
+need ~10 independent in-flight FMAs to keep both units busy at peak throughput.
+4 × 8 = 32 elements per iteration = 4 FMA ops → not perfect but close.
 
-### Fused Q8_0 dequant+dot
+**`min_rows_per_thread` raised to 512**: Benchmarking showed Linux thread spawn
+is ~200 µs (not 50 µs). With `min_rows=16`, Q8_0 multithreaded was 3× *slower*
+than single-threaded because 1884 spawns × 200 µs = 376 ms overhead per token.
+With `min_rows=512`, wk/wv (128 rows) and wq/wo (896 rows with only 2 threads)
+reduce total spawns to ~636, fixing the regression.
 
-For Q8_0 blocks, the decode is `val = d × qs[i]`. Instead of writing to an
-intermediate `row_buf` and then doing a separate dot, both can be fused:
+### Results (Q4_K_M, Qwen2.5-0.5B)
 
-```
-for each block b:
-    d = scale[b]
-    for i in 0..32 step 8:
-        q8 = load 8 × i8 from qs
-        qf = @intToFloat(@Vector(8, f32), q8)
-        acc += (d × qf) * vec[b*32+i..]
-```
+| Step | Threads | tok/s | vs Phase 4 |
+|------|---------|-------|------------|
+| Phase 4 serial scalar | 1 | 1.45 | — |
+| Phase 5 step 1 (threading, scalar) | 12 | 2.23 | 1.54× |
+| Phase 5 step 2 (SIMD) | 1 | 3.06 | **2.11×** |
+| Phase 5 step 2 (SIMD + threads) | 12 | 4.40 | **3.03×** |
 
-This eliminates one full write+read of `max_cols` floats per row and fits the hot
-data in L1/L2 instead of spilling to L3.
+The SIMD dot product alone is a 2.11× single-thread gain. Measured result implies
+the dot product accounts for ~60% of total per-row time, dequant ~40%.
 
-### Expected gain
-
-2–4× on the dot-product component of each row. Combined with threading:
-~3–6× total vs Phase 4 baseline, targeting 4–8 tok/s on the 0.5B model.
+See `docs/benchmarks/phase5.md` for full hyperfine data and analysis.
 
 ---
 

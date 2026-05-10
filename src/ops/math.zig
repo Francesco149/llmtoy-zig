@@ -38,6 +38,34 @@ pub fn silu(x: f32) f32 {
     return x / (1.0 + @exp(-x));
 }
 
+/// Dot product using 8-wide f32 SIMD with 4 independent accumulators.
+///
+/// 4 accumulators amortise the 5-cycle FMA latency on Zen 2 (2 FMA units,
+/// each with 5-cycle latency → need ~10 in-flight ops; 4 × 8 = 32 elements
+/// per iteration keeps both units busy). For AVX2 each iteration is 4 ×
+/// VFMADD256, processing 32 floats per cycle at peak.
+pub inline fn dotf32(a: []const f32, b: []const f32) f32 {
+    const n = a.len;
+    var acc0: @Vector(8, f32) = @splat(0.0);
+    var acc1: @Vector(8, f32) = @splat(0.0);
+    var acc2: @Vector(8, f32) = @splat(0.0);
+    var acc3: @Vector(8, f32) = @splat(0.0);
+    var i: usize = 0;
+    while (i + 32 <= n) : (i += 32) {
+        acc0 += @as(@Vector(8, f32), a[i +  0 ..][0..8].*) * @as(@Vector(8, f32), b[i +  0 ..][0..8].*);
+        acc1 += @as(@Vector(8, f32), a[i +  8 ..][0..8].*) * @as(@Vector(8, f32), b[i +  8 ..][0..8].*);
+        acc2 += @as(@Vector(8, f32), a[i + 16 ..][0..8].*) * @as(@Vector(8, f32), b[i + 16 ..][0..8].*);
+        acc3 += @as(@Vector(8, f32), a[i + 24 ..][0..8].*) * @as(@Vector(8, f32), b[i + 24 ..][0..8].*);
+    }
+    var acc = (acc0 + acc1) + (acc2 + acc3);
+    while (i + 8 <= n) : (i += 8) {
+        acc += @as(@Vector(8, f32), a[i..][0..8].*) * @as(@Vector(8, f32), b[i..][0..8].*);
+    }
+    var sum = @reduce(.Add, acc);
+    while (i < n) : (i += 1) sum += a[i] * b[i];
+    return sum;
+}
+
 /// Matrix-vector multiply with quantized weight matrix.
 ///
 /// Dequantizes one row at a time into a stack-allocated f32 buffer, computing
@@ -78,9 +106,7 @@ pub fn quantMatvec(
             .q6_k => dq.dequantQ6K(row_data, row),
             else  => unreachable,
         }
-        var sum: f32 = 0.0;
-        for (row, vec) |w, x| sum += w * x;
-        out[i] = sum;
+        out[i] = dotf32(row, vec);
     }
 }
 
@@ -117,9 +143,7 @@ const RowJob = struct {
                 .q6_k => dq.dequantQ6K(row_data, row),
                 else  => unreachable,
             }
-            var sum: f32 = 0.0;
-            for (row, job.vec) |w, x| sum += w * x;
-            job.out[i] = sum;
+            job.out[i] = dotf32(row, job.vec);
         }
     }
 };
@@ -140,8 +164,11 @@ pub fn quantMatvecPar(
     scratch: []f32,   // length >= n_threads * cols
     n_threads: usize,
 ) void {
-    // Minimum rows-per-thread to amortize thread-spawn overhead (~50 µs each).
-    const min_rows_per_thread = 16;
+    // Minimum rows-per-thread to amortize thread-spawn overhead (~200 µs each
+    // on Linux). 512 ensures tiny matrices (e.g. wk/wv at 128 rows) stay
+    // single-threaded, while large matrices (w_gate at 4864 rows) still use
+    // all available threads.
+    const min_rows_per_thread = 512;
     const nt = @min(n_threads, rows / min_rows_per_thread + 1);
 
     if (nt <= 1) {
@@ -234,4 +261,18 @@ test "silu: zero → zero, positive → less than input" {
     try std.testing.expectApproxEqAbs(@as(f32, 0), silu(0), 1e-6);
     // silu(x) < x for x > 0 (sigmoid < 1)
     try std.testing.expect(silu(1.0) > 0 and silu(1.0) < 1.0);
+}
+
+test "dotf32: matches scalar for lengths 1, 7, 8, 32, 33" {
+    inline for ([_]usize{ 1, 7, 8, 32, 33 }) |n| {
+        var a: [n]f32 = undefined;
+        var b: [n]f32 = undefined;
+        var expected: f32 = 0;
+        for (0..n) |i| {
+            a[i] = @as(f32, @floatFromInt(i + 1)) * 0.5;
+            b[i] = @as(f32, @floatFromInt(n - i)) * 0.3;
+            expected += a[i] * b[i];
+        }
+        try std.testing.expectApproxEqAbs(expected, dotf32(&a, &b), 1e-4);
+    }
 }
