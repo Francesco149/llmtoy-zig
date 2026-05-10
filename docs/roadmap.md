@@ -24,10 +24,14 @@ Each phase is a self-contained educational unit: runnable, tested, and documente
 - Synthetic tiny model tests to validate numerics
 
 ## Phase 4 — Full CPU Forward Pass (current)
-- Multi-head / grouped-query attention
-- KV cache
-- Temperature / top-k / top-p sampling
-- End-to-end text generation on a real (small) model
+- [x] Multi-head / grouped-query attention (GQA)
+- [x] RoPE positional embeddings
+- [x] KV cache (incremental decoding)
+- [x] Temperature / top-k / top-p sampling
+- [x] Q8_0 / Q4_K dequantisation (on-the-fly, one row at a time)
+- [x] GGUF weight loader → Config + ModelWeights
+- [x] `generate` CLI command
+- [ ] End-to-end validation on a real dense model
 
 ## Phase 5 — CPU Optimizations
 - AVX2 SGEMM kernel
