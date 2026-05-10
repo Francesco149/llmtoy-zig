@@ -17,13 +17,13 @@ Each phase is a self-contained educational unit: runnable, tested, and documente
 - Encode / decode text
 - CLI: `llmtoy tokenize <model.gguf> "hello world"`
 
-## Phase 3 — Naive CPU Inference (current)
+## Phase 3 — Naive CPU Inference ✓
 - Naive (no SIMD) matmul, RMSNorm, softmax, SiLU
 - Single-head attention + FFN forward pass
 - Greedy sampling
 - Synthetic tiny model tests to validate numerics
 
-## Phase 4 — Full CPU Forward Pass
+## Phase 4 — Full CPU Forward Pass (current)
 - Multi-head / grouped-query attention
 - KV cache
 - Temperature / top-k / top-p sampling

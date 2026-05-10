@@ -60,10 +60,11 @@ All CI-equivalent checks must pass before committing: `zig build test`.
 
 ## Current phase
 
-**Phase 2 complete.** See `docs/roadmap.md` for the full plan.
+**Phase 3 complete.** See `docs/roadmap.md` for the full plan.
 
-Next: Phase 3 — Naive CPU Inference (`src/ops/`).
-Naive matmul, RMSNorm, softmax, SiLU; single-head attention + FFN forward pass; greedy sampling; synthetic tiny-model tests to validate numerics.
+Next: Phase 4 — Full CPU Forward Pass.
+Multi-head / GQA attention, RoPE, KV cache, dequantisation (Q4_K / Q8_0),
+temperature / top-k / top-p sampling, end-to-end generation on a real model.
 
 ## Zig 0.16 API patterns
 
