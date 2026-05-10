@@ -25,14 +25,55 @@ All matmuls in a transformer can be decomposed into `matvec` calls (one per outp
 
 ### `rmsnorm(out, x, weight, eps)`
 
-Root-mean-square normalisation — a cheaper alternative to LayerNorm that omits the mean subtraction. Used at the input of every attention and FFN sub-layer.
+Root-mean-square normalisation — used at the input of every attention and FFN sub-layer.
 
 ```
-rms  = sqrt(mean(x²) + eps)
-out[i] = x[i] / rms * weight[i]
+rms     = sqrt(mean(x²) + eps)
+out[i]  = x[i] / rms * weight[i]
 ```
 
 The `weight` vector is a learned per-dimension scale stored in the model. `eps` (typically 1e-5 or 1e-6) prevents division by zero.
+
+**Relationship to L2 normalisation.** Plain L2 normalisation divides by the vector's magnitude to produce a unit vector:
+
+```
+||x||  = sqrt(Σ xᵢ²)
+out[i] = x[i] / ||x||          → magnitude always = 1
+```
+
+RMS is just the magnitude divided by `sqrt(n)`:
+
+```
+rms(x) = sqrt(Σ xᵢ² / n) = ||x|| / sqrt(n)
+```
+
+So with all-ones weights, `out[i] = x[i] / rms = x[i] * sqrt(n) / ||x||` — the same *direction* as L2-normalised, scaled by `sqrt(n)`. With `x = [1, 2, 3, 4]` and `w = [1, 1, 1, 1]`:
+
+```
+||x||   = sqrt(30) ≈ 5.477
+rms(x)  = sqrt(30/4) ≈ 2.739
+
+L2-norm:  [0.183, 0.365, 0.548, 0.730]   magnitude = 1.0
+RMSNorm:  [0.365, 0.730, 1.095, 1.461]   magnitude = sqrt(4) = 2.0
+          — same direction, exactly sqrt(n) larger
+```
+
+At Qwen3's `d_model = 2048`, the RMSNorm output has magnitude `sqrt(2048) ≈ 45`. The learned `weight` vector then re-scales each dimension independently; after training it encodes which dimensions should be amplified or suppressed.
+
+**Relationship to LayerNorm.** LayerNorm additionally subtracts the mean before normalising:
+
+```
+LayerNorm: out[i] = (x[i] − mean(x)) / std(x) * w[i] + b[i]
+```
+
+The mean subtraction matters when the residual stream accumulates a large constant offset across dimensions. With `x = [100, 101, 102]`:
+
+```
+L2-norm / RMSNorm:  ≈ [0.570, 0.576, 0.581]  — constant offset dominates, tiny spread
+LayerNorm:            [−1.22, 0.0,  +1.22]   — mean stripped, differences preserved
+```
+
+RMSNorm's authors found empirically that the mean subtraction rarely matters for language models (the residual stream doesn't accumulate large constant shifts in practice), so they dropped it — one fewer operation, no bias parameter `b`, same downstream quality.
 
 ### `softmax(x)`
 
