@@ -200,20 +200,19 @@ fn cmdGenerate(
     io: std.Io,
     gpa: std.mem.Allocator,
 ) !void {
-    std.debug.print("loading model {s}...\n", .{path});
+    std.debug.print("loading {s}...\n", .{path});
 
     var reader = try gguf_reader.GgufReader.open(path, io, gpa);
     defer reader.deinit();
 
     const cfg = try loader.configFromGguf(&reader, gpa);
     std.debug.print(
-        "config: d_model={} n_layers={} n_heads={} n_kv_heads={} d_ffn={} vocab={}\n",
-        .{ cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.d_ffn, cfg.vocab_size },
+        "  layers={} heads={}/{} d_model={} d_ffn={} vocab={}\n",
+        .{ cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.d_model, cfg.d_ffn, cfg.vocab_size },
     );
 
     var weights = try loader.loadWeights(&reader, cfg, gpa);
     defer weights.deinit();
-    std.debug.print("weights loaded\n", .{});
 
     var vocab = try vocab_mod.fromGguf(&reader, gpa);
     defer vocab.deinit();
@@ -235,15 +234,16 @@ fn cmdGenerate(
 
     // Prefill: process every prompt token.
     const clk = std.Io.Clock.real;
-    const t_load = clk.now(io);
-    std.debug.print("prefilling {} tokens...\n", .{prompt_ids.len});
+    const t_start = clk.now(io);
+    std.debug.print("prefilling {} prompt tokens...\n", .{prompt_ids.len});
     var last_logits: []f32 = undefined;
     for (prompt_ids, 0..) |tok, pos| {
         if (pos > 0) gpa.free(last_logits);
         last_logits = try fwd.forwardOneModel(tok, pos, &kv, &weights, cfg, gpa);
     }
     const t_prefill = clk.now(io);
-    std.debug.print("prefill done ({} ms)\n", .{@divTrunc(t_load.durationTo(t_prefill).nanoseconds, std.time.ns_per_ms)});
+    const prefill_ms = @divTrunc(t_start.durationTo(t_prefill).nanoseconds, std.time.ns_per_ms);
+    std.debug.print("  prefill: {} ms\n", .{prefill_ms});
 
     // Echo prompt then generate.
     try out.print("{s}", .{prompt});
@@ -252,22 +252,26 @@ fn cmdGenerate(
     var n_gen: u32 = 0;
     var pos: usize = prompt_ids.len;
     while (n_gen < opts.max_tokens) : (n_gen += 1) {
-        const t0 = clk.now(io);
         const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
         gpa.free(last_logits);
 
-        // Decode token; stop on EOS (token 1 is EOS for most models).
+        // Decode token; stop on EOS.
         if (next_tok == 1) break;
 
-        const tok_str = if (next_tok < vocab.tokens.len) vocab.tokens[next_tok] else "<?>";
-        try out.print("{s}", .{tok_str});
+        var tok_buf: [64]u8 = undefined;
+        const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
+        try out.writeAll(tok_buf[0..tok_len]);
         try out.flush();
 
         last_logits = try fwd.forwardOneModel(next_tok, pos, &kv, &weights, cfg, gpa);
-        const t1 = clk.now(io);
-        std.debug.print("tok {} ({} ms)\n", .{ n_gen + 1, @divTrunc(t0.durationTo(t1).nanoseconds, std.time.ns_per_ms) });
         pos += 1;
     }
     gpa.free(last_logits);
     try out.print("\n", .{});
+    try out.flush();
+
+    const t_end = clk.now(io);
+    const gen_ms  = @divTrunc(t_prefill.durationTo(t_end).nanoseconds, std.time.ns_per_ms);
+    const toks_per_s = if (gen_ms > 0) @divTrunc(@as(i96, n_gen) * 1000, gen_ms) else 0;
+    std.debug.print("  generated: {} tokens in {} ms ({} tok/s)\n", .{ n_gen, gen_ms, toks_per_s });
 }

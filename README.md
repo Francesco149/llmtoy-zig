@@ -16,11 +16,44 @@ An educational LLM inference engine written in [Zig](https://ziglang.org/), buil
 
 ```sh
 nix develop          # enter the dev shell (zig, zls, perf, gdb, hyperfine)
-zig build test       # run tests
-zig build run        # run the binary
+zig build            # compile
+zig build test       # run all unit tests
 ```
 
-> First `nix develop` downloads packages; subsequent invocations use the local store — no network hit.
+> `zig` is only on PATH inside the Nix dev shell. First run downloads packages; subsequent runs use the local store.
+
+## Usage
+
+All commands live in `zig-out/bin/llmtoy`. Pass a GGUF model file as the first argument.
+
+```sh
+# Inspect a model's architecture and quantization breakdown
+llmtoy info model.gguf
+
+# Tokenize text and show token IDs + decoded pieces
+llmtoy tokenize model.gguf "hello, world"
+
+# Generate text (greedy, 20 tokens)
+llmtoy generate model.gguf "The capital of France is" \
+    --max-tokens 20 --temperature 0.0
+
+# Generate with sampling (temperature + nucleus)
+llmtoy generate model.gguf "def fibonacci(n):" \
+    --max-tokens 60 --temperature 0.8 --top-p 0.9 --top-k 40
+
+# Flags:  --max-tokens N   --temperature T   --top-p P   --top-k K   --seed S
+```
+
+The `generate` command writes the completed text to stdout and progress/timing to stderr:
+
+```
+loading model.gguf...
+  layers=24 heads=14/2 d_model=896 d_ffn=4864 vocab=151936
+prefilling 5 prompt tokens...
+  prefill: 20314 ms
+The capital of France is Paris.
+  generated: 4 tokens in 16341 ms (0 tok/s)
+```
 
 ## Roadmap
 
@@ -32,8 +65,8 @@ See [docs/roadmap.md](docs/roadmap.md) for the phase-by-phase plan.
 | 1 | GGUF parsing | ✓ |
 | 2 | Tokenization | ✓ |
 | 3 | Naive CPU inference | ✓ |
-| 4 | Full CPU forward pass + sampling | current |
-| 5 | CPU optimizations (SIMD, threading, quant) | planned |
+| 4 | Full CPU forward pass + sampling | ✓ |
+| 5 | CPU optimizations (SIMD, threading) | current |
 | 6 | MoE architecture (Gemma4 / Qwen3.6) | planned |
 | 7 | GPU path (Vulkan or ROCm) | planned |
 | 8 | Multimodal (stretch) | planned |

@@ -144,6 +144,30 @@ fn cpToUtf8(allocator: std.mem.Allocator, cp: u21) ![]u8 {
 
 /// Decode token IDs back to bytes.
 /// Caller owns the returned slice.
+/// Decode a single token to raw UTF-8 bytes into `buf`.
+/// Returns the number of bytes written (0 if token is out of range or empty).
+/// `buf` should be at least 32 bytes; a token is rarely longer than that.
+pub fn decodeOne(id: u32, vocab: *const Vocab, buf: []u8) usize {
+    if (id >= vocab.tokens.len) return 0;
+    const tok = vocab.tokens[id];
+    var out: usize = 0;
+    var pos: usize = 0;
+    while (pos < tok.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(tok[pos]) catch break;
+        if (pos + seq_len > tok.len) break;
+        const cp = std.unicode.utf8Decode(tok[pos..][0..seq_len]) catch break;
+        pos += seq_len;
+        if (cpIsByteEncoded(cp)) {
+            if (out < buf.len) { buf[out] = CP_TO_BYTE[cp]; out += 1; }
+        } else {
+            var tmp: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(cp, &tmp) catch continue;
+            for (tmp[0..n]) |b| { if (out < buf.len) { buf[out] = b; out += 1; } }
+        }
+    }
+    return out;
+}
+
 pub fn decode(token_ids: []const u32, vocab: *const Vocab, allocator: std.mem.Allocator) ![]u8 {
     var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
