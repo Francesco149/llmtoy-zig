@@ -29,10 +29,10 @@ See [docs/roadmap.md](docs/roadmap.md) for the phase-by-phase plan.
 | Phase | Topic | Status |
 |-------|-------|--------|
 | 0 | Foundation — Nix, project structure | ✓ |
-| 1 | GGUF parsing | planned |
-| 2 | Tokenization | planned |
-| 3 | Naive CPU inference | planned |
-| 4 | Full CPU forward pass + sampling | planned |
+| 1 | GGUF parsing | ✓ |
+| 2 | Tokenization | ✓ |
+| 3 | Naive CPU inference | ✓ |
+| 4 | Full CPU forward pass + sampling | current |
 | 5 | CPU optimizations (SIMD, threading, quant) | planned |
 | 6 | MoE architecture (Gemma4 / Qwen3.6) | planned |
 | 7 | GPU path (Vulkan or ROCm) | planned |

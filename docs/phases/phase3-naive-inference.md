@@ -294,6 +294,79 @@ With `x = [0, 1, 0, 0]` instead: neuron 0 produces `silu(0) * 0 = 0` and neuron 
 
 Our target models (Qwen3 and Gemma4) replace the dense FFN with a **Mixture of Experts**: many separate FFN blocks, with a learned router selecting a small subset (e.g. 8 of 256) to activate per token. This is the sparse-activation idea taken to its logical conclusion — rather than having all neurons potentially active and relying on SiLU gating to suppress most of them, only the selected experts run at all. The rest don't consume compute. Phase 6 implements this.
 
+## End-to-end flow
+
+```
+ input text
+      │
+      ▼
+ ┌────────────┐
+ │ Tokenizer  │  BPE encode → token IDs   (Phase 2)
+ └────────────┘
+      │  [t₀, t₁, …, tₙ]
+      ▼
+ ┌────────────┐
+ │ Embedding  │  token_emb[tᵢ] → x[i]    shape: [T × d_model]
+ │  lookup    │
+ └────────────┘
+      │  residual stream  x[0..T]
+      ▼
+ ╔═══════════════════════════════════════════════╗
+ ║  Transformer layer  ×  L                      ║
+ ║                                               ║
+ ║  ┌──────────┐                                 ║
+ ║  │ RMSNorm  │  x̂ = x / rms(x) * w            ║
+ ║  └────┬─────┘                                 ║
+ ║       │                                       ║
+ ║  ┌────▼──────────────────────────────────┐    ║
+ ║  │  Single-head attention                │    ║
+ ║  │                                       │    ║
+ ║  │  Q  = Wq · x̂                         │    ║
+ ║  │  K  = Wk · x̂  (all positions 0..t)   │    ║
+ ║  │  V  = Wv · x̂                         │    ║
+ ║  │                                       │    ║
+ ║  │  scores  = Q · Kᵀ / √head_dim        │    ║
+ ║  │  weights = softmax(scores)  ← causal  │    ║
+ ║  │  out     = Wo · (weights · V)         │    ║
+ ║  └────────────────────────────────────────┘   ║
+ ║       │                                       ║
+ ║  x += out          ← residual add             ║
+ ║       │                                       ║
+ ║  ┌────▼─────┐                                 ║
+ ║  │ RMSNorm  │                                 ║
+ ║  └────┬─────┘                                 ║
+ ║       │                                       ║
+ ║  ┌────▼──────────────────────────────────┐    ║
+ ║  │  SwiGLU FFN                           │    ║
+ ║  │                                       │    ║
+ ║  │  gate   = silu(Wgate · x̂)            │    ║
+ ║  │  up     =      Wup   · x̂             │    ║
+ ║  │  hidden = gate ⊙ up                   │    ║
+ ║  │  out    = Wdown · hidden              │    ║
+ ║  └────────────────────────────────────────┘   ║
+ ║       │                                       ║
+ ║  x += out          ← residual add             ║
+ ╚═══════════════════════════════════════════════╝
+      │  x[T−1]  (last token only)
+      ▼
+ ┌────────────┐
+ │  RMSNorm   │  out_norm
+ └────────────┘
+      │
+      ▼
+ ┌────────────┐
+ │  LM head   │  matvec(lm_head, x) → logits  [vocab_size]
+ └────────────┘
+      │
+      ▼
+ ┌────────────┐
+ │   Greedy   │  argmax(logits) → next token ID
+ └────────────┘
+      │
+      ▼
+ output token
+```
+
 ## Forward pass (`src/model/forward.zig`)
 
 Full causal forward pass over a sequence of `T` tokens:
