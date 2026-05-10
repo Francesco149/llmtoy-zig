@@ -126,21 +126,89 @@ silu(x) = x · sigmoid(x) = x / (1 + exp(−x))
 
 ## Single-head attention (`src/ops/attn.zig`)
 
-Scaled dot-product attention for a single head over a causal prefix of length `seq_len`:
+### The problem attention solves
+
+Each token in a sequence needs to gather information from other tokens to understand its context. "Bank" means something different in "river bank" vs "savings bank" — the surrounding words resolve the ambiguity. Attention is the mechanism by which a token reaches back into the sequence and pulls in relevant context.
+
+The naive solution would be a fixed weighted average of all previous tokens. Attention makes those weights *content-dependent*: each token decides dynamically, based on what it's currently representing, which past tokens are worth attending to.
+
+### Soft lookup: the database analogy
+
+Imagine a key-value database with fuzzy matching:
 
 ```
-scores[i] = dot(q, k[i]) / sqrt(head_dim)     for i = 0..seq_len-1
-weights    = softmax(scores)
-out        = Σ_i  weights[i] · v[i]
+keys:   ["name",     "age", "city" ]
+values: ["Alice",    "30",  "Paris"]
+query:  "location"
 ```
 
-The `1/sqrt(head_dim)` scale prevents scores from growing large when `head_dim` is large, which would saturate softmax and kill the gradients. In inference it's just an empirical detail of how the model was trained.
+A hard lookup fails — "location" doesn't exactly match any key. A soft lookup computes a similarity score between the query and every key, converts the scores to weights via softmax, and returns the weighted sum of values. "location" is most similar to "city", so the output is mostly "Paris" with a small contribution from the others.
 
-Causal masking — preventing position `t` from attending to future positions — is enforced by only passing `k[0..t+1]` and `v[0..t+1]` to the function. The caller controls the visible prefix; no explicit `-inf` masking needed.
+Attention is exactly this, operating on continuous vectors instead of strings. The query, keys, and values are all dense vectors in `ℝ^head_dim`. Dot product measures similarity: `dot(q, k)` is large when the vectors point in similar directions and small (or negative) when they don't.
+
+### Q, K, V projections
+
+The residual stream `x` for each token is a single vector that carries everything the model knows about that token so far. Before the dot-product lookup, three separate linear projections transform it into three distinct roles:
+
+```
+Q = Wq · x    "what am I looking for?"
+K = Wk · x    "how do I present myself as a lookup target?"
+V = Wv · x    "what will I contribute if selected?"
+```
+
+Separating these three roles is the key design choice. A token can be highly *queryable* (a good key to match against) without having anything useful to *contribute* (its value is not informative), and vice versa. The three weight matrices are learned independently, so the model can specialise each role.
+
+In "The cat sat on the mat", when processing "sat":
+- Q encodes "I'm a verb, looking for my subject"
+- K for "cat" encodes "I'm a noun that could be a subject"
+- V for "cat" encodes the full semantic content of "cat"
+- The high Q·K score pulls "cat"'s V into "sat"'s context
+
+### Full computation, traced
+
+With `head_dim = 2` and a 2-token prefix, say positions 0 and 1:
+
+```
+q    = [1.0, 0.0]          ← query for the current position
+k[0] = [0.9, 0.1]          ← key at position 0 (similar to q)
+k[1] = [−0.5, 0.8]         ← key at position 1 (dissimilar)
+
+scores[0] = dot(q, k[0]) / sqrt(2) = 0.90 / 1.41 ≈  0.64
+scores[1] = dot(q, k[1]) / sqrt(2) = −0.50 / 1.41 ≈ −0.35
+
+weights = softmax([0.64, −0.35]) ≈ [0.73, 0.27]
+
+v[0] = [1.0, 2.0]
+v[1] = [3.0, 4.0]
+
+out = 0.73 · [1.0, 2.0] + 0.27 · [3.0, 4.0]
+    = [0.73, 1.46] + [0.81, 1.08]
+    = [1.54, 2.54]
+```
+
+Position 0 contributes 73% of the output because its key matched the query; position 1 still contributes 27% — attention always produces a weighted blend, never a hard selection (unless scores are extreme).
+
+### Why divide by `sqrt(head_dim)`
+
+For random unit vectors in `ℝ^d`, the expected dot product is 0 but the standard deviation is `sqrt(d)`. With `head_dim = 64` (common in practice), random scores have std ≈ 8. Fed into softmax, scores like `[−12, 3, 15]` produce a near-zero/one distribution with no gradient signal — the model can't learn because softmax is already saturated.
+
+Dividing by `sqrt(head_dim)` brings the scores back to O(1) variance regardless of dimension, keeping softmax in its informative, gradient-friendly range.
+
+### Causal masking
+
+A language model generates tokens left to right, so position `t` must not be able to see positions `t+1, t+2, …` — that would be cheating. In our implementation, the caller enforces this by passing only `k[0..t+1]` and `v[0..t+1]` to `sdpAttn`. No explicit `-inf` masking is needed; future positions simply aren't visible.
+
+In training (processing a full sequence in parallel) the mask is usually applied by adding `-inf` to future positions before softmax. `exp(−inf) = 0` zeroes them out cleanly.
+
+### What the weights learn
+
+After training, the three matrices `Wq`, `Wk`, `Wv` in each head encode a learned relationship type. Different heads in a multi-head model tend to specialise: one head might learn syntactic subject-verb agreement, another might learn coreference (matching pronouns to their referents), another might track positional proximity. No single head is designed for this explicitly — it emerges from training.
+
+The output projection `Wo` then mixes the contributions from all heads back into the residual stream dimension, letting the model combine the different relationship types it has discovered.
 
 ### Why the failing test was wrong
 
-An early test tried to show attention "concentrating on the best-matching key" using `head_dim=2` and values `v[0]=[99,99]`, `v[1]=[7,7]`. The score difference was only ~0.7 nats, giving attention weights ≈ (0.33, 0.67) — still blending heavily with the large `v[0]`. The fix: `head_dim=1` with `q=10, k=[−10, 10]` gives scores `(−100, 100)`, softmax collapses to `(~0, ~1)`, and the output is within 1e-3 of `v[1]=7`. A good reminder that attention concentration depends on the *ratio* of scores, not their absolute values.
+An early test tried to show attention "concentrating on the best-matching key" using `head_dim=2` and values `v[0]=[99,99]`, `v[1]=[7,7]`. The score difference was only ~0.7, giving weights ≈ (0.33, 0.67) — still blending heavily with the large `v[0]`. The fix: `head_dim=1` with `q=10, k=[−10, 10]` gives scores `(−100, 100)`, softmax collapses to `(~0, ~1)`, and the output is within 1e-3 of `v[1]=7`. The lesson: concentration depends on the *ratio* of scores (through exp), not their absolute values — and `v[0]=99` being large is irrelevant once its attention weight is near zero.
 
 ## SwiGLU FFN
 
