@@ -7,6 +7,9 @@ const bpe = @import("tokenizer/bpe.zig");
 comptime {
     _ = @import("gguf/reader.zig");
     _ = @import("tokenizer/bpe.zig");
+    _ = @import("ops/math.zig");
+    _ = @import("ops/attn.zig");
+    _ = @import("model/forward.zig");
 }
 
 pub fn main(init: std.process.Init) !void {
