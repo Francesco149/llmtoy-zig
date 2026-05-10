@@ -110,8 +110,58 @@ though the threading multiplier shrinks.
 
 ---
 
-## Next: Step 3 — Fused Q4_K/Q8_0 dequant+dot (planned)
+## Step 3 — Fused Q8_0 dequant + dot (`dotQ8_0`)
 
-Vectorize the dequantization itself. Q4_K nibble unpacking and scale extraction
-can be done with SIMD byte shuffles. Q8_0 can fuse i8→f32 conversion with
-the dot product, eliminating the `row_buf` round-trip entirely.
+Added `dq.dotQ8_0(data, vec)`: processes a Q8_0 row directly against the input
+vector without writing to `row_buf`. Uses `vpmovsxbd` (i8→i32 sign-extend) +
+`vcvtdq2ps` (i32→f32) + `vmulps` in a 32-element unrolled inner loop.
+
+Serial paths in both `quantMatvec` and `RowJob.run` branch on `mat_type == .q8_0`
+before dequant, taking the fused path and skipping `row_buf` entirely.
+
+### Results (30 tokens, ReleaseFast)
+
+| Model | Threads | Step 2 tok/s | Step 3 tok/s | gain |
+|-------|---------|-------------|-------------|------|
+| Q8_0  | 1  | 6.40 | **14.06** | **2.20×** |
+| Q8_0  | 12 | 5.64 | 6.48 | 1.15× |
+| Q4_K_M | 1 | 3.06 | 3.06 | — |
+| Q4_K_M | 12 | 4.40 | 4.40 | — |
+
+### Analysis
+
+**Q8_0 1-thread (2.20×)**: Per-row memory traffic falls from 8.1 KB to 4.5 KB.
+`vpmovsxbd ymm, [mem]` reads 8 bytes and produces 8 i32s in one µop — the i8→f32
+conversion has near-zero marginal cost over the memory load itself.
+
+**Q8_0 12-thread (1.15×)**: Faster per-row work means spawn overhead is a larger
+fraction of total time. Thread pool needed to fully exploit multithreading on
+fast paths.
+
+**Q4_K_M unchanged**: The fused path is Q8_0-only; Q4_K still uses dequant+dotf32.
+
+### Cumulative from Phase 4 baseline (Q4_K_M, 12 threads)
+
+| Phase | tok/s | overall speedup |
+|-------|-------|----------------|
+| 4 serial scalar | 1.45 | — |
+| 5.1 threading | 2.23 | 1.54× |
+| 5.2 SIMD dot | 4.40 | 3.03× |
+| 5.3 fused Q8_0 | 4.40 | 3.03× (Q4_K unchanged) |
+
+### Q8_0 cumulative
+
+| Phase | tok/s |
+|-------|-------|
+| 4 baseline | ~1.5 |
+| 5.2 SIMD dot | 6.40 (1-thread) |
+| 5.3 fused dot | **14.06** (1-thread) |
+
+---
+
+## Next: Step 4 — Vectorized Q4_K dequantization (planned)
+
+The remaining bottleneck for Q4_K is the nibble unpacking and sub-block scale
+extraction in `dequantQ4K`. Vectorizing this with AVX2 byte shuffles would reduce
+the Q4_K dequant cost by 4–8×, pushing Q4_K toward the same memory-bandwidth
+bound that Q8_0 already hits.

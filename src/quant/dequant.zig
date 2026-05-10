@@ -51,6 +51,32 @@ pub fn dequantQ8_0(data: []const u8, out: []f32) void {
     }
 }
 
+/// Fused Q8_0 dequant + dot product against `vec`.
+///
+/// Bypasses the f32 row_buf entirely — i8 values are sign-extended to f32
+/// via vpmovsxbd+vcvtdq2ps and multiplied directly against the vec lane.
+/// Each 32-element block: acc += scale × dot(@floatFromInt(qs[0..32]), vec_chunk)
+pub fn dotQ8_0(data: []const u8, vec: []const f32) f32 {
+    const n_blocks = vec.len / Q8_0_BLOCK_ELEMS;
+    var total: f32 = 0.0;
+    for (0..n_blocks) |b| {
+        const blk = data[b * Q8_0_BLOCK_BYTES ..][0..Q8_0_BLOCK_BYTES];
+        const d   = f16Bytes(blk[0..2]);
+        const qs  = blk[2..][0..Q8_0_BLOCK_ELEMS];
+        const base = b * Q8_0_BLOCK_ELEMS;
+        var acc: @Vector(8, f32) = @splat(0.0);
+        inline for (0..4) |j| {
+            const raw8: @Vector(8, u8)  = qs[j * 8 ..][0..8].*;
+            const qi:   @Vector(8, i8)  = @bitCast(raw8);
+            const qf:   @Vector(8, f32) = @floatFromInt(qi);
+            const vf:   @Vector(8, f32) = vec[base + j * 8 ..][0..8].*;
+            acc += qf * vf;
+        }
+        total += @reduce(.Add, acc) * d;
+    }
+    return total;
+}
+
 // ── Q4_K ──────────────────────────────────────────────────────────────────────
 //
 // Super-block layout (144 bytes for 256 elements):
@@ -239,6 +265,28 @@ test "dequantF16: converts half-precision" {
     dequantF16(&data, &out);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[0], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), out[1], 1e-4);
+}
+
+test "dotQ8_0: matches dequant+scalar-dot" {
+    // Craft 2 Q8_0 blocks and check that dotQ8_0 == sum(dequant * vec)
+    var data: [Q8_0_BLOCK_BYTES * 2]u8 = @splat(0);
+    var vec:  [Q8_0_BLOCK_ELEMS * 2]f32 = undefined;
+    // block 0: scale = 0.5, values = 1..32
+    data[0] = 0x00; data[1] = 0x38; // f16(0.5)
+    for (0..32) |i| data[2 + i] = @intCast(i + 1);
+    // block 1: scale = 0.25, values = -16..15
+    data[Q8_0_BLOCK_BYTES + 0] = 0x00; data[Q8_0_BLOCK_BYTES + 1] = 0x34; // f16(0.25)
+    for (0..32) |i| data[Q8_0_BLOCK_BYTES + 2 + i] = @bitCast(@as(i8, @intCast(@as(i32, @intCast(i)) - 16)));
+    for (&vec, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.1 - 3.0;
+
+    // reference via dequant
+    var decoded: [Q8_0_BLOCK_ELEMS * 2]f32 = undefined;
+    dequantQ8_0(&data, &decoded);
+    var expected: f32 = 0;
+    for (decoded, vec) |d, v| expected += d * v;
+
+    const got = dotQ8_0(&data, &vec);
+    try std.testing.expectApproxEqAbs(expected, got, 1e-3);
 }
 
 test "dequantQ8_0: single block round-trip" {

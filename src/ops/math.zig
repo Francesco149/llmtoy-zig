@@ -96,12 +96,15 @@ pub fn quantMatvec(
 
     for (0..rows) |i| {
         const row_data = mat_data[i * row_bytes ..][0..row_bytes];
+        if (mat_type == .q8_0) {
+            out[i] = dq.dotQ8_0(row_data, vec);
+            continue;
+        }
         const row = row_buf[0..cols];
         switch (mat_type) {
             .f32  => dq.dequantF32(row_data, row),
             .f16  => dq.dequantF16(row_data, row),
             .q5_0 => dq.dequantQ5_0(row_data, row),
-            .q8_0 => dq.dequantQ8_0(row_data, row),
             .q4_k => dq.dequantQ4K(row_data, row),
             .q6_k => dq.dequantQ6K(row_data, row),
             else  => unreachable,
@@ -133,12 +136,15 @@ const RowJob = struct {
         };
         for (0..job.n_rows) |i| {
             const row_data = job.mat_data[(job.row_start + i) * row_bytes ..][0..row_bytes];
+            if (job.mat_type == .q8_0) {
+                job.out[i] = dq.dotQ8_0(row_data, job.vec);
+                continue;
+            }
             const row = job.row_buf[0..job.cols];
             switch (job.mat_type) {
                 .f32  => dq.dequantF32(row_data, row),
                 .f16  => dq.dequantF16(row_data, row),
                 .q5_0 => dq.dequantQ5_0(row_data, row),
-                .q8_0 => dq.dequantQ8_0(row_data, row),
                 .q4_k => dq.dequantQ4K(row_data, row),
                 .q6_k => dq.dequantQ6K(row_data, row),
                 else  => unreachable,
