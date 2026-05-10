@@ -104,6 +104,106 @@ pub fn dequantQ4K(data: []const u8, out: []f32) void {
     }
 }
 
+// ── Q5_0 ──────────────────────────────────────────────────────────────────────
+//
+// Block layout (22 bytes for 32 elements):
+//   [0..1]  f16   scale `d`
+//   [2..5]  u8[4] qh  — 1 high bit per element, packed as a little-endian u32
+//   [6..21] u8[16] qs — 4 low bits per element, 2 per byte (nibble-packed)
+//
+// Dequant: val = d * (x - 16), where x = (nibble | high_bit<<4) ∈ 0..31
+
+pub const Q5_0_BLOCK_ELEMS = 32;
+pub const Q5_0_BLOCK_BYTES = 2 + 4 + Q5_0_BLOCK_ELEMS / 2; // 22
+
+pub fn dequantQ5_0(data: []const u8, out: []f32) void {
+    const n_blocks = out.len / Q5_0_BLOCK_ELEMS;
+    for (0..n_blocks) |b| {
+        const blk = data[b * Q5_0_BLOCK_BYTES ..][0..Q5_0_BLOCK_BYTES];
+        const d   = f16Bytes(blk[0..2]);
+        const qh  = std.mem.readInt(u32, blk[2..6], .little);
+        const qs  = blk[6..22];
+        for (0..16) |j| {
+            const hi0: u8   = @intCast(((qh >> @intCast(j))      & 1) << 4);
+            const hi1: u8   = @intCast(((qh >> @intCast(j + 16)) & 1) << 4);
+            const x0: i32   = @as(i32, (qs[j] & 0x0F) | hi0) - 16;
+            const x1: i32   = @as(i32, (qs[j] >>    4) | hi1) - 16;
+            out[b * Q5_0_BLOCK_ELEMS + j]      = d * @as(f32, @floatFromInt(x0));
+            out[b * Q5_0_BLOCK_ELEMS + j + 16] = d * @as(f32, @floatFromInt(x1));
+        }
+    }
+}
+
+// ── Q6_K ──────────────────────────────────────────────────────────────────────
+//
+// Super-block layout (210 bytes for 256 elements):
+//   [0..127]   u8[128]  ql  — lower 4 bits of each 6-bit value (2 per byte)
+//   [128..191] u8[64]   qh  — upper 2 bits of each 6-bit value (4 per byte)
+//   [192..207] i8[16]   sc  — signed 8-bit scales (one per 16-element sub-group)
+//   [208..209] f16       d  — super-block scale
+//
+// Reconstruction for a pair from ql[l] / ql[l+32] and qh[l]:
+//   q1 = (ql[l]    & 0xF) | ((qh[l] & 0x03) << 4)  — lo nibble, qh bits 0-1
+//   q2 = (ql[l+32] & 0xF) | (((qh[l]>>2) & 0x03) << 4)
+//   q3 = (ql[l]    >>  4) | (((qh[l]>>4) & 0x03) << 4)
+//   q4 = (ql[l+32] >>  4) | (((qh[l]>>6) & 0x03) << 4)
+//   signed_val = cast_i8(q) - 32   →  range −32..31
+//   out = d × sc[sub_group] × signed_val
+
+pub const Q6_K_BLOCK_BYTES = 128 + 64 + 16 + 2; // 210
+
+pub fn dequantQ6K(data: []const u8, out: []f32) void {
+    const n_blocks = out.len / QK_K;
+    for (0..n_blocks) |b| {
+        const blk = data[b * Q6_K_BLOCK_BYTES ..][0..Q6_K_BLOCK_BYTES];
+        const ql  = blk[0..128];
+        const qh  = blk[128..192];
+        const sc  = blk[192..208]; // int8 scales
+        const d   = f16Bytes(blk[208..210]);
+
+        var ql_off: usize = 0;
+        var qh_off: usize = 0;
+        var sc_off: usize = 0;
+        var chunk: usize = 0;
+        while (chunk < QK_K) : ({
+            chunk  += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_off += 8;
+        }) {
+            for (0..32) |l| {
+                const is = l / 16; // 0 or 1 within this chunk's 8 scales
+
+                const q1 = q6val(ql[ql_off + l],      qh[qh_off + l], 0, 0);
+                const q2 = q6val(ql[ql_off + l + 32], qh[qh_off + l], 2, 0);
+                const q3 = q6val(ql[ql_off + l],      qh[qh_off + l], 4, 4);
+                const q4 = q6val(ql[ql_off + l + 32], qh[qh_off + l], 6, 4);
+
+                const s0 = d * @as(f32, @floatFromInt(@as(i8, @bitCast(sc[sc_off + is + 0]))));
+                const s2 = d * @as(f32, @floatFromInt(@as(i8, @bitCast(sc[sc_off + is + 2]))));
+                const s4 = d * @as(f32, @floatFromInt(@as(i8, @bitCast(sc[sc_off + is + 4]))));
+                const s6 = d * @as(f32, @floatFromInt(@as(i8, @bitCast(sc[sc_off + is + 6]))));
+
+                const base = b * QK_K + chunk + l;
+                out[base +  0] = s0 * q1;
+                out[base + 32] = s2 * q2;
+                out[base + 64] = s4 * q3;
+                out[base + 96] = s6 * q4;
+            }
+        }
+    }
+}
+
+/// Reconstruct one signed 6-bit value from its packed parts, subtract 32.
+/// ql_byte: the byte holding the 4 low bits (select lo or hi nibble via ql_shift)
+/// qh_byte: the byte holding the 2 high bits (select the 2-bit field via qh_shift)
+fn q6val(ql_byte: u8, qh_byte: u8, qh_shift: u4, ql_shift: u4) f32 {
+    const lo4: u8 = (ql_byte >> @intCast(ql_shift)) & 0x0F;
+    const hi2: u8 = (qh_byte >> @intCast(qh_shift)) & 0x03;
+    const raw: u8 = lo4 | (hi2 << 4); // 6-bit value, 0..63
+    return @floatFromInt(@as(i32, raw) - 32);
+}
+
 const ScaleMin = struct { sc: u8, mn: u8 };
 
 fn scaleMin(j: usize, scales: []const u8) ScaleMin {

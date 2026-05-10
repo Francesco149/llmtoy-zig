@@ -255,11 +255,6 @@ pub fn forwardOneModel(
     const up_buf    = try allocator.alloc(f32, ff); defer allocator.free(up_buf);
     const ffn_out   = try allocator.alloc(f32, d);  defer allocator.free(ffn_out);
 
-    // Embedding lookup (dequantize the token's row).
-    const emb = w.token_emb;
-    math.quantMatvec(x[0..1], emb.data, emb.type_, &[_]f32{1.0}, 1, 1, row_buf[0..1]);
-    // Actually we need just one row of the embedding matrix, not a matvec.
-    // Dequantize directly into x.
     embedLookup(x, w.token_emb, token, d, row_buf);
 
     for (0..cfg.n_layers) |l| {
@@ -269,6 +264,11 @@ pub fn forwardOneModel(
         math.quantMatvec(q_all, lw.wq.data, lw.wq.type_, xb, nq,  d, row_buf[0..d]);
         math.quantMatvec(k_new, lw.wk.data, lw.wk.type_, xb, nkv, d, row_buf[0..d]);
         math.quantMatvec(v_new, lw.wv.data, lw.wv.type_, xb, nkv, d, row_buf[0..d]);
+
+        // Add optional per-layer Q/K/V biases (Qwen2 style).
+        if (lw.q_bias) |b| { for (q_all, b) |*q, bv| q.* += bv; }
+        if (lw.k_bias) |b| { for (k_new, b) |*k, bv| k.* += bv; }
+        if (lw.v_bias) |b| { for (v_new, b) |*v, bv| v.* += bv; }
 
         for (0..cfg.n_heads)    |h| rope.applyRope(q_all[h * hd ..][0..hd], pos, cfg.rope_theta);
         for (0..cfg.n_kv_heads) |h| rope.applyRope(k_new[h * hd ..][0..hd], pos, cfg.rope_theta);
@@ -314,16 +314,20 @@ fn embedLookup(out: []f32, mat: mw.RawMatrix, row: u32, cols: usize, row_buf: []
     const row_bytes = switch (mat.type_) {
         .f32  => cols * 4,
         .f16  => cols * 2,
+        .q5_0 => (cols / dq.Q5_0_BLOCK_ELEMS) * dq.Q5_0_BLOCK_BYTES,
         .q8_0 => (cols / dq.Q8_0_BLOCK_ELEMS) * dq.Q8_0_BLOCK_BYTES,
         .q4_k => (cols / dq.QK_K) * dq.Q4_K_BLOCK_BYTES,
+        .q6_k => (cols / dq.QK_K) * dq.Q6_K_BLOCK_BYTES,
         else  => @panic("unsupported embedding quant type"),
     };
     const src = mat.data[@as(usize, row) * row_bytes ..][0..row_bytes];
     switch (mat.type_) {
         .f32  => dq.dequantF32(src, out),
         .f16  => dq.dequantF16(src, out),
+        .q5_0 => dq.dequantQ5_0(src, out),
         .q8_0 => dq.dequantQ8_0(src, out),
         .q4_k => dq.dequantQ4K(src, out),
+        .q6_k => dq.dequantQ6K(src, out),
         else  => unreachable,
     }
 }

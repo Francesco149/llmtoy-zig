@@ -128,6 +128,11 @@ pub fn loadWeights(
         lw.w_gate = try rawMatrix(reader, &tensor_map, try layerName(&name_buf, l, "ffn_gate.weight"),    cfg.d_ffn,    d);
         lw.w_up   = try rawMatrix(reader, &tensor_map, try layerName(&name_buf, l, "ffn_up.weight"),      cfg.d_ffn,    d);
         lw.w_down = try rawMatrix(reader, &tensor_map, try layerName(&name_buf, l, "ffn_down.weight"),    d,            cfg.d_ffn);
+
+        // Optional attention biases (Qwen2 style; not present in all models).
+        lw.q_bias = loadBias(reader, &tensor_map, try layerName(&name_buf, l, "attn_q.bias"), nq,  aa) catch null;
+        lw.k_bias = loadBias(reader, &tensor_map, try layerName(&name_buf, l, "attn_k.bias"), nkv, aa) catch null;
+        lw.v_bias = loadBias(reader, &tensor_map, try layerName(&name_buf, l, "attn_v.bias"), nkv, aa) catch null;
     }
 
     return mw.ModelWeights{
@@ -159,6 +164,24 @@ fn loadNorm(
         .f32  => dq.dequantF32(raw, out),
         .f16  => dq.dequantF16(raw, out),
         .q8_0 => dq.dequantQ8_0(raw, out),
+        else  => return LoadError.UnsupportedQuantType,
+    }
+    return out;
+}
+
+fn loadBias(
+    reader: *const gguf.GgufReader,
+    map: *const std.StringHashMap(types.TensorInfo),
+    name: []const u8,
+    n: usize,
+    allocator: std.mem.Allocator,
+) ![]f32 {
+    const info = map.get(name) orelse return LoadError.MissingTensor;
+    const raw  = reader.tensorBytes(info);
+    const out  = try allocator.alloc(f32, n);
+    switch (info.type_) {
+        .f32  => dq.dequantF32(raw, out),
+        .f16  => dq.dequantF16(raw, out),
         else  => return LoadError.UnsupportedQuantType,
     }
     return out;

@@ -234,11 +234,16 @@ fn cmdGenerate(
     };
 
     // Prefill: process every prompt token.
+    const clk = std.Io.Clock.real;
+    const t_load = clk.now(io);
+    std.debug.print("prefilling {} tokens...\n", .{prompt_ids.len});
     var last_logits: []f32 = undefined;
     for (prompt_ids, 0..) |tok, pos| {
         if (pos > 0) gpa.free(last_logits);
         last_logits = try fwd.forwardOneModel(tok, pos, &kv, &weights, cfg, gpa);
     }
+    const t_prefill = clk.now(io);
+    std.debug.print("prefill done ({} ms)\n", .{@divTrunc(t_load.durationTo(t_prefill).nanoseconds, std.time.ns_per_ms)});
 
     // Echo prompt then generate.
     try out.print("{s}", .{prompt});
@@ -247,6 +252,7 @@ fn cmdGenerate(
     var n_gen: u32 = 0;
     var pos: usize = prompt_ids.len;
     while (n_gen < opts.max_tokens) : (n_gen += 1) {
+        const t0 = clk.now(io);
         const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
         gpa.free(last_logits);
 
@@ -258,6 +264,8 @@ fn cmdGenerate(
         try out.flush();
 
         last_logits = try fwd.forwardOneModel(next_tok, pos, &kv, &weights, cfg, gpa);
+        const t1 = clk.now(io);
+        std.debug.print("tok {} ({} ms)\n", .{ n_gen + 1, @divTrunc(t0.durationTo(t1).nanoseconds, std.time.ns_per_ms) });
         pos += 1;
     }
     gpa.free(last_logits);

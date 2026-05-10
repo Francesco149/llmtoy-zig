@@ -59,8 +59,10 @@ pub fn quantMatvec(
     const row_bytes = switch (mat_type) {
         .f32   => cols * 4,
         .f16   => cols * 2,
+        .q5_0  => (cols / dq.Q5_0_BLOCK_ELEMS) * dq.Q5_0_BLOCK_BYTES,
         .q8_0  => (cols / dq.Q8_0_BLOCK_ELEMS) * dq.Q8_0_BLOCK_BYTES,
         .q4_k  => (cols / dq.QK_K) * dq.Q4_K_BLOCK_BYTES,
+        .q6_k  => (cols / dq.QK_K) * dq.Q6_K_BLOCK_BYTES,
         else   => @panic("unsupported quant type in quantMatvec"),
     };
 
@@ -70,8 +72,10 @@ pub fn quantMatvec(
         switch (mat_type) {
             .f32  => dq.dequantF32(row_data, row),
             .f16  => dq.dequantF16(row_data, row),
+            .q5_0 => dq.dequantQ5_0(row_data, row),
             .q8_0 => dq.dequantQ8_0(row_data, row),
             .q4_k => dq.dequantQ4K(row_data, row),
+            .q6_k => dq.dequantQ6K(row_data, row),
             else  => unreachable,
         }
         var sum: f32 = 0.0;

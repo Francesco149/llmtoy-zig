@@ -31,6 +31,10 @@ pub const LayerWeights = struct {
     w_gate:    RawMatrix, // [d_ffn, d_model]
     w_up:      RawMatrix, // [d_ffn, d_model]
     w_down:    RawMatrix, // [d_model, d_ffn]
+    // Qwen2-style attention biases (optional — null for models that lack them)
+    q_bias: ?[]f32 = null, // [nq]
+    k_bias: ?[]f32 = null, // [nkv]
+    v_bias: ?[]f32 = null, // [nkv] (rare; included for completeness)
 };
 
 pub const ModelWeights = struct {
