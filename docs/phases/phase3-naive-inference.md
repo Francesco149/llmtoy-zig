@@ -146,6 +146,24 @@ A hard lookup fails — "location" doesn't exactly match any key. A soft lookup 
 
 Attention is exactly this, operating on continuous vectors instead of strings. The query, keys, and values are all dense vectors in `ℝ^head_dim`. Dot product measures similarity: `dot(q, k)` is large when the vectors point in similar directions and small (or negative) when they don't.
 
+### Why dot product measures meaning
+
+The dimensions of these vectors are not individually interpretable — you can't point at dimension 847 and say "this one means royalty." Meaning is *distributed*: a concept is encoded as a direction in the full space, spread across many dimensions simultaneously. Individual dimensions look like noise if you inspect them in isolation.
+
+What training produces is a geometry: things that appear in similar contexts get pushed toward similar directions. The dot product then measures how much two vectors overlap directionally — large and positive means pointing the same way (similar meaning/context), near zero means perpendicular (unrelated), negative means opposing.
+
+The classic demonstration is from Word2Vec:
+
+```
+vec("king") − vec("man") + vec("woman") ≈ vec("queen")
+```
+
+No dimension was designed to mean "royalty" or "gender." The model arranged the space so that the *relationship* between concepts is a consistent direction, and vector arithmetic reflects real-world structure.
+
+A consequence of distributing meaning across dimensions: you can fit far more than `d` distinct concepts into `d` dimensions by using *nearly* orthogonal directions. In 2048 dimensions there are vastly more than 2048 distinguishable directions — the model exploits this, encoding more concepts than it has dimensions by overlapping them at slight angles. Research calls this the superposition hypothesis.
+
+The technically clean similarity measure is cosine similarity — dot product divided by both magnitudes — which measures pure direction regardless of scale. Scaled dot-product attention uses `dot(q,k) / sqrt(head_dim)` instead, a cheaper approximation that works because `Wq` and `Wk` learn to keep vectors at roughly consistent scale during training.
+
 ### Q, K, V projections
 
 The residual stream `x` for each token is a single vector that carries everything the model knows about that token so far. Before the dot-product lookup, three separate linear projections transform it into three distinct roles:
