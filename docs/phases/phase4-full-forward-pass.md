@@ -41,7 +41,31 @@ When you compute `Qₜ · Kₛ`, the rotation at position `t` and `s` interact i
 dot(R(t)·q, R(s)·k) = dot(q, R(s−t)·k)
 ```
 
-The score depends only on `t − s` (the relative distance), not on absolute positions. This is why RoPE generalises to context lengths beyond what was seen during training — the relative distance encoding is the same whether the sequence is 100 or 10,000 tokens long.
+The score depends only on `t − s` (the relative distance), not on absolute positions. In principle this should work at any context length. In practice it breaks down — and understanding why explains a lot about modern context-length engineering.
+
+### Why longer contexts degrade quality
+
+Each dimension pair has a characteristic wavelength — the relative distance at which it completes one full rotation cycle:
+
+```
+λᵢ = 2π × rope_theta^(2i/d)
+```
+
+For `rope_theta=10000` and `d=128`: `λ₀ ≈ 6` tokens, `λ₆₃ ≈ 62,000` tokens. Low-index pairs rotate fast (short wavelength); high-index pairs rotate slowly (long wavelength).
+
+During training with max context length `L`, dimension pair `i` sweeps through angles in the range `[0, 2π × L/λᵢ]`. For fast pairs (`L >> λᵢ`) the model sees many complete cycles and learns the full rotational pattern. For slow pairs (`L << λᵢ`) the model only observes a small arc of the cycle — those dimensions are undertrained.
+
+When inference extends beyond `L`, the slow dimensions start producing angles never seen during training. Attention heads that learned to use those dimensions for coarse positional structure produce garbage, and output quality degrades.
+
+The failure is not that long-range pairs have *smaller* angle deltas per step (they do, by design). It's that the dimensions designed for long-range encoding never complete enough of their cycle during a finite training run to be reliable at inference time.
+
+### Why `rope_theta=1,000,000` fixes this
+
+Raising the base stretches all wavelengths by the same factor. With `rope_theta=1,000,000` the slow end reaches `λ₆₃ ≈ 6.2 billion` tokens, so for a 128K-token training run even the slowest dimension sweeps through `128000 / 6.2B ≈ 0.002%` of its cycle. That sounds worse — but the key is that the *fast* dimensions still rotate rapidly and handle local structure correctly, and the model simply doesn't need the slow dimensions to work at normal context lengths.
+
+The practical fix: train at context length `L`, set `rope_theta` large enough that `λ_{max} >> L`. The slow dimensions contribute almost no rotational signal within the training window (angles stay near zero), but they don't hurt either. At inference beyond `L`, they're still near-zero — the model is still in-distribution.
+
+Fancier approaches (YaRN, NTK-aware scaling) apply *different* stretch factors to different frequency bands, since uniform scaling also slows down the fast dimensions in ways that can hurt short-range attention quality.
 
 ### Implementation
 
