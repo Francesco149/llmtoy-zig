@@ -114,11 +114,17 @@ defer m.deinit();
 try m.put(key, value);
 ```
 
-**ArrayList** — `.init()` gone; pass allocator per-call. `std.ArrayListUnmanaged` requires explicit field init (bare `{}` fails in 0.16):
+**ArrayList** — in 0.16, `std.ArrayList(T)` IS the unmanaged type (renamed); `std.ArrayListUnmanaged` is a deprecated alias for the same thing. The managed variant moved to `std.array_list.Managed(T)`. Bare `{}` init fails — use explicit fields.
 ```zig
-var list: std.ArrayListUnmanaged(T) = .{ .items = &.{}, .capacity = 0 };
+// std.ArrayList = unmanaged; allocator at each call site:
+var list: std.ArrayList(T) = .{ .items = &.{}, .capacity = 0 };
 defer list.deinit(allocator);
 try list.append(allocator, item);
+
+// Managed (allocator stored inside the struct):
+var list = std.array_list.Managed(T).init(allocator);
+defer list.deinit();
+try list.append(item);
 ```
 
 **Writer in tests** — no `std.io.fixedBufferStream`; use `std.Io.Writer.fixed`:
