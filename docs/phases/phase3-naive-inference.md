@@ -77,11 +77,44 @@ RMSNorm's authors found empirically that the mean subtraction rarely matters for
 
 ### `softmax(x)`
 
-In-place, numerically stable: subtract `max(x)` before `exp` so no value overflows to `inf`.
+Converts an arbitrary vector of real numbers into a probability distribution: all values become positive and sum to 1.
 
 ```
-x[i] = exp(x[i] − max) / Σ exp(x[j] − max)
+softmax(x)[i] = exp(x[i]) / Σ exp(x[j])
 ```
+
+**Why exp causes extreme skew.** Linear differences become exponential ratios. If two logits differ by `d`, their softmax weights differ by a factor of `exp(d)`:
+
+```
+x = [1, 2, 3]
+exp(x) = [2.72, 7.39, 20.09]   — each step is e≈2.72× larger
+softmax = [0.090, 0.245, 0.665] — values 1 apart linearly, 7× apart in probability
+```
+
+Add one outlier and the rest effectively vanish:
+
+```
+x = [1, 2, 10]
+exp(x) = [2.72, 7.39, 22026]
+softmax ≈ [0.00012, 0.00033, 0.99955]
+```
+
+Equal inputs give a uniform distribution — the only case where softmax is not skewed:
+
+```
+x = [3, 3, 3]
+softmax = [0.333, 0.333, 0.333]
+```
+
+**Numerical stability.** `exp(1000)` overflows to `inf`. The fix: subtract `max(x)` before applying `exp`. This doesn't change the output because the constant cancels between numerator and denominator:
+
+```
+exp(x[i] − c) / Σ exp(x[j] − c)  =  exp(x[i]) / Σ exp(x[j])   for any c
+```
+
+Setting `c = max(x)` guarantees the largest input to `exp` is 0, so `exp(0) = 1` is the ceiling.
+
+**Connection to greedy decoding.** Since `exp` is monotone, `argmax(softmax(x)) = argmax(x)` — the greedy token is just the highest logit. Softmax itself isn't needed for greedy; it becomes necessary in Phase 4 for nucleus (top-p) sampling, where we accumulate probability mass rather than just taking the peak.
 
 ### `silu(x)`
 
