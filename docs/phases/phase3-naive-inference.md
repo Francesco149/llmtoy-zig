@@ -230,16 +230,69 @@ An early test tried to show attention "concentrating on the best-matching key" u
 
 ## SwiGLU FFN
 
-Both target models use SwiGLU (Swish-gated linear unit) for the FFN block:
+### Attention routes, FFN transforms
+
+Attention decides *where* to gather information from — it blends vectors from different positions in the sequence. The FFN then decides *what to do* with that blended vector at a single position. The two sub-layers have fundamentally different jobs.
+
+A useful framing: attention is the model's communication mechanism (tokens talking to each other), while the FFN is the model's computation and memory mechanism (a single token processing what it just learned). Most of the model's factual knowledge is stored in FFN weights, not attention weights.
+
+### Why two linear layers aren't enough
+
+A linear function of a linear function is still linear — stacking `Wdown · Wup · x` collapses to a single matrix multiply. The nonlinearity between them is what gives the FFN its expressive power. It allows the network to carve the input space into regions and respond differently in each.
+
+### FFN neurons as pattern detectors
+
+Think of each row of `Wup` as a pattern template. `Wup · x` computes how strongly `x` matches each pattern. The nonlinearity then thresholds those match scores — strong matches survive, weak ones get suppressed — and `Wdown` maps the surviving patterns to output contributions.
+
+With `d_ffn = 4 × d_model` (typical for dense models), there are four times as many pattern detectors as output dimensions. Only a fraction fire for any given input, making the representation naturally sparse after training. Each neuron specialises in recognising a specific kind of input and emitting a specific kind of output.
+
+A rough analogy: neuron 1847 might learn to activate strongly when the residual stream encodes "the subject of this sentence is a European city" and emit a vector that nudges the output toward capital-city-related concepts. No one designed this — it emerges from gradient descent on next-token prediction.
+
+### SwiGLU: gated vs vanilla FFN
+
+A vanilla FFN with ReLU:
 
 ```
-gate   = silu(Wgate · x)
-up     = Wup · x
-hidden = gate ⊙ up          (element-wise product)
+hidden = relu(Wup · x)
 out    = Wdown · hidden
 ```
 
-Three weight matrices instead of two. The gating mechanism lets the network suppress irrelevant dimensions before the expensive `Wdown` projection.
+ReLU simply zeroes negative activations. Any positive match score passes through unchanged.
+
+SwiGLU adds a multiplicative gate:
+
+```
+gate   = silu(Wgate · x)       ← how confident am I this pattern applies?
+up     = Wup · x               ← what is the pattern match score?
+hidden = gate ⊙ up             ← gate modulates the signal
+out    = Wdown · hidden
+```
+
+The gate and the content path look at the same input `x` but through different learned weight matrices. This lets the model ask two separate questions: "is this pattern present?" (Wup) and "is *this context* one where that pattern should fire?" (Wgate). A neuron can detect a pattern but choose not to emit it based on broader context — something ReLU can't do because it has no second opinion.
+
+SiLU (the smooth version of ReLU, also called Swish) is used instead of ReLU for the gate because it's differentiable at zero, giving cleaner gradients. The name SwiGLU = Swish + Gated Linear Unit.
+
+### Traced example
+
+With `d_model=4`, `d_ffn=3`, and `x = [1, 0, 0, 0]`:
+
+```
+Wgate = [[2, 0, 0, 0],    Wup = [[1,  0, 0, 0],
+          [0, 1, 0, 0],           [0,  1, 0, 0],
+          [0, 0, 1, 0]]           [0,  0, 1, 0]]
+
+gate   = silu(Wgate · x) = silu([2, 0, 0]) ≈ [1.76, 0.0, 0.0]
+up     =       Wup · x   =           [1, 0, 0]
+hidden = gate ⊙ up       ≈ [1.76, 0.0, 0.0]   ← only neuron 0 fires
+```
+
+Neuron 0 matched (x[0]=1 activates both Wgate row 0 and Wup row 0). Neurons 1 and 2 are silent because `x` has nothing at those dimensions. `Wdown` then maps `hidden` to the output space — only neuron 0's column contributes.
+
+With `x = [0, 1, 0, 0]` instead: neuron 0 produces `silu(0) * 0 = 0` and neuron 1 fires. Different input, different neuron pattern, different output. The FFN acts as a large conditional lookup over the space of possible residual stream states.
+
+### Connection to MoE
+
+Our target models (Qwen3 and Gemma4) replace the dense FFN with a **Mixture of Experts**: many separate FFN blocks, with a learned router selecting a small subset (e.g. 8 of 256) to activate per token. This is the sparse-activation idea taken to its logical conclusion — rather than having all neurons potentially active and relying on SiLU gating to suppress most of them, only the selected experts run at all. The rest don't consume compute. Phase 6 implements this.
 
 ## Forward pass (`src/model/forward.zig`)
 
