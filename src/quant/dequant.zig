@@ -77,6 +77,62 @@ pub fn dotQ8_0(data: []const u8, vec: []const f32) f32 {
     return total;
 }
 
+/// Fused Q5_0 dequant + dot product.
+///
+/// Each 32-element block is processed in 4 groups of 8 via SIMD:
+///   g=0: elements  0.. 7  —  lo nibbles of qs[0.. 7], qh bits  0.. 7
+///   g=1: elements  8..15  —  lo nibbles of qs[8..15], qh bits  8..15
+///   g=2: elements 16..23  —  hi nibbles of qs[0.. 7], qh bits 16..23
+///   g=3: elements 24..31  —  hi nibbles of qs[8..15], qh bits 24..31
+///
+/// High-bit extraction: shift qh right by a comptime offset, isolate 8 bits
+/// with {1,2,4,…,128} masks, then @min(bits, 1) via vpminud to normalise to
+/// 0/1. vpmovzxbd + vcvtdq2ps convert the 5-bit values to f32 without
+/// writing to an intermediate f32 row buffer.
+pub fn dotQ5_0(data: []const u8, vec: []const f32) f32 {
+    const n_blocks = vec.len / Q5_0_BLOCK_ELEMS;
+    // {1, 2, 4, 8, 16, 32, 64, 128} — comptime mask for isolating 8 consecutive bits.
+    const BIT_MASKS: @Vector(8, u32) = .{ 1, 2, 4, 8, 16, 32, 64, 128 };
+    var total: f32 = 0.0;
+    for (0..n_blocks) |b| {
+        const blk  = data[b * Q5_0_BLOCK_BYTES ..][0..Q5_0_BLOCK_BYTES];
+        const d    = f16Bytes(blk[0..2]);
+        const qh   = std.mem.readInt(u32, blk[2..6], .little);
+        const qs   = blk[6..22];
+        const base = b * Q5_0_BLOCK_ELEMS;
+
+        var acc: @Vector(8, f32) = @splat(0.0);
+        inline for (0..4) |g| {
+            const qs_off  = comptime (g & 1) * 8;  // qs[0..7] for g=0,2; qs[8..15] for g=1,3
+            const use_hi  = comptime g >= 2;
+            const qh_off: u5 = comptime if (g < 2) @as(u5, g * 8) else @as(u5, (g - 2) * 8 + 16);
+
+            const bytes: @Vector(8, u8) = qs[qs_off..][0..8].*;
+            const nib: @Vector(8, u8) = if (comptime use_hi)
+                bytes >> @as(@Vector(8, u8), @splat(4))
+            else
+                bytes & @as(@Vector(8, u8), @splat(0x0F));
+
+            // Scalar shift of qh by the comptime offset, then extract 8 bits via
+            // bitmask + vpminud to normalise each to exactly 0 or 1.
+            const qh_shifted: u32 = qh >> qh_off;
+            const qh_v: @Vector(8, u32) = @splat(qh_shifted);
+            const bits: @Vector(8, u32) = qh_v & BIT_MASKS;
+            const hb_u32: @Vector(8, u32) = @min(bits, @as(@Vector(8, u32), @splat(@as(u32, 1))));
+            const hb: @Vector(8, u8) = @intCast(hb_u32);
+
+            // Combine: q5 = nibble | (hi_bit << 4)  →  0..31, then subtract 16.
+            const q5_u8: @Vector(8, u8) = nib | (hb << @as(@Vector(8, u8), @splat(@as(u8, 4))));
+            const q5_f:  @Vector(8, f32) = @floatFromInt(q5_u8);
+            const q5:    @Vector(8, f32) = q5_f - @as(@Vector(8, f32), @splat(@as(f32, 16.0)));
+            const vf:    @Vector(8, f32) = vec[base + g * 8 ..][0..8].*;
+            acc += q5 * vf;
+        }
+        total += @reduce(.Add, acc) * d;
+    }
+    return total;
+}
+
 // ── Q4_K ──────────────────────────────────────────────────────────────────────
 //
 // Super-block layout (144 bytes for 256 elements):
@@ -301,6 +357,27 @@ test "dequantQ8_0: single block round-trip" {
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), out[1], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32,  2.0), out[2], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32,  0.0), out[3], 1e-5);
+}
+
+test "dotQ5_0: matches dequant+scalar-dot" {
+    var data: [Q5_0_BLOCK_BYTES * 2]u8 = @splat(0);
+    var vec: [Q5_0_BLOCK_ELEMS * 2]f32 = undefined;
+    // block 0: d=0.5, qh=0xAAAAAAAA (every other bit), nibbles vary
+    data[0] = 0x00; data[1] = 0x38; // f16(0.5)
+    data[2] = 0xAA; data[3] = 0xAA; data[4] = 0xAA; data[5] = 0xAA;
+    for (0..16) |j| data[6 + j] = @intCast((j & 0xF) | (((j + 3) & 0xF) << 4));
+    // block 1: d=0.125, qh=0, all nibbles = 5
+    data[Q5_0_BLOCK_BYTES + 0] = 0x00; data[Q5_0_BLOCK_BYTES + 1] = 0x30; // f16(0.125)
+    for (data[Q5_0_BLOCK_BYTES + 6 .. Q5_0_BLOCK_BYTES + 22]) |*b| b.* = 0x55;
+    for (&vec, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.1 - 3.0;
+
+    var decoded: [Q5_0_BLOCK_ELEMS * 2]f32 = undefined;
+    dequantQ5_0(&data, &decoded);
+    var expected: f32 = 0;
+    for (decoded, vec) |d, v| expected += d * v;
+
+    const got = dotQ5_0(&data, &vec);
+    try std.testing.expectApproxEqAbs(expected, got, 1e-3);
 }
 
 test "dequantQ4K: zero block gives all zeros" {

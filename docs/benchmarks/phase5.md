@@ -140,14 +140,15 @@ fast paths.
 
 **Q4_K_M unchanged**: The fused path is Q8_0-only; Q4_K still uses dequant+dotf32.
 
-### Cumulative from Phase 4 baseline (Q4_K_M, 12 threads)
+### Cumulative from Phase 4 baseline (Q4_K_M, best-thread config)
 
-| Phase | tok/s | overall speedup |
-|-------|-------|----------------|
+| Phase | tok/s (best config) | overall speedup |
+|-------|---------------------|----------------|
 | 4 serial scalar | 1.45 | — |
-| 5.1 threading | 2.23 | 1.54× |
-| 5.2 SIMD dot | 4.40 | 3.03× |
-| 5.3 fused Q8_0 | 4.40 | 3.03× (Q4_K unchanged) |
+| 5.1 threading | 2.23 (12t) | 1.54× |
+| 5.2 SIMD dot | 4.40 (12t) | 3.03× |
+| 5.3 fused Q8_0 | 4.40 (12t) | 3.03× (Q4_K unchanged) |
+| 5.4 fused Q5_0 | **4.82 (1t)** | **3.32×** |
 
 ### Q8_0 cumulative
 
@@ -159,9 +160,123 @@ fast paths.
 
 ---
 
-## Next: Step 4 — Vectorized Q4_K dequantization (planned)
+## Step 4 — Fused Q5_0 dequant + dot (`dotQ5_0`)
 
-The remaining bottleneck for Q4_K is the nibble unpacking and sub-block scale
-extraction in `dequantQ4K`. Vectorizing this with AVX2 byte shuffles would reduce
-the Q4_K dequant cost by 4–8×, pushing Q4_K toward the same memory-bandwidth
-bound that Q8_0 already hits.
+### Background: actual quant distribution
+
+Inspecting `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf` with `llmtoy info` reveals the dominant
+quantization type is **Q5_0** (132 tensors), not Q4_K (12 tensors). Token embeddings and
+most attention projections are Q5_0; the "K_M" suffix only affects the FFN matrices.
+
+### Q5_0 block layout (22 bytes / 32 elements)
+
+```
+[0..1]  f16  d         — scale
+[2..5]  u8[4] qh       — 1 high bit per element packed as little-endian u32
+[6..21] u8[16] qs      — 4 low bits per element, 2 per byte
+```
+
+Reconstruction: `val = d × ((nib | hi_bit<<4) − 16)`, range −16..15.
+
+### `dotQ5_0` SIMD strategy
+
+Process 32 elements in 4 comptime-unrolled groups of 8:
+
+```
+g=0: lo nibbles of qs[0..7],  qh bits  0.. 7 → elements  0.. 7
+g=1: lo nibbles of qs[8..15], qh bits  8..15 → elements  8..15
+g=2: hi nibbles of qs[0..7],  qh bits 16..23 → elements 16..23
+g=3: hi nibbles of qs[8..15], qh bits 24..31 → elements 24..31
+```
+
+High-bit extraction: shift qh right by a comptime offset, isolate 8 bits with
+`{1,2,4,8,16,32,64,128}` masks, then `@min(bits, splat(1))` normalises each to 0/1.
+No intermediate row_buf write — values convert directly i8→f32 via `vpmovsxbd + vcvtdq2ps`.
+
+### Compiler output (inner per-block loop)
+
+```asm
+; ── per-block loop ───────────────────────────────────────────────────────
+.block_loop:
+    ; load f16 scale and convert
+    vpinsrw     xmm7, xmm0, [rdi], 0x0    ; insert 2-byte f16 into xmm7
+    mov         eax, [rdi+0x2]             ; qh (u32, 4 bytes)
+    vmovq       xmm8, [rdi+0x6]            ; qs[0..7] — 8 nibble-packed bytes
+    vcvtph2ps   xmm7, xmm7                 ; f16 → f32 scale
+
+    ; extract lo nibbles of qs[0..7]
+    vpand       xmm9, xmm8, xmm1           ; xmm1 = 0x0F×8: lo nibbles → xmm9
+    vpsrlw      xmm8, xmm8, 0x4
+    vpand       xmm8, xmm8, xmm6           ; xmm6 = 0x0F×16: hi nibbles → xmm8
+
+    ; high-bit extraction for group 0 (qh bits 0..7)
+    ; xmm4 = 0xF0×8  — encodes -16 as i8 (clever: 0xF0|nib = nib-16 after sign-ext)
+    ; xmm2 = BIT_MASKS = {1,2,4,8,16,32,64,128} as u32
+    vpbroadcastd ymm10, xmm9               ; broadcast qh[0..7] to 8 u32 lanes
+    vpand       ymm10, ymm10, ymm2         ; isolate bits 0..7 of qh
+    vpcmpeqd    ymm10, ymm10, ymm3         ; ymm3=0: eq-to-zero mask (0xFF where bit was 0)
+    vpackssdw   xmm10, xmm10, xmm11       ; pack i32→i16
+    vpacksswb   xmm10, xmm10, xmm10       ; pack i16→i8 byte mask
+    vpblendvb   xmm10, xmm5, xmm4, xmm10  ; bit=0 → 0xF0 (=-16 as i8), bit=1 → 0
+
+    vpor        xmm9, xmm10, xmm9         ; q5_i8: bit=0 → nib|0xF0 = nib-16, bit=1 → nib
+    vpmovsxbd   ymm9, xmm9                ; sign-extend i8→i32 (encodes -16 via 0xF0)
+
+    ; convert and multiply (groups 1-3 follow the same pattern)
+    vcvtdq2ps   ymm9, ymm9                ; i32 → f32: bit=0: nib-16, bit=1: nib  (no vsubps!)
+    vmulps      ymm9, ymm9, [rsi-0x60]    ; × vec[0..7]
+    ; ... groups 1-3 similarly produce ymm10, ymm8, ymm11 ...
+
+    vaddps      ymm8, ymm9, ymm8          ; accumulate all 4 groups
+    vaddps      ymm8, ymm8, ymm10
+
+    ; horizontal reduce ymm8 → scalar, multiply by scale, accumulate total
+    vmulss      xmm7, xmm_scalar, xmm7   ; block_sum × d
+    vaddss      xmm0, xmm0, xmm7         ; total += block_sum
+
+    dec         rcx
+    jne         .block_loop
+```
+
+**Key insight — `vpblendvb` encodes the −16 offset into the selection constant:**
+`xmm4 = {0xF0×8}`. `0xF0` is −16 as a signed i8. When the high bit is **zero**, the blend
+selects `0xF0`; OR with the nibble gives `nib | 0xF0 = nib − 16` after sign-extension
+(`vpmovsxbd`). When the high bit is **one**, the blend selects `0x00`; nibble passes
+through unchanged. The `vsubps −16.0` instruction is eliminated entirely — the subtraction
+is absorbed into the integer domain before `vcvtdq2ps`.
+
+`vpinsrw + vcvtph2ps` converts the f16 block scale in one XMM round-trip, identical to
+the Q8_0 path.
+
+### Results (30 tokens, ReleaseFast)
+
+| Model | Threads | Step 3 tok/s | Step 4 tok/s | gain |
+|-------|---------|-------------|-------------|------|
+| Q4_K_M | 1  | 3.06 | **4.82** | **1.57×** |
+| Q4_K_M | 12 | 4.40 | 4.65 | 1.06× |
+| Q8_0   | 1  | 14.06 | 14.06 | — (unchanged) |
+
+### hyperfine (20 tokens, 3 runs)
+
+```
+threads=1:   4.441 s ± 0.073 s
+threads=12:  4.726 s ± 0.009 s
+threads=1 is 1.06× faster than threads=12
+```
+
+Single-thread is now faster than 12-thread because per-row work is so fast that
+raw-spawn overhead (~200 µs × ~650 spawns = ~130 ms/token) exceeds parallelism gains.
+This repeats the pattern from step 3 for Q8_0: a thread pool is required to benefit
+from threading at this throughput level.
+
+### Analysis
+
+**1.57× single-thread gain**: Q5_0 is 132/290 tensors in Q4_K_M (~45% of calls to
+`quantMatvec`). For those rows, per-row memory traffic falls from ~3.5 KB store +
+3.5 KB load (row_buf round-trip) to read-only (nibbles + vec). The fused path also
+eliminates the SIMD-scalar boundary crossing that `dequantQ5_0 + dotf32` required.
+
+**Threading breakeven**: Step 4 makes Q5_0 rows ~1.57× faster. Each row is now so
+fast that `min_rows_per_thread=512` no longer adequately amortises the 200 µs
+spawn cost for medium matrices (wq at 896 rows spawns 2 threads = 400 µs overhead
+vs < 100 µs of useful work gained). A persistent thread pool would fix this.

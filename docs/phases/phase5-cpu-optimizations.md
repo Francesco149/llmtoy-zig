@@ -312,6 +312,85 @@ See `docs/benchmarks/phase5.md` for full numbers.
 
 ---
 
+## Step 4: Fused Q5_0 dequant + dot product
+
+### The real bottleneck
+
+Inspecting the model with `llmtoy info` reveals that **Q5_0 is the dominant quant type**
+(132 tensors) in `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf`. Q4_K has only 12 tensors. The
+step 3 assumption that Q4_K was the main target was wrong; Q5_0 comes first.
+
+### Q5_0 block format
+
+```
+[0..1]   f16   d          — scale
+[2..5]   u8[4] qh         — 1 high bit per element (32 bits total)
+[6..21]  u8[16] qs        — 4 low bits per element, 2 per byte (nibble-packed)
+```
+
+Reconstruction: `val = d × ((nib | hi_bit<<4) − 16)`, range −16..15.
+
+32 elements are interleaved: elements 0..15 use the **lo nibbles** of `qs[0..15]` with
+`qh` bits 0..15; elements 16..31 use the **hi nibbles** of `qs[0..15]` with `qh` bits
+16..31.
+
+### `dotQ5_0` — fused path
+
+Process 32 elements in 4 comptime-unrolled groups of 8 (`inline for (0..4) |g|`):
+
+```zig
+pub fn dotQ5_0(data: []const u8, vec: []const f32) f32 {
+    const BIT_MASKS: @Vector(8, u32) = .{ 1, 2, 4, 8, 16, 32, 64, 128 };
+    for (0..n_blocks) |b| {
+        const d   = f16Bytes(blk[0..2]);
+        const qh  = std.mem.readInt(u32, blk[2..6], .little);
+        const qs  = blk[6..22];
+        var acc: @Vector(8, f32) = @splat(0.0);
+        inline for (0..4) |g| {
+            // comptime: which half of qs, lo or hi nibble, which qh offset
+            const nib: @Vector(8, u8) = ...;
+            // isolate 8 consecutive qh bits via bitmask, normalise to 0/1
+            const hb:  @Vector(8, u8) = @intCast(@min(qh_v & BIT_MASKS, splat(1)));
+            const q5_u8 = nib | (hb << splat(4));       // 0..31
+            const q5    = @as(@Vector(8, f32), @floatFromInt(q5_u8)) - splat(16.0);
+            acc += q5 * vec[base + g*8..][0..8].*;
+        }
+        total += @reduce(.Add, acc) * d;
+    }
+}
+```
+
+### What the compiler did (annotated disassembly)
+
+LLVM eliminated the `vsubps -16.0` entirely by encoding the subtraction into the
+high-bit selection constant:
+
+- Source: `nib | (hb << 4)` where hb ∈ {0, 1} → values 0..31 as u8, then `- 16.0`
+- Compiler: replaces `0x10` (16) with `0xF0` (= −16 as i8), then uses `vpmovsxbd`
+  (sign-extend i8→i32) instead of `vpmovzxbd`
+
+For `hi=0`: blend selects `0xF0`, `nib | 0xF0` as i8 = `nib − 16` (−16..−1) ✓  
+For `hi=1`: blend selects `0x00`, `nib | 0x00` as i8 = `nib` (0..15) ✓
+
+The `vpcmpeqd ymm, ymm, zero` + `vpackssdw` + `vpacksswb` + `vpblendvb` sequence
+performs the conditional selection; no branch in the inner loop. Full annotated asm
+in `docs/benchmarks/phase5.md`.
+
+### Results
+
+| Config | tok/s (step 3) | tok/s (step 4) | gain |
+|--------|----------------|----------------|------|
+| Q4_K_M, 1 thread  | 3.06 | **4.82** | **1.57×** |
+| Q4_K_M, 12 threads | 4.40 | 4.65 | 1.06× |
+| Q8_0, 1 thread | 14.06 | 14.06 | — (no Q5_0 tensors) |
+
+Single-thread is now faster than 12-thread. The per-row work is fast enough that
+raw-spawn overhead dominates. A persistent thread pool is the correct next step.
+
+See `docs/benchmarks/phase5.md` for full numbers and hyperfine data.
+
+---
+
 ## What's missing (Phase 6)
 
 - **MoE routing**: Qwen3.6 and Gemma4 use Mixture-of-Experts FFN layers. The loader

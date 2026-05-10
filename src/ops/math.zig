@@ -100,6 +100,10 @@ pub fn quantMatvec(
             out[i] = dq.dotQ8_0(row_data, vec);
             continue;
         }
+        if (mat_type == .q5_0) {
+            out[i] = dq.dotQ5_0(row_data, vec);
+            continue;
+        }
         const row = row_buf[0..cols];
         switch (mat_type) {
             .f32  => dq.dequantF32(row_data, row),
@@ -138,6 +142,10 @@ const RowJob = struct {
             const row_data = job.mat_data[(job.row_start + i) * row_bytes ..][0..row_bytes];
             if (job.mat_type == .q8_0) {
                 job.out[i] = dq.dotQ8_0(row_data, job.vec);
+                continue;
+            }
+            if (job.mat_type == .q5_0) {
+                job.out[i] = dq.dotQ5_0(row_data, job.vec);
                 continue;
             }
             const row = job.row_buf[0..job.cols];
