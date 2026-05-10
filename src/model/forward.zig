@@ -228,6 +228,7 @@ pub fn forwardOneModel(
     kv: *KvCache,
     w: *const mw.ModelWeights,
     cfg: Config,
+    n_threads: usize,
     allocator: std.mem.Allocator,
 ) ![]f32 {
     const seq = pos + 1;
@@ -237,10 +238,10 @@ pub fn forwardOneModel(
     const nkv = cfg.n_kv_heads * hd;
     const ff  = cfg.d_ffn;
 
-    // row_buf: scratch for dequantizing one matrix row at a time.
+    // scratch: per-thread dequant buffers; n_threads × max_cols floats.
     const max_cols = @max(@max(d, ff), @max(nq, nkv));
-    const row_buf = try allocator.alloc(f32, max_cols);
-    defer allocator.free(row_buf);
+    const scratch = try allocator.alloc(f32, n_threads * max_cols);
+    defer allocator.free(scratch);
 
     const x         = try allocator.alloc(f32, d);  defer allocator.free(x);
     const xb        = try allocator.alloc(f32, d);  defer allocator.free(xb);
@@ -255,15 +256,15 @@ pub fn forwardOneModel(
     const up_buf    = try allocator.alloc(f32, ff); defer allocator.free(up_buf);
     const ffn_out   = try allocator.alloc(f32, d);  defer allocator.free(ffn_out);
 
-    embedLookup(x, w.token_emb, token, d, row_buf);
+    embedLookup(x, w.token_emb, token, d, scratch[0..max_cols]);
 
     for (0..cfg.n_layers) |l| {
         const lw = &w.layers[l];
 
         math.rmsnorm(xb, x, lw.attn_norm, cfg.eps);
-        math.quantMatvec(q_all, lw.wq.data, lw.wq.type_, xb, nq,  d, row_buf[0..d]);
-        math.quantMatvec(k_new, lw.wk.data, lw.wk.type_, xb, nkv, d, row_buf[0..d]);
-        math.quantMatvec(v_new, lw.wv.data, lw.wv.type_, xb, nkv, d, row_buf[0..d]);
+        math.quantMatvecPar(q_all, lw.wq.data, lw.wq.type_, xb, nq,  d, scratch, n_threads);
+        math.quantMatvecPar(k_new, lw.wk.data, lw.wk.type_, xb, nkv, d, scratch, n_threads);
+        math.quantMatvecPar(v_new, lw.wv.data, lw.wv.type_, xb, nkv, d, scratch, n_threads);
 
         // Add optional per-layer Q/K/V biases (Qwen2 style).
         if (lw.q_bias) |b| { for (q_all, b) |*q, bv| q.* += bv; }
@@ -290,20 +291,20 @@ pub fn forwardOneModel(
             );
         }
 
-        math.quantMatvec(attn_proj, lw.wo.data, lw.wo.type_, attn_concat, d, nq, row_buf[0..nq]);
+        math.quantMatvecPar(attn_proj, lw.wo.data, lw.wo.type_, attn_concat, d, nq, scratch, n_threads);
         for (x, attn_proj) |*xi, delta| xi.* += delta;
 
         math.rmsnorm(xb, x, lw.ffn_norm, cfg.eps);
-        math.quantMatvec(gate_buf, lw.w_gate.data, lw.w_gate.type_, xb, ff, d, row_buf[0..d]);
-        math.quantMatvec(up_buf,   lw.w_up.data,   lw.w_up.type_,   xb, ff, d, row_buf[0..d]);
+        math.quantMatvecPar(gate_buf, lw.w_gate.data, lw.w_gate.type_, xb, ff, d, scratch, n_threads);
+        math.quantMatvecPar(up_buf,   lw.w_up.data,   lw.w_up.type_,   xb, ff, d, scratch, n_threads);
         for (gate_buf, up_buf) |*g, u| g.* = math.silu(g.*) * u;
-        math.quantMatvec(ffn_out, lw.w_down.data, lw.w_down.type_, gate_buf, d, ff, row_buf[0..ff]);
+        math.quantMatvecPar(ffn_out, lw.w_down.data, lw.w_down.type_, gate_buf, d, ff, scratch, n_threads);
         for (x, ffn_out) |*xi, delta| xi.* += delta;
     }
 
     const logits = try allocator.alloc(f32, cfg.vocab_size);
     math.rmsnorm(xb, x, w.out_norm, cfg.eps);
-    math.quantMatvec(logits, w.lm_head.data, w.lm_head.type_, xb, cfg.vocab_size, d, row_buf[0..d]);
+    math.quantMatvecPar(logits, w.lm_head.data, w.lm_head.type_, xb, cfg.vocab_size, d, scratch, n_threads);
     return logits;
 }
 

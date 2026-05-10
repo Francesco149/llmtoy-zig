@@ -41,7 +41,7 @@ llmtoy generate model.gguf "The capital of France is" \
 llmtoy generate model.gguf "def fibonacci(n):" \
     --max-tokens 60 --temperature 0.8 --top-p 0.9 --top-k 40
 
-# Flags:  --max-tokens N   --temperature T   --top-p P   --top-k K   --seed S
+# Flags:  --max-tokens N   --temperature T   --top-p P   --top-k K   --seed S   --threads N
 ```
 
 The `generate` command writes the completed text to stdout and progress/timing to stderr:
@@ -66,7 +66,7 @@ See [docs/roadmap.md](docs/roadmap.md) for the phase-by-phase plan.
 | 2 | Tokenization | ✓ |
 | 3 | Naive CPU inference | ✓ |
 | 4 | Full CPU forward pass + sampling | ✓ |
-| 5 | CPU optimizations (SIMD, threading) | current |
+| 5 | CPU optimizations (threading + AVX2) | current (threading done) |
 | 6 | MoE architecture (Gemma4 / Qwen3.6) | planned |
 | 7 | GPU path (Vulkan or ROCm) | planned |
 | 8 | Multimodal (stretch) | planned |

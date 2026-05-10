@@ -84,6 +84,101 @@ pub fn quantMatvec(
     }
 }
 
+/// Context passed to each worker thread for a parallel quantMatvec slice.
+const RowJob = struct {
+    mat_data:  []const u8,
+    mat_type:  GgmlType,
+    vec:       []const f32,
+    out:       []f32,       // sub-slice of the caller's `out`; length == n_rows
+    row_buf:   []f32,       // per-thread scratch; length == cols
+    row_start: usize,       // first global row (for mat_data addressing)
+    n_rows:    usize,
+    cols:      usize,
+
+    fn run(job: *RowJob) void {
+        const row_bytes: usize = switch (job.mat_type) {
+            .f32   => job.cols * 4,
+            .f16   => job.cols * 2,
+            .q5_0  => (job.cols / dq.Q5_0_BLOCK_ELEMS) * dq.Q5_0_BLOCK_BYTES,
+            .q8_0  => (job.cols / dq.Q8_0_BLOCK_ELEMS) * dq.Q8_0_BLOCK_BYTES,
+            .q4_k  => (job.cols / dq.QK_K) * dq.Q4_K_BLOCK_BYTES,
+            .q6_k  => (job.cols / dq.QK_K) * dq.Q6_K_BLOCK_BYTES,
+            else   => @panic("unsupported quant type in RowJob"),
+        };
+        for (0..job.n_rows) |i| {
+            const row_data = job.mat_data[(job.row_start + i) * row_bytes ..][0..row_bytes];
+            const row = job.row_buf[0..job.cols];
+            switch (job.mat_type) {
+                .f32  => dq.dequantF32(row_data, row),
+                .f16  => dq.dequantF16(row_data, row),
+                .q5_0 => dq.dequantQ5_0(row_data, row),
+                .q8_0 => dq.dequantQ8_0(row_data, row),
+                .q4_k => dq.dequantQ4K(row_data, row),
+                .q6_k => dq.dequantQ6K(row_data, row),
+                else  => unreachable,
+            }
+            var sum: f32 = 0.0;
+            for (row, job.vec) |w, x| sum += w * x;
+            job.out[i] = sum;
+        }
+    }
+};
+
+/// Parallel version of quantMatvec.
+///
+/// Splits output rows across `n_threads` threads. Each thread gets its own
+/// row_buf from `scratch` (caller must supply `n_threads * cols` floats).
+/// Falls back to the serial path when there are fewer rows than threads or
+/// rows-per-thread would be too few to amortize spawn overhead.
+pub fn quantMatvecPar(
+    out: []f32,
+    mat_data: []const u8,
+    mat_type: GgmlType,
+    vec: []const f32,
+    rows: usize,
+    cols: usize,
+    scratch: []f32,   // length >= n_threads * cols
+    n_threads: usize,
+) void {
+    // Minimum rows-per-thread to amortize thread-spawn overhead (~50 µs each).
+    const min_rows_per_thread = 16;
+    const nt = @min(n_threads, rows / min_rows_per_thread + 1);
+
+    if (nt <= 1) {
+        quantMatvec(out, mat_data, mat_type, vec, rows, cols, scratch[0..cols]);
+        return;
+    }
+
+    var jobs: [64]RowJob = undefined; // 64 threads is more than enough
+    var threads: [64]std.Thread = undefined;
+    var n_spawned: usize = 0;
+
+    const base = rows / nt;
+    const extra = rows % nt;
+    var row: usize = 0;
+    for (0..nt) |t| {
+        const n = base + if (t < extra) @as(usize, 1) else @as(usize, 0);
+        jobs[t] = .{
+            .mat_data  = mat_data,
+            .mat_type  = mat_type,
+            .vec       = vec,
+            .out       = out[row..][0..n],
+            .row_buf   = scratch[t * cols ..][0..cols],
+            .row_start = row,
+            .n_rows    = n,
+            .cols      = cols,
+        };
+        threads[n_spawned] = std.Thread.spawn(.{}, RowJob.run, .{&jobs[t]}) catch {
+            jobs[t].run(); // spawn failed: run this slice on the caller thread
+            row += n;
+            continue;
+        };
+        n_spawned += 1;
+        row += n;
+    }
+    for (0..n_spawned) |t| threads[t].join();
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 test "matvec: 3×3 identity" {

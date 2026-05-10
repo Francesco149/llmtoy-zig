@@ -60,11 +60,12 @@ All CI-equivalent checks must pass before committing: `zig build test`.
 
 ## Current phase
 
-**Phase 4 complete.** See `docs/roadmap.md` for the full plan.
+**Phase 5 in progress.** See `docs/roadmap.md` for the full plan.
 
-Next: Phase 5 — CPU Optimizations.
-AVX2 SGEMM, multi-threading (std.Thread.Pool), Q4_K/Q8_0 hot-path dequant,
-hyperfine benchmarks for each optimization step.
+Multi-threading (`quantMatvecPar`, raw Thread.spawn/join) is done: 1.54× speedup
+on Qwen2.5-0.5B, `--threads N` CLI flag added for benchmarking.
+
+Next: AVX2 SIMD dot product — `@Vector(8, f32)` loop + fused Q8_0 dequant+dot.
 
 ## Zig 0.16 API patterns
 

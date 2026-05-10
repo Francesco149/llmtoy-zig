@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, args[1], "generate")) {
         if (args.len < 4) {
             std.debug.print(
-                "usage: llmtoy generate <model.gguf> <prompt> [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S]\n",
+                "usage: llmtoy generate <model.gguf> <prompt> [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N]\n",
                 .{},
             );
             return error.MissingArg;
@@ -65,6 +65,7 @@ pub fn main(init: std.process.Init) !void {
         var top_p:       f32   = 0.9;
         var top_k:       u32   = 40;
         var seed:        u64   = 42;
+        var threads:     u32   = 0; // 0 = auto (getCpuCount)
         var i: usize = 4;
         while (i < args.len) : (i += 2) {
             if (i + 1 >= args.len) break;
@@ -75,6 +76,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, flag, "--top-p"))       top_p       = try std.fmt.parseFloat(f32, val);
             if (std.mem.eql(u8, flag, "--top-k"))       top_k       = try std.fmt.parseInt(u32, val, 10);
             if (std.mem.eql(u8, flag, "--seed"))        seed        = try std.fmt.parseInt(u64, val, 10);
+            if (std.mem.eql(u8, flag, "--threads"))     threads     = try std.fmt.parseInt(u32, val, 10);
         }
 
         try cmdGenerate(out, model_path, prompt, .{
@@ -83,6 +85,7 @@ pub fn main(init: std.process.Init) !void {
             .top_p       = top_p,
             .top_k       = top_k,
             .seed        = seed,
+            .threads     = threads,
         }, io, gpa);
     } else {
         try usagePrint(out);
@@ -190,6 +193,7 @@ const GenerateOptions = struct {
     top_p:       f32  = 0.9,
     top_k:       u32  = 40,
     seed:        u64  = 42,
+    threads:     u32  = 0, // 0 = auto
 };
 
 fn cmdGenerate(
@@ -235,11 +239,12 @@ fn cmdGenerate(
     // Prefill: process every prompt token.
     const clk = std.Io.Clock.real;
     const t_start = clk.now(io);
-    std.debug.print("prefilling {} prompt tokens...\n", .{prompt_ids.len});
+    const n_threads: usize = if (opts.threads > 0) opts.threads else std.Thread.getCpuCount() catch 1;
+    std.debug.print("prefilling {} prompt tokens (threads={})...\n", .{ prompt_ids.len, n_threads });
     var last_logits: []f32 = undefined;
     for (prompt_ids, 0..) |tok, pos| {
         if (pos > 0) gpa.free(last_logits);
-        last_logits = try fwd.forwardOneModel(tok, pos, &kv, &weights, cfg, gpa);
+        last_logits = try fwd.forwardOneModel(tok, pos, &kv, &weights, cfg, n_threads, gpa);
     }
     const t_prefill = clk.now(io);
     const prefill_ms = @divTrunc(t_start.durationTo(t_prefill).nanoseconds, std.time.ns_per_ms);
@@ -263,7 +268,7 @@ fn cmdGenerate(
         try out.writeAll(tok_buf[0..tok_len]);
         try out.flush();
 
-        last_logits = try fwd.forwardOneModel(next_tok, pos, &kv, &weights, cfg, gpa);
+        last_logits = try fwd.forwardOneModel(next_tok, pos, &kv, &weights, cfg, n_threads, gpa);
         pos += 1;
     }
     gpa.free(last_logits);
