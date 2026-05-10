@@ -95,6 +95,21 @@ Merge rank = index in `tokenizer.ggml.merges` (lower index → applied first). T
 
 The algorithm is O(n² · m) per word (n symbols, m merge attempts per pass), which is fine for educational use. Production implementations (llama.cpp, tiktoken) use a priority queue for O(n log n).
 
+### The merge loop is a no-op for common words
+
+When all the bytes of a word merge all the way down to one symbol, the loop is equivalent to a single vocab lookup — the merge work just happens to complete. The loop earns its keep on words that aren't in the vocabulary as a unit, where merges run out partway through and you're left with multiple subword pieces. This is the gradient BPE was designed to exploit: common words get one token, rare words are reconstructed from their most frequent substrings.
+
+Measured on Qwen3 (Qwen3.6-35B-A3B, 247587 merges):
+
+| word | tokens |
+|------|--------|
+| `hello` | `hello` |
+| `tokenization` | `token` · `ization` |
+| `backpropagation` | `back` · `prop` · `agation` |
+| `antidisestablishmentarianism` | `ant` · `idis` · `establish` · `ment` · `arian` · `ism` |
+
+`tokenization` splits at a morpheme boundary because `token` and `ization` both appear frequently enough to accumulate high-priority merges independently. `backpropagation` inherits its split from `propagation` — running `propagation` alone also yields `prop` + `agation`, so the merge that would produce `propagation` as a single token never reached high enough priority. `establish` is common enough to survive as one token, which is why it stays intact inside the much longer word. The loop is a greedy reconstruction of the frequency hierarchy learned during training.
+
 ## Pre-tokenization (simplification)
 
 GPT-2 family tokenizers never merge across word boundaries. Real models use a regex to split text into pieces before BPE — e.g. Qwen3's `"qwen35"` pre-tokenizer uses a tiktoken-compatible Unicode-aware pattern.
