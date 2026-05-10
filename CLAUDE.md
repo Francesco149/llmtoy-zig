@@ -114,10 +114,10 @@ defer m.deinit();
 try m.put(key, value);
 ```
 
-**ArrayList** — in 0.16, `std.ArrayList(T)` IS the unmanaged type (renamed); `std.ArrayListUnmanaged` is a deprecated alias for the same thing. The managed variant moved to `std.array_list.Managed(T)`. Bare `{}` init fails — use explicit fields.
+**ArrayList** — in 0.16, `std.ArrayList(T)` IS the unmanaged type (renamed); `std.ArrayListUnmanaged` is a deprecated alias for the same thing. The managed variant moved to `std.array_list.Managed(T)`. Use `.empty` to initialise.
 ```zig
 // std.ArrayList = unmanaged; allocator at each call site:
-var list: std.ArrayList(T) = .{ .items = &.{}, .capacity = 0 };
+var list: std.ArrayList(T) = .empty;
 defer list.deinit(allocator);
 try list.append(allocator, item);
 

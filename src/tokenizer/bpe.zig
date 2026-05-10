@@ -51,7 +51,7 @@ fn cpIsByteEncoded(cp: u21) bool {
 ///
 /// Caller owns the returned slice.
 pub fn encode(text: []const u8, vocab: *const Vocab, allocator: std.mem.Allocator) ![]u32 {
-    var ids: std.ArrayList(u32) = .{ .items = &.{}, .capacity = 0 };
+    var ids: std.ArrayList(u32) = .empty;
     errdefer ids.deinit(allocator);
 
     if (vocab.add_bos) {
@@ -90,7 +90,7 @@ fn encodePiece(
     const aa = arena.allocator();
 
     // Build initial symbol list: one utf8-encoded codepoint per byte.
-    var symbols: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
+    var symbols: std.ArrayList([]const u8) = .empty;
 
     if (with_space) {
         try symbols.append(aa, try cpToUtf8(aa, BYTE_TO_CP[' ']));
@@ -145,7 +145,7 @@ fn cpToUtf8(allocator: std.mem.Allocator, cp: u21) ![]u8 {
 /// Decode token IDs back to bytes.
 /// Caller owns the returned slice.
 pub fn decode(token_ids: []const u32, vocab: *const Vocab, allocator: std.mem.Allocator) ![]u8 {
-    var result: std.ArrayList(u8) = .{ .items = &.{}, .capacity = 0 };
+    var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
 
     for (token_ids) |id| {
