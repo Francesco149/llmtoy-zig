@@ -60,14 +60,11 @@ All CI-equivalent checks must pass before committing: `zig build test`.
 
 ## Current phase
 
-**Phase 4 in progress.** See `docs/roadmap.md` for the full plan.
+**Phase 4 complete.** See `docs/roadmap.md` for the full plan.
 
-Core architecture is done: multi-head/GQA attention, RoPE, KV cache, Q8_0/Q4_K
-dequant, GGUF loader, temperature/top-k/top-p sampling, `generate` CLI command.
-
-Remaining for Phase 4 completion: end-to-end validation on a real dense model
-and the phase 4 doc is written (`docs/phases/phase4-full-forward-pass.md`).
-Phase 5 next: AVX2 SIMD matmul, multi-threading, MoE routing is Phase 6.
+Next: Phase 5 — CPU Optimizations.
+AVX2 SGEMM, multi-threading (std.Thread.Pool), Q4_K/Q8_0 hot-path dequant,
+hyperfine benchmarks for each optimization step.
 
 ## Zig 0.16 API patterns
 

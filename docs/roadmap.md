@@ -23,15 +23,15 @@ Each phase is a self-contained educational unit: runnable, tested, and documente
 - Greedy sampling
 - Synthetic tiny model tests to validate numerics
 
-## Phase 4 — Full CPU Forward Pass (current)
+## Phase 4 — Full CPU Forward Pass ✓
 - [x] Multi-head / grouped-query attention (GQA)
 - [x] RoPE positional embeddings
 - [x] KV cache (incremental decoding)
 - [x] Temperature / top-k / top-p sampling
-- [x] Q8_0 / Q4_K dequantisation (on-the-fly, one row at a time)
-- [x] GGUF weight loader → Config + ModelWeights
-- [x] `generate` CLI command
-- [ ] End-to-end validation on a real dense model
+- [x] Q5_0 / Q6_K / Q8_0 / Q4_K dequantisation (on-the-fly, one row at a time)
+- [x] GGUF weight loader → Config + ModelWeights (Qwen2 attention biases)
+- [x] `generate` CLI command with per-token timing
+- [x] End-to-end validation: Qwen2.5-0.5B `def add(a,b): return` → `a + b`
 
 ## Phase 5 — CPU Optimizations
 - AVX2 SGEMM kernel
