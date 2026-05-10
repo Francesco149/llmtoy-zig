@@ -1,4 +1,6 @@
-const std = @import("std");
+const std    = @import("std");
+const GgmlType = @import("../gguf/types.zig").GgmlType;
+const dq       = @import("../quant/dequant.zig");
 
 /// Matrix-vector multiply: out[rows] = mat[rows×cols] · vec[cols]
 /// mat is row-major: row i starts at mat[i*cols].
@@ -34,6 +36,48 @@ pub fn softmax(x: []f32) void {
 /// SiLU activation: x * sigmoid(x)
 pub fn silu(x: f32) f32 {
     return x / (1.0 + @exp(-x));
+}
+
+/// Matrix-vector multiply with quantized weight matrix.
+///
+/// Dequantizes one row at a time into a stack-allocated f32 buffer, computing
+/// the dot product with `vec` before moving to the next row. This keeps peak
+/// memory usage at O(cols) rather than O(rows × cols) — critical for large
+/// weight matrices that would overflow RAM when fully materialized as f32.
+pub fn quantMatvec(
+    out: []f32,
+    mat_data: []const u8,
+    mat_type: GgmlType,
+    vec: []const f32,
+    rows: usize,
+    cols: usize,
+    row_buf: []f32, // caller-provided scratch of length `cols`
+) void {
+    std.debug.assert(row_buf.len >= cols);
+    std.debug.assert(out.len == rows);
+
+    const row_bytes = switch (mat_type) {
+        .f32   => cols * 4,
+        .f16   => cols * 2,
+        .q8_0  => (cols / dq.Q8_0_BLOCK_ELEMS) * dq.Q8_0_BLOCK_BYTES,
+        .q4_k  => (cols / dq.QK_K) * dq.Q4_K_BLOCK_BYTES,
+        else   => @panic("unsupported quant type in quantMatvec"),
+    };
+
+    for (0..rows) |i| {
+        const row_data = mat_data[i * row_bytes ..][0..row_bytes];
+        const row = row_buf[0..cols];
+        switch (mat_type) {
+            .f32  => dq.dequantF32(row_data, row),
+            .f16  => dq.dequantF16(row_data, row),
+            .q8_0 => dq.dequantQ8_0(row_data, row),
+            .q4_k => dq.dequantQ4K(row_data, row),
+            else  => unreachable,
+        }
+        var sum: f32 = 0.0;
+        for (row, vec) |w, x| sum += w * x;
+        out[i] = sum;
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

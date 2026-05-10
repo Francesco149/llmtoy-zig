@@ -1,37 +1,38 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
 
-/// Plain f32 weight arrays for a minimal LLaMA-style transformer.
-/// Layout matches what we'll dequantize from GGUF in Phase 4.
-///
-/// All slices are owned by this struct — call deinit to free.
-/// Use initZero for a clean slate, then overwrite individual weights for tests.
+/// Plain f32 weight arrays for testing.
+/// Dimensions now reflect full multi-head / GQA projections:
+///   wq[l]:  [n_heads  * head_dim, d_model]  (n_heads*hd rows, d_model cols)
+///   wk[l]:  [n_kv_heads * head_dim, d_model]
+///   wv[l]:  [n_kv_heads * head_dim, d_model]
+///   wo[l]:  [d_model, n_heads * head_dim]
 pub const Weights = struct {
     token_emb: []f32,   // [vocab_size × d_model]
 
-    // Per-layer (n_layers slices each)
     attn_norm: [][]f32, // [n_layers][d_model]
-    wq: [][]f32,        // [n_layers][d_model × head_dim]
-    wk: [][]f32,        // [n_layers][d_model × head_dim]
-    wv: [][]f32,        // [n_layers][d_model × head_dim]
-    wo: [][]f32,        // [n_layers][d_model × head_dim]  (head_dim → d_model)
-    ffn_norm: [][]f32,  // [n_layers][d_model]
-    w_gate: [][]f32,    // [n_layers][d_ffn × d_model]
-    w_up: [][]f32,      // [n_layers][d_ffn × d_model]
-    w_down: [][]f32,    // [n_layers][d_model × d_ffn]
+    wq:        [][]f32, // [n_layers][n_heads  * head_dim * d_model]
+    wk:        [][]f32, // [n_layers][n_kv_heads * head_dim * d_model]
+    wv:        [][]f32, // [n_layers][n_kv_heads * head_dim * d_model]
+    wo:        [][]f32, // [n_layers][d_model * n_heads * head_dim]
+    ffn_norm:  [][]f32, // [n_layers][d_model]
+    w_gate:    [][]f32, // [n_layers][d_ffn × d_model]
+    w_up:      [][]f32, // [n_layers][d_ffn × d_model]
+    w_down:    [][]f32, // [n_layers][d_model × d_ffn]
 
     out_norm: []f32,    // [d_model]
-    lm_head: []f32,     // [vocab_size × d_model]
+    lm_head:  []f32,    // [vocab_size × d_model]
 
     allocator: std.mem.Allocator,
 
-    /// Allocate all weight arrays and zero-initialise them.
     pub fn initZero(cfg: Config, allocator: std.mem.Allocator) !Weights {
-        const d = cfg.d_model;
+        const d  = cfg.d_model;
         const hd = cfg.headDim();
-        const v = cfg.vocab_size;
+        const nq  = cfg.n_heads    * hd; // full Q projection width
+        const nkv = cfg.n_kv_heads * hd; // full KV projection width
+        const v  = cfg.vocab_size;
         const ff = cfg.d_ffn;
-        const l = cfg.n_layers;
+        const l  = cfg.n_layers;
 
         const token_emb = try zeroSlice(allocator, v * d);
         errdefer allocator.free(token_emb);
@@ -39,20 +40,20 @@ pub const Weights = struct {
         const attn_norm = try layerSlices(allocator, l, d);
         errdefer freeLayerSlices(allocator, attn_norm);
 
-        const wq = try layerSlices(allocator, l, d * hd);
+        const wq = try layerSlices(allocator, l, nq * d);
         errdefer freeLayerSlices(allocator, wq);
-        const wk = try layerSlices(allocator, l, d * hd);
+        const wk = try layerSlices(allocator, l, nkv * d);
         errdefer freeLayerSlices(allocator, wk);
-        const wv = try layerSlices(allocator, l, d * hd);
+        const wv = try layerSlices(allocator, l, nkv * d);
         errdefer freeLayerSlices(allocator, wv);
-        const wo = try layerSlices(allocator, l, d * hd);
+        const wo = try layerSlices(allocator, l, d * nq);
         errdefer freeLayerSlices(allocator, wo);
 
         const ffn_norm = try layerSlices(allocator, l, d);
         errdefer freeLayerSlices(allocator, ffn_norm);
         const w_gate = try layerSlices(allocator, l, ff * d);
         errdefer freeLayerSlices(allocator, w_gate);
-        const w_up = try layerSlices(allocator, l, ff * d);
+        const w_up   = try layerSlices(allocator, l, ff * d);
         errdefer freeLayerSlices(allocator, w_up);
         const w_down = try layerSlices(allocator, l, d * ff);
         errdefer freeLayerSlices(allocator, w_down);
@@ -90,11 +91,9 @@ pub const Weights = struct {
         a.free(self.lm_head);
     }
 
-    /// Set all RMSNorm weight vectors to 1 (identity normalisation).
-    /// Useful in tests to remove the weight's effect from normalisation.
     pub fn setNormWeightsOne(self: *Weights) void {
         for (self.attn_norm) |w| @memset(w, 1.0);
-        for (self.ffn_norm) |w| @memset(w, 1.0);
+        for (self.ffn_norm)  |w| @memset(w, 1.0);
         @memset(self.out_norm, 1.0);
     }
 };

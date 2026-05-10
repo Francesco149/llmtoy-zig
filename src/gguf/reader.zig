@@ -35,6 +35,20 @@ pub const GgufData = struct {
         const v = self.metadata.get(key) orelse return null;
         return if (v == .bool_) v.bool_ else null;
     }
+
+    pub fn metaF32(self: *const GgufData, key: []const u8) ?f32 {
+        const v = self.metadata.get(key) orelse return null;
+        return if (v == .float32) v.float32 else null;
+    }
+
+    pub fn metaU64(self: *const GgufData, key: []const u8) ?u64 {
+        const v = self.metadata.get(key) orelse return null;
+        return switch (v) {
+            .uint32 => |n| n,
+            .uint64 => |n| n,
+            else => null,
+        };
+    }
 };
 
 /// Parse GGUF data from raw bytes.
@@ -144,6 +158,14 @@ pub const GgufReader = struct {
 
     pub fn metaBool(self: *const GgufReader, key: []const u8) ?bool {
         return self.data.metaBool(key);
+    }
+
+    pub fn metaF32(self: *const GgufReader, key: []const u8) ?f32 {
+        return self.data.metaF32(key);
+    }
+
+    pub fn metaU64(self: *const GgufReader, key: []const u8) ?u64 {
+        return self.data.metaU64(key);
     }
 };
 
