@@ -411,7 +411,7 @@ pub fn dequantQ3K(data: []const u8, out: []f32) void {
 
         for (0..2) |half| {
             const q_base: usize = half * 32;
-            var shift: u4 = 0;
+            var shift: u3 = 0;
             for (0..4) |_| {
                 const dl  = d_all * (@as(f32, @floatFromInt(sc[is])) - 32.0); is += 1;
                 for (0..16) |l| {
@@ -427,7 +427,7 @@ pub fn dequantQ3K(data: []const u8, out: []f32) void {
                     out[out_idx] = dl2 * @as(f32, @floatFromInt(lo2 - if (hi) @as(i32, 0) else 4));
                     out_idx += 1;
                 }
-                shift = @intCast((@as(usize, shift) + 2) % 8);
+                shift = @intCast((@as(u8, shift) +% 2) & 7);
                 m *%= 2; // wrapping left-shift by 1: 1→2→4→8→(16 but loop ends)
             }
         }

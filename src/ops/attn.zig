@@ -17,14 +17,13 @@ pub fn sdpAttn(
     vs: []const f32,
     seq_len: usize,
     head_dim: usize,
+    scale: f32,
     allocator: std.mem.Allocator,
 ) !void {
     std.debug.assert(q.len == head_dim);
     std.debug.assert(ks.len == seq_len * head_dim);
     std.debug.assert(vs.len == seq_len * head_dim);
     std.debug.assert(out.len == head_dim);
-
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
     const scores = try allocator.alloc(f32, seq_len);
     defer allocator.free(scores);
@@ -51,7 +50,7 @@ test "sdpAttn: seq_len=1 → output equals value" {
     const k = [_]f32{ 1, 0, 0, 0 };
     const v = [_]f32{ 3, 1, 4, 1 };
     var out: [hd]f32 = undefined;
-    try sdpAttn(&out, &q, &k, &v, 1, hd, std.testing.allocator);
+    try sdpAttn(&out, &q, &k, &v, 1, hd, 1.0, std.testing.allocator);
     for (out, v) |o, vv| try std.testing.expectApproxEqAbs(vv, o, 1e-5);
 }
 
@@ -62,7 +61,7 @@ test "sdpAttn: equal keys → average of values" {
     const ks = [_]f32{ 1, 0, 1, 0 }; // k[0] == k[1]
     const vs = [_]f32{ 0, 0, 2, 4 }; // v[0]=[0,0], v[1]=[2,4]
     var out: [hd]f32 = undefined;
-    try sdpAttn(&out, &q, &ks, &vs, 2, hd, std.testing.allocator);
+    try sdpAttn(&out, &q, &ks, &vs, 2, hd, 1.0, std.testing.allocator);
     // 0.5*[0,0] + 0.5*[2,4] = [1,2]
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[1], 1e-5);
@@ -77,6 +76,6 @@ test "sdpAttn: extreme score difference → output ≈ winning value" {
     const ks = [_]f32{ -10, 10 }; // k[0] anti-parallel, k[1] parallel
     const vs = [_]f32{ 99, 7 };
     var out: [hd]f32 = undefined;
-    try sdpAttn(&out, &q, &ks, &vs, 2, hd, std.testing.allocator);
+    try sdpAttn(&out, &q, &ks, &vs, 2, hd, 1.0, std.testing.allocator);
     try std.testing.expectApproxEqAbs(@as(f32, 7.0), out[0], 1e-3);
 }

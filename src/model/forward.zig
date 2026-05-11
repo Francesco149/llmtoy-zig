@@ -90,7 +90,9 @@ pub fn forward(
                     q_all[t * nq + h * hd ..][0..hd],
                     ks_head[0..seq * hd],
                     vs_head[0..seq * hd],
-                    seq, hd, allocator,
+                    seq, hd,
+                    1.0 / @sqrt(@as(f32, @floatFromInt(hd))),
+                    allocator,
                 );
             }
 
@@ -194,7 +196,9 @@ pub fn forwardOne(
                 q_all[h * hd ..][0..hd],
                 ks_head[0..seq * hd],
                 vs_head[0..seq * hd],
-                seq, hd, allocator,
+                seq, hd,
+                1.0 / @sqrt(@as(f32, @floatFromInt(hd))),
+                allocator,
             );
         }
 
@@ -288,7 +292,9 @@ pub fn forwardOneModel(
                 attn_concat[h * hd ..][0..hd],
                 q_all[h * hd ..][0..hd],
                 ks_head[0..seq * hd], vs_head[0..seq * hd],
-                seq, hd, allocator,
+                seq, hd,
+                1.0 / @sqrt(@as(f32, @floatFromInt(hd))),
+                allocator,
             );
         }
 

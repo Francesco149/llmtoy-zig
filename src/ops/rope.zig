@@ -30,6 +30,25 @@ pub fn applyRope(vec: []f32, pos: usize, theta: f32) void {
     }
 }
 
+/// Apply RoPE using an explicit pre-computed frequency table.
+///
+/// freqs[i] holds the inverse frequency for the i-th pair of dimensions.
+/// freqs.len must equal vec.len / 2.  Used for Gemma4 global attention where
+/// frequencies are stored in the GGUF as rope_freqs.weight.
+pub fn applyRopeFreqs(vec: []f32, freqs: []const f32, pos: usize) void {
+    std.debug.assert(vec.len == freqs.len * 2);
+    const fpos: f32 = @floatFromInt(pos);
+    for (0..freqs.len) |i| {
+        const angle = fpos * freqs[i];
+        const cos_a = @cos(angle);
+        const sin_a = @sin(angle);
+        const x0 = vec[2 * i];
+        const x1 = vec[2 * i + 1];
+        vec[2 * i]     = x0 * cos_a - x1 * sin_a;
+        vec[2 * i + 1] = x0 * sin_a + x1 * cos_a;
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 test "applyRope: pos=0 is identity" {

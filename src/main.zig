@@ -7,6 +7,9 @@ const fwd         = @import("model/forward.zig");
 const kv_mod      = @import("model/kv_cache.zig");
 const sample_mod  = @import("model/sample.zig");
 const tp          = @import("ops/thread_pool.zig");
+const g4_loader   = @import("model/gemma4/loader.zig");
+const g4_fwd      = @import("model/gemma4/forward.zig");
+const g4_kv       = @import("model/gemma4/kv_cache.zig");
 
 // Pull tests from sub-modules into the test binary.
 comptime {
@@ -19,6 +22,7 @@ comptime {
     _ = @import("quant/dequant.zig");
     _ = @import("model/forward.zig");
     _ = @import("model/sample.zig");
+    _ = @import("model/gemma4/forward.zig");
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -140,6 +144,18 @@ fn cmdInfo(out: *std.Io.Writer, path: []const u8, io: std.Io, gpa: std.mem.Alloc
     if (reader.metaString("general.name")) |name| {
         try out.print("name:      {s}\n", .{name});
     }
+    if (reader.metaString("tokenizer.chat_template")) |tmpl| {
+        const first_line_end = std.mem.indexOfScalar(u8, tmpl, '\n') orelse tmpl.len;
+        try out.print("chat_tmpl: present ({} bytes), first line: {s}\n", .{ tmpl.len, tmpl[0..first_line_end] });
+    }
+    if (reader.metaU64("gemma4.embedding_length_per_layer_input")) |v| {
+        try out.print("per_layer_input: {}\n", .{v});
+    }
+    if (reader.metaU64("gemma4.attention.shared_kv_layers")) |v| {
+        try out.print("shared_kv_layers: {}\n", .{v});
+    }
+    if (reader.metaU32("tokenizer.ggml.bos_token_id")) |v| try out.print("bos_token: {}\n", .{v});
+    if (reader.metaU32("tokenizer.ggml.eos_token_id")) |v| try out.print("eos_token: {}\n", .{v});
 
     try out.print("\nquant distribution:\n", .{});
     var counts = std.AutoHashMap(u32, u32).init(gpa);
@@ -161,13 +177,15 @@ fn cmdInfo(out: *std.Io.Writer, path: []const u8, io: std.Io, gpa: std.mem.Alloc
             tensor.type_.label(), tensor.name, tensor.dims,
         });
     }
-    // Print blk.0 tensors for architecture inspection
-    try out.print("\nblk.0 tensors:\n", .{});
-    for (reader.data.tensors) |tensor| {
-        if (std.mem.startsWith(u8, tensor.name, "blk.0.")) {
-            try out.print("  [{s}] {s}  dims={any}\n", .{
-                tensor.type_.label(), tensor.name, tensor.dims,
-            });
+    // Print blk.0 and blk.5 tensors for architecture inspection
+    for ([_][]const u8{ "blk.0.", "blk.5." }) |prefix| {
+        try out.print("\n{s}* tensors:\n", .{prefix});
+        for (reader.data.tensors) |tensor| {
+            if (std.mem.startsWith(u8, tensor.name, prefix)) {
+                try out.print("  [{s}] {s}  dims={any}\n", .{
+                    tensor.type_.label(), tensor.name, tensor.dims,
+                });
+            }
         }
     }
 }
@@ -220,76 +238,104 @@ fn cmdGenerate(
     var reader = try gguf_reader.GgufReader.open(path, io, gpa);
     defer reader.deinit();
 
-    const cfg = try loader.configFromGguf(&reader, gpa);
-    std.debug.print(
-        "  layers={} heads={}/{} d_model={} d_ffn={} vocab={}\n",
-        .{ cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.d_model, cfg.d_ffn, cfg.vocab_size },
-    );
-
-    var weights = try loader.loadWeights(&reader, cfg, gpa);
-    defer weights.deinit();
-
     var vocab = try vocab_mod.fromGguf(&reader, gpa);
     defer vocab.deinit();
 
     const prompt_ids = try bpe.encode(prompt, &vocab, gpa);
     defer gpa.free(prompt_ids);
 
-    var kv = try kv_mod.KvCache.init(cfg, gpa);
-    defer kv.deinit();
+    const clk = std.Io.Clock.real;
+    const t_start = clk.now(io);
+    const n_threads: usize = if (opts.threads > 0) opts.threads else std.Thread.getCpuCount() catch 1;
+    const pool = try tp.ThreadPool.init(gpa, n_threads, io);
+    defer pool.deinit(gpa);
 
     var prng = std.Random.DefaultPrng.init(opts.seed);
     const rng = prng.random();
-
     const params = sample_mod.SampleParams{
         .temperature = opts.temperature,
         .top_p       = opts.top_p,
         .top_k       = opts.top_k,
     };
 
-    // Prefill: process every prompt token.
-    const clk = std.Io.Clock.real;
-    const t_start = clk.now(io);
-    const n_threads: usize = if (opts.threads > 0) opts.threads else std.Thread.getCpuCount() catch 1;
-    const pool = try tp.ThreadPool.init(gpa, n_threads, io);
-    defer pool.deinit(gpa);
-    std.debug.print("prefilling {} prompt tokens (threads={})...\n", .{ prompt_ids.len, n_threads });
-    var last_logits: []f32 = undefined;
-    for (prompt_ids, 0..) |tok, pos| {
-        if (pos > 0) gpa.free(last_logits);
-        last_logits = try fwd.forwardOneModel(tok, pos, &kv, &weights, cfg, pool, gpa);
-    }
-    const t_prefill = clk.now(io);
-    const prefill_ms = @divTrunc(t_start.durationTo(t_prefill).nanoseconds, std.time.ns_per_ms);
-    std.debug.print("  prefill: {} ms\n", .{prefill_ms});
-
-    // Echo prompt then generate.
     try out.print("{s}", .{prompt});
     try out.flush();
 
-    var n_gen: u32 = 0;
-    var pos: usize = prompt_ids.len;
-    while (n_gen < opts.max_tokens) : (n_gen += 1) {
-        const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
+    if (g4_loader.isGemma4(&reader)) {
+        const g4cfg = try g4_loader.configFromGguf(&reader, gpa);
+        std.debug.print(
+            "  [Gemma4] layers={} heads={} d_model={} experts={}/{} vocab={}\n",
+            .{ g4cfg.n_layers, g4cfg.n_heads, g4cfg.d_model,
+               g4cfg.n_experts, g4cfg.n_experts_used, g4cfg.vocab_size },
+        );
+        var weights = try g4_loader.loadWeights(&reader, g4cfg, gpa);
+        defer weights.deinit();
+        const max_seq: usize = @min(g4cfg.max_seq_len, 4096);
+        var kv = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
+        defer kv.deinit();
+        std.debug.print("prefilling {} tokens (threads={})...\n", .{ prompt_ids.len, n_threads });
+        var last_logits: []f32 = undefined;
+        for (prompt_ids, 0..) |tok, pos| {
+            if (pos > 0) gpa.free(last_logits);
+            last_logits = try g4_fwd.forwardOne(tok, pos, &kv, &weights, g4cfg, pool, gpa);
+        }
+        const t_prefill = clk.now(io);
+        std.debug.print("  prefill: {} ms\n", .{@divTrunc(t_start.durationTo(t_prefill).nanoseconds, std.time.ns_per_ms)});
+        var n_gen: u32 = 0;
+        var pos: usize = prompt_ids.len;
+        while (n_gen < opts.max_tokens) : (n_gen += 1) {
+            const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
+            gpa.free(last_logits);
+            if (next_tok == vocab.eos_token_id) break;
+            var tok_buf: [64]u8 = undefined;
+            const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
+            try out.writeAll(tok_buf[0..tok_len]);
+            try out.flush();
+            last_logits = try g4_fwd.forwardOne(next_tok, pos, &kv, &weights, g4cfg, pool, gpa);
+            pos += 1;
+        }
         gpa.free(last_logits);
-
-        // Decode token; stop on EOS.
-        if (next_tok == 1) break;
-
-        var tok_buf: [64]u8 = undefined;
-        const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
-        try out.writeAll(tok_buf[0..tok_len]);
-        try out.flush();
-
-        last_logits = try fwd.forwardOneModel(next_tok, pos, &kv, &weights, cfg, pool, gpa);
-        pos += 1;
+        const t_end = clk.now(io);
+        const gen_ms = @divTrunc(t_prefill.durationTo(t_end).nanoseconds, std.time.ns_per_ms);
+        const toks_per_s = if (gen_ms > 0) @divTrunc(@as(i96, n_gen) * 1000, gen_ms) else 0;
+        std.debug.print("  generated: {} tokens in {} ms ({} tok/s)\n", .{ n_gen, gen_ms, toks_per_s });
+    } else {
+        const cfg = try loader.configFromGguf(&reader, gpa);
+        std.debug.print(
+            "  layers={} heads={}/{} d_model={} d_ffn={} vocab={}\n",
+            .{ cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.d_model, cfg.d_ffn, cfg.vocab_size },
+        );
+        var weights = try loader.loadWeights(&reader, cfg, gpa);
+        defer weights.deinit();
+        var kv = try kv_mod.KvCache.init(cfg, gpa);
+        defer kv.deinit();
+        std.debug.print("prefilling {} tokens (threads={})...\n", .{ prompt_ids.len, n_threads });
+        var last_logits: []f32 = undefined;
+        for (prompt_ids, 0..) |tok, pos| {
+            if (pos > 0) gpa.free(last_logits);
+            last_logits = try fwd.forwardOneModel(tok, pos, &kv, &weights, cfg, pool, gpa);
+        }
+        const t_prefill = clk.now(io);
+        std.debug.print("  prefill: {} ms\n", .{@divTrunc(t_start.durationTo(t_prefill).nanoseconds, std.time.ns_per_ms)});
+        var n_gen: u32 = 0;
+        var pos: usize = prompt_ids.len;
+        while (n_gen < opts.max_tokens) : (n_gen += 1) {
+            const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
+            gpa.free(last_logits);
+            if (next_tok == vocab.eos_token_id) break;
+            var tok_buf: [64]u8 = undefined;
+            const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
+            try out.writeAll(tok_buf[0..tok_len]);
+            try out.flush();
+            last_logits = try fwd.forwardOneModel(next_tok, pos, &kv, &weights, cfg, pool, gpa);
+            pos += 1;
+        }
+        gpa.free(last_logits);
+        const t_end = clk.now(io);
+        const gen_ms = @divTrunc(t_prefill.durationTo(t_end).nanoseconds, std.time.ns_per_ms);
+        const toks_per_s = if (gen_ms > 0) @divTrunc(@as(i96, n_gen) * 1000, gen_ms) else 0;
+        std.debug.print("  generated: {} tokens in {} ms ({} tok/s)\n", .{ n_gen, gen_ms, toks_per_s });
     }
-    gpa.free(last_logits);
     try out.print("\n", .{});
     try out.flush();
-
-    const t_end = clk.now(io);
-    const gen_ms  = @divTrunc(t_prefill.durationTo(t_end).nanoseconds, std.time.ns_per_ms);
-    const toks_per_s = if (gen_ms > 0) @divTrunc(@as(i96, n_gen) * 1000, gen_ms) else 0;
-    std.debug.print("  generated: {} tokens in {} ms ({} tok/s)\n", .{ n_gen, gen_ms, toks_per_s });
 }

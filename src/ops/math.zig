@@ -39,6 +39,20 @@ pub fn silu(x: f32) f32 {
     return x / (1.0 + @exp(-x));
 }
 
+/// RMS normalize without a learned weight vector: out[i] = x[i] / rms(x)
+pub fn rmsnormRaw(out: []f32, x: []const f32, eps: f32) void {
+    var ss: f32 = 0.0;
+    for (x) |v| ss += v * v;
+    const rms_inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(x.len)) + eps);
+    for (out, x) |*o, v| o.* = v * rms_inv;
+}
+
+/// GELU activation (approximate, tanh variant): x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715*x³)))
+pub fn gelu(x: f32) f32 {
+    const c: f32 = 0.7978845608028654; // sqrt(2/π)
+    return 0.5 * x * (1.0 + std.math.tanh(c * (x + 0.044715 * x * x * x)));
+}
+
 /// Dot product using 8-wide f32 SIMD with 4 independent accumulators.
 ///
 /// 4 accumulators amortise the 5-cycle FMA latency on Zen 2 (2 FMA units,
