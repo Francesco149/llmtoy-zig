@@ -38,8 +38,13 @@ llmtoy:   33.573 s
 llama.cpp 24.265 s
 ```
 
-Both engines include model load, prefill, and generation time in this harness.
-The comparison is still useful because it is run the same way each time.
+The current CLI reports setup, prefill, and generation separately. Older notes
+below list total harness wall time because they were captured before that split.
+Use the split timings for future comparisons, especially `generation tok/s`.
+
+Profiling workflow lives in [profiling.md](/opt/ai-lab/llmtoy-zig/docs/profiling.md).
+Run `scripts/profile_gemma4.sh stat` for counters and
+`scripts/profile_gemma4.sh record` for sampled hot symbols.
 
 ## Optimization 1: Hoist Per-Layer Temporary Buffers
 
@@ -136,4 +141,5 @@ for this exact 16-entry lookup table. The likely next wins are:
 - reduce thread-pool wakeups around small expert matvecs
 - specialize Gemma4/A4B row types so `mat_type` branches disappear in hot loops
 - fuse gate and up expert projections for the packed `gate_up_exps` tensor
-- add a benchmark mode that excludes model load and reports prefill vs decode
+- add a benchmark mode that excludes model load entirely for stable decode-only
+  measurements

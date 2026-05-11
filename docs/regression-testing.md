@@ -74,10 +74,11 @@ The script assumes modern `llama-cli` flags:
 If the local llama.cpp clone changes CLI flags, update
 `scripts/regression_compare.py` rather than encoding those details in test docs.
 
-When `--chat` is passed, the script runs llama.cpp with `--conversation
---single-turn --reasoning off` so llama.cpp applies the model's chat template to
-the raw user prompt. `llmtoy` uses its own minimal chat-template helper for the
-same raw prompt.
+When `--chat` is passed, the script runs llama.cpp with
+`--conversation --single-turn --reasoning off` so llama.cpp applies the model's
+chat template to the raw user prompt. The nixpkgs `llama-cli` currently keeps
+some chat UI text in its raw stdout; the harness strips that from the
+human-readable `-- generation --` section while preserving raw stdout in JSON.
 
 ## transformers Notes
 

@@ -69,6 +69,11 @@ def find_llama_cli(explicit: str | None) -> list[str] | None:
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+LLMTOY_SETUP_RE = re.compile(r"setup:\s+(\d+)\s+ms")
+LLMTOY_TOKEN_TIMING_RE = re.compile(
+    r"(prefill|generation):\s+(\d+)\s+tokens\s+in\s+(\d+)\s+ms\s+\(([\d.]+)\s+tok/s\)"
+)
+LLAMA_TPS_RE = re.compile(r"\[\s*Prompt:\s*([\d.]+)\s*t/s\s*\|\s*Generation:\s*([\d.]+)\s*t/s\s*\]")
 
 
 def clean_text(text: str) -> str:
@@ -105,6 +110,29 @@ def generation_text(result: dict[str, Any]) -> str:
     return text
 
 
+def extract_timings(result: dict[str, Any]) -> dict[str, Any]:
+    text = clean_text(result.get("stderr", "") + "\n" + result.get("stdout", ""))
+    timings: dict[str, Any] = {}
+
+    if result.get("name") == "llmtoy":
+        if match := LLMTOY_SETUP_RE.search(text):
+            timings["setup_ms"] = int(match.group(1))
+        for match in LLMTOY_TOKEN_TIMING_RE.finditer(text):
+            label = match.group(1)
+            timings[label] = {
+                "tokens": int(match.group(2)),
+                "ms": int(match.group(3)),
+                "tok_s": float(match.group(4)),
+            }
+
+    if result.get("name") == "llama.cpp":
+        if match := LLAMA_TPS_RE.search(text):
+            timings["prefill_tok_s"] = float(match.group(1))
+            timings["generation_tok_s"] = float(match.group(2))
+
+    return timings
+
+
 def print_human_report(report: dict[str, Any]) -> None:
     print("Regression comparison")
     print(f"model: {report['model']}")
@@ -129,6 +157,22 @@ def print_human_report(report: dict[str, Any]) -> None:
         print(f"== {name}: exit={status} elapsed={elapsed}s ==")
         if result.get("expectation_failed"):
             print(result["expectation_failed"])
+
+        timings = result.get("timings") or {}
+        if timings:
+            print("-- timings --")
+            if "setup_ms" in timings:
+                print(f"setup: {timings['setup_ms']} ms")
+            if "prefill" in timings:
+                prefill = timings["prefill"]
+                print(f"prefill: {prefill['tokens']} tokens in {prefill['ms']} ms ({prefill['tok_s']:.2f} tok/s)")
+            if "generation" in timings:
+                gen = timings["generation"]
+                print(f"generation: {gen['tokens']} tokens in {gen['ms']} ms ({gen['tok_s']:.2f} tok/s)")
+            if "prefill_tok_s" in timings:
+                print(f"prefill: {timings['prefill_tok_s']:.2f} tok/s")
+            if "generation_tok_s" in timings:
+                print(f"generation: {timings['generation_tok_s']:.2f} tok/s")
 
         gen = generation_text(result)
         print("-- generation --")
@@ -252,6 +296,7 @@ def main() -> int:
             "--no-display-prompt",
             "--no-warmup",
             "--log-disable",
+            "--simple-io",
         ]
         if args.chat:
             llama_cmd.extend(["--conversation", "--single-turn", "--reasoning", "off"])
@@ -277,6 +322,7 @@ def main() -> int:
     for result in results:
         if result.get("skipped"):
             continue
+        result["timings"] = extract_timings(result)
         if result.get("exit_code") != 0:
             ok = False
         if args.expect_substring and args.expect_substring not in result.get("stdout", ""):

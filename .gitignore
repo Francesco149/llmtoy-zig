@@ -5,3 +5,4 @@ result-*
 .claude/
 __pycache__/
 *.py[cod]
+profiles/

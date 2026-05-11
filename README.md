@@ -98,7 +98,8 @@ nix shell nixpkgs#llama-cpp -c llama-cli \
   --reasoning off \
   --no-display-prompt \
   --no-warmup \
-  --log-disable
+  --log-disable \
+  --simple-io
 ```
 
 The regression helper runs both commands sequentially and prints compact output

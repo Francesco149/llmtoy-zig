@@ -245,6 +245,8 @@ fn cmdGenerate(
     gpa: std.mem.Allocator,
 ) !void {
     std.debug.print("loading {s}...\n", .{path});
+    const clk = std.Io.Clock.real;
+    const t_load_start = clk.now(io);
 
     var reader = try gguf_reader.GgufReader.open(path, io, gpa);
     defer reader.deinit();
@@ -264,8 +266,6 @@ fn cmdGenerate(
     const prompt_ids = try bpe.encode(prompt_text, &vocab, gpa);
     defer gpa.free(prompt_ids);
 
-    const clk = std.Io.Clock.real;
-    const t_start = clk.now(io);
     const n_threads: usize = if (opts.threads > 0) opts.threads else std.Thread.getCpuCount() catch 1;
     const pool = try tp.ThreadPool.init(gpa, n_threads, io);
     defer pool.deinit(gpa);
@@ -293,6 +293,8 @@ fn cmdGenerate(
         const max_seq: usize = @min(g4cfg.max_seq_len, 4096);
         var kv = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
         defer kv.deinit();
+        const t_prefill_start = clk.now(io);
+        printSetupTiming(t_load_start, t_prefill_start);
         std.debug.print("prefilling {} tokens (threads={})...\n", .{ prompt_ids.len, n_threads });
         var last_logits: []f32 = undefined;
         for (prompt_ids, 0..) |tok, pos| {
@@ -300,9 +302,10 @@ fn cmdGenerate(
             last_logits = try g4_fwd.forwardOne(tok, pos, &kv, &weights, g4cfg, pool, gpa);
         }
         const t_prefill = clk.now(io);
-        std.debug.print("  prefill: {} ms\n", .{@divTrunc(t_start.durationTo(t_prefill).nanoseconds, std.time.ns_per_ms)});
+        printTokenTiming("prefill", prompt_ids.len, t_prefill_start, t_prefill);
         var n_gen: u32 = 0;
         var pos: usize = prompt_ids.len;
+        const t_gen_start = clk.now(io);
         while (n_gen < opts.max_tokens) : (n_gen += 1) {
             const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
             gpa.free(last_logits);
@@ -316,9 +319,7 @@ fn cmdGenerate(
         }
         gpa.free(last_logits);
         const t_end = clk.now(io);
-        const gen_ms = @divTrunc(t_prefill.durationTo(t_end).nanoseconds, std.time.ns_per_ms);
-        const toks_per_s = if (gen_ms > 0) @divTrunc(@as(i96, n_gen) * 1000, gen_ms) else 0;
-        std.debug.print("  generated: {} tokens in {} ms ({} tok/s)\n", .{ n_gen, gen_ms, toks_per_s });
+        printTokenTiming("generation", n_gen, t_gen_start, t_end);
     } else {
         const cfg = try loader.configFromGguf(&reader, gpa);
         std.debug.print(
@@ -329,6 +330,8 @@ fn cmdGenerate(
         defer weights.deinit();
         var kv = try kv_mod.KvCache.init(cfg, gpa);
         defer kv.deinit();
+        const t_prefill_start = clk.now(io);
+        printSetupTiming(t_load_start, t_prefill_start);
         std.debug.print("prefilling {} tokens (threads={})...\n", .{ prompt_ids.len, n_threads });
         var last_logits: []f32 = undefined;
         for (prompt_ids, 0..) |tok, pos| {
@@ -336,9 +339,10 @@ fn cmdGenerate(
             last_logits = try fwd.forwardOneModel(tok, pos, &kv, &weights, cfg, pool, gpa);
         }
         const t_prefill = clk.now(io);
-        std.debug.print("  prefill: {} ms\n", .{@divTrunc(t_start.durationTo(t_prefill).nanoseconds, std.time.ns_per_ms)});
+        printTokenTiming("prefill", prompt_ids.len, t_prefill_start, t_prefill);
         var n_gen: u32 = 0;
         var pos: usize = prompt_ids.len;
+        const t_gen_start = clk.now(io);
         while (n_gen < opts.max_tokens) : (n_gen += 1) {
             const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
             gpa.free(last_logits);
@@ -352,10 +356,21 @@ fn cmdGenerate(
         }
         gpa.free(last_logits);
         const t_end = clk.now(io);
-        const gen_ms = @divTrunc(t_prefill.durationTo(t_end).nanoseconds, std.time.ns_per_ms);
-        const toks_per_s = if (gen_ms > 0) @divTrunc(@as(i96, n_gen) * 1000, gen_ms) else 0;
-        std.debug.print("  generated: {} tokens in {} ms ({} tok/s)\n", .{ n_gen, gen_ms, toks_per_s });
+        printTokenTiming("generation", n_gen, t_gen_start, t_end);
     }
     try out.print("\n", .{});
     try out.flush();
+}
+
+fn printSetupTiming(start: anytype, end: anytype) void {
+    const ms = @divTrunc(start.durationTo(end).nanoseconds, std.time.ns_per_ms);
+    std.debug.print("  setup: {} ms\n", .{ms});
+}
+
+fn printTokenTiming(label: []const u8, tokens: anytype, start: anytype, end: anytype) void {
+    const ns = start.durationTo(end).nanoseconds;
+    const ms = @divTrunc(ns, std.time.ns_per_ms);
+    const seconds = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    const tps = if (seconds > 0.0) @as(f64, @floatFromInt(tokens)) / seconds else 0.0;
+    std.debug.print("  {s}: {} tokens in {} ms ({d:.2} tok/s)\n", .{ label, tokens, ms, tps });
 }
