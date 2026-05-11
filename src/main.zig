@@ -100,7 +100,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\
         \\  llmtoy info <model.gguf>              print model metadata and tensor summary
         \\  llmtoy tokenize <model.gguf> <text>   BPE-encode text, print IDs and decoded tokens
-        \\  llmtoy generate <model.gguf> <prompt> [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S]
+        \\  llmtoy generate <model.gguf> <prompt> [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N]
         \\
     );
 }
@@ -155,11 +155,20 @@ fn cmdInfo(out: *std.Io.Writer, path: []const u8, io: std.Io, gpa: std.mem.Alloc
         try out.print("  {s}: {}\n", .{ gtype.label(), entry.value_ptr.* });
     }
 
-    try out.print("\nfirst 8 tensors:\n", .{});
-    for (reader.data.tensors[0..@min(8, reader.data.tensors.len)]) |tensor| {
-        try out.print("  [{s}] {s}  dims={any}  offset={}\n", .{
-            tensor.type_.label(), tensor.name, tensor.dims, tensor.offset,
+    try out.print("\nfirst 16 tensors:\n", .{});
+    for (reader.data.tensors[0..@min(16, reader.data.tensors.len)]) |tensor| {
+        try out.print("  [{s}] {s}  dims={any}\n", .{
+            tensor.type_.label(), tensor.name, tensor.dims,
         });
+    }
+    // Print blk.0 tensors for architecture inspection
+    try out.print("\nblk.0 tensors:\n", .{});
+    for (reader.data.tensors) |tensor| {
+        if (std.mem.startsWith(u8, tensor.name, "blk.0.")) {
+            try out.print("  [{s}] {s}  dims={any}\n", .{
+                tensor.type_.label(), tensor.name, tensor.dims,
+            });
+        }
     }
 }
 

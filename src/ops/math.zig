@@ -85,15 +85,7 @@ pub fn quantMatvec(
     std.debug.assert(row_buf.len >= cols);
     std.debug.assert(out.len == rows);
 
-    const row_bytes = switch (mat_type) {
-        .f32   => cols * 4,
-        .f16   => cols * 2,
-        .q5_0  => (cols / dq.Q5_0_BLOCK_ELEMS) * dq.Q5_0_BLOCK_BYTES,
-        .q8_0  => (cols / dq.Q8_0_BLOCK_ELEMS) * dq.Q8_0_BLOCK_BYTES,
-        .q4_k  => (cols / dq.QK_K) * dq.Q4_K_BLOCK_BYTES,
-        .q6_k  => (cols / dq.QK_K) * dq.Q6_K_BLOCK_BYTES,
-        else   => @panic("unsupported quant type in quantMatvec"),
-    };
+    const row_bytes = rowBytes(mat_type, cols);
 
     for (0..rows) |i| {
         const row_data = mat_data[i * row_bytes ..][0..row_bytes];
@@ -106,15 +98,42 @@ pub fn quantMatvec(
             continue;
         }
         const row = row_buf[0..cols];
-        switch (mat_type) {
-            .f32  => dq.dequantF32(row_data, row),
-            .f16  => dq.dequantF16(row_data, row),
-            .q5_0 => dq.dequantQ5_0(row_data, row),
-            .q4_k => dq.dequantQ4K(row_data, row),
-            .q6_k => dq.dequantQ6K(row_data, row),
-            else  => unreachable,
-        }
+        dequantRow(row_data, row, mat_type);
         out[i] = dotf32(row, vec);
+    }
+}
+
+/// Bytes occupied by one row of a quantized matrix.
+pub fn rowBytes(mat_type: GgmlType, cols: usize) usize {
+    return switch (mat_type) {
+        .f32    => cols * 4,
+        .f16    => cols * 2,
+        .q5_0   => (cols / dq.Q5_0_BLOCK_ELEMS) * dq.Q5_0_BLOCK_BYTES,
+        .q5_1   => (cols / dq.Q5_1_BLOCK_ELEMS) * dq.Q5_1_BLOCK_BYTES,
+        .q8_0   => (cols / dq.Q8_0_BLOCK_ELEMS) * dq.Q8_0_BLOCK_BYTES,
+        .q4_k   => (cols / dq.QK_K) * dq.Q4_K_BLOCK_BYTES,
+        .q5_k   => (cols / dq.QK_K) * dq.Q5_K_BLOCK_BYTES,
+        .q6_k   => (cols / dq.QK_K) * dq.Q6_K_BLOCK_BYTES,
+        .q3_k   => (cols / dq.QK_K) * dq.Q3_K_BLOCK_BYTES,
+        .iq4_nl => (cols / dq.IQ4_NL_BLOCK_ELEMS) * dq.IQ4_NL_BLOCK_BYTES,
+        else    => std.debug.panic("unsupported quant type in rowBytes: {s}", .{mat_type.label()}),
+    };
+}
+
+/// Dequantize one row of data into a pre-allocated f32 buffer.
+pub fn dequantRow(data: []const u8, out: []f32, mat_type: GgmlType) void {
+    switch (mat_type) {
+        .f32    => dq.dequantF32(data, out),
+        .f16    => dq.dequantF16(data, out),
+        .q5_0   => dq.dequantQ5_0(data, out),
+        .q5_1   => dq.dequantQ5_1(data, out),
+        .q8_0   => dq.dequantQ8_0(data, out),
+        .q4_k   => dq.dequantQ4K(data, out),
+        .q5_k   => dq.dequantQ5K(data, out),
+        .q6_k   => dq.dequantQ6K(data, out),
+        .q3_k   => dq.dequantQ3K(data, out),
+        .iq4_nl => dq.dequantIQ4NL(data, out),
+        else    => std.debug.panic("unsupported quant type in dequantRow: {s}", .{mat_type.label()}),
     }
 }
 
@@ -135,15 +154,7 @@ const RowJob = struct {
     }
 
     fn run(job: *RowJob) void {
-        const row_bytes: usize = switch (job.mat_type) {
-            .f32   => job.cols * 4,
-            .f16   => job.cols * 2,
-            .q5_0  => (job.cols / dq.Q5_0_BLOCK_ELEMS) * dq.Q5_0_BLOCK_BYTES,
-            .q8_0  => (job.cols / dq.Q8_0_BLOCK_ELEMS) * dq.Q8_0_BLOCK_BYTES,
-            .q4_k  => (job.cols / dq.QK_K) * dq.Q4_K_BLOCK_BYTES,
-            .q6_k  => (job.cols / dq.QK_K) * dq.Q6_K_BLOCK_BYTES,
-            else   => @panic("unsupported quant type in RowJob"),
-        };
+        const row_bytes = rowBytes(job.mat_type, job.cols);
         for (0..job.n_rows) |i| {
             const row_data = job.mat_data[(job.row_start + i) * row_bytes ..][0..row_bytes];
             if (job.mat_type == .q8_0) {
@@ -155,14 +166,7 @@ const RowJob = struct {
                 continue;
             }
             const row = job.row_buf[0..job.cols];
-            switch (job.mat_type) {
-                .f32  => dq.dequantF32(row_data, row),
-                .f16  => dq.dequantF16(row_data, row),
-                .q5_0 => dq.dequantQ5_0(row_data, row),
-                .q4_k => dq.dequantQ4K(row_data, row),
-                .q6_k => dq.dequantQ6K(row_data, row),
-                else  => unreachable,
-            }
+            dequantRow(row_data, row, job.mat_type);
             job.out[i] = dotf32(row, job.vec);
         }
     }

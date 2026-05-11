@@ -304,6 +304,197 @@ fn f16Bytes(b: *const [2]u8) f32 {
     return @floatCast(@as(f16, @bitCast(raw)));
 }
 
+// ── Q5_K ──────────────────────────────────────────────────────────────────────
+//
+// Super-block layout (176 bytes for 256 elements):
+//   [0..1]   f16  d       super-scale for sub-block scales
+//   [2..3]   f16  dmin    super-scale for sub-block mins
+//   [4..15]  u8[12] scales — same 6-bit (scale,min) packing as Q4_K
+//   [16..47] u8[32] qh    — 1 high bit per element, packed 8/byte
+//   [48..175] u8[128] ql  — 4 low bits per element, 2 per byte (same layout as Q4_K)
+//
+// High-bit packing: element at abs position n, with j = n/64, l = n%32, group = (n%64)/32.
+//   bit mask = 1 << (2*j + group);  hi = (qh[l] & mask) != 0
+//   Combined value: q5 = lo4 | (hi << 4)  → [0..31]; result = d*sc*q5 - dmin*mn
+//
+// This matches GGML dequantize_row_q5_K exactly (u1/u2 shifting pattern).
+
+pub const Q5_K_BLOCK_BYTES = 2 + 2 + K_SCALE_SIZE + QK_K / 8 + QK_K / 2; // 176
+
+pub fn dequantQ5K(data: []const u8, out: []f32) void {
+    const n_blocks = out.len / QK_K;
+    for (0..n_blocks) |b| {
+        const blk  = data[b * Q5_K_BLOCK_BYTES ..][0..Q5_K_BLOCK_BYTES];
+        const d    = f16Bytes(blk[0..2]);
+        const dmin = f16Bytes(blk[2..4]);
+        const sc_buf = blk[4..16];
+        const qh   = blk[16..48];
+        const ql   = blk[48..176];
+
+        var is: usize = 0;
+        var um1: u8 = 1;
+        var um2: u8 = 2;
+        var out_idx: usize = b * QK_K;
+        var ql_off: usize = 0;
+
+        for (0..4) |_| {
+            const sm1 = scaleMin(is,     sc_buf);
+            const sm2 = scaleMin(is + 1, sc_buf);
+            is += 2;
+            const d1 = d * @as(f32, @floatFromInt(sm1.sc));
+            const m1 = dmin * @as(f32, @floatFromInt(sm1.mn));
+            const d2 = d * @as(f32, @floatFromInt(sm2.sc));
+            const m2 = dmin * @as(f32, @floatFromInt(sm2.mn));
+
+            for (0..32) |l| {
+                const hi: f32 = if ((qh[l] & um1) != 0) 16.0 else 0.0;
+                out[out_idx] = d1 * (@as(f32, @floatFromInt(ql[ql_off + l] & 0xF)) + hi) - m1;
+                out_idx += 1;
+            }
+            for (0..32) |l| {
+                const hi: f32 = if ((qh[l] & um2) != 0) 16.0 else 0.0;
+                out[out_idx] = d2 * (@as(f32, @floatFromInt(ql[ql_off + l] >> 4)) + hi) - m2;
+                out_idx += 1;
+            }
+            ql_off += 32;
+            um1 *%= 4; // wrapping multiply: 1→4→16→64→(0 but loop done)
+            um2 *%= 4;
+        }
+    }
+}
+
+// ── Q3_K ──────────────────────────────────────────────────────────────────────
+//
+// Super-block layout (110 bytes for 256 elements):
+//   [0..31]  u8[32] hmask — 1 high bit per element (bit j+4*(n/128) of hmask[l] for element n)
+//   [32..95] u8[64] qs   — 2 low bits per element, 4 per byte
+//   [96..107] u8[12] scales — 16 × 6-bit signed scale values packed via GGML bit-trick
+//   [108..109] f16  d    — single super-scale (no dmin)
+//
+// Scale decode: read 12 bytes as 3 u32s, apply the GGML kmask bit manipulation, producing
+// 16 u8 scale values each in [0..63]. Actual scale = d * (val - 32), range [-32..31].
+//
+// Element decode: for n in [0,128) and [128,256) halves:
+//   qs_base = (n/128)*32;  shift = 2*(j%4);  m = 1 << (j + 4*(n/128))
+//   lo2 = (qs[qs_base + l + group*16] >> shift) & 3
+//   has_hi = (hmask[l + group*16] & m) != 0
+//   val = dl * (lo2 - (has_hi ? 0 : 4))          — signed [-4..3]
+//
+// Matches GGML dequantize_row_q3_K exactly.
+
+pub const Q3_K_BLOCK_BYTES = QK_K / 8 + QK_K / 4 + K_SCALE_SIZE + 2; // 110
+
+pub fn dequantQ3K(data: []const u8, out: []f32) void {
+    const n_blocks = out.len / QK_K;
+    for (0..n_blocks) |b| {
+        const blk   = data[b * Q3_K_BLOCK_BYTES ..][0..Q3_K_BLOCK_BYTES];
+        const hmask = blk[0..32];
+        const qs    = blk[32..96];
+        const d_all = f16Bytes(blk[108..110]);
+
+        // Unpack 12-byte scales into 16 u8 values via GGML's bit manipulation.
+        const kmask1: u32 = 0x03030303;
+        const kmask2: u32 = 0x0f0f0f0f;
+        var aux: [4]u32 = undefined;
+        aux[0] = std.mem.readInt(u32, blk[96..100],  .little);
+        aux[1] = std.mem.readInt(u32, blk[100..104], .little);
+        const tmp = std.mem.readInt(u32, blk[104..108], .little);
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2)         | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2)         | (((tmp >> 2) & kmask1) << 4);
+        const sc: [16]u8 = @bitCast(aux);
+
+        var is: usize = 0;
+        var m: u8 = 1;
+        var out_idx: usize = b * QK_K;
+
+        for (0..2) |half| {
+            const q_base: usize = half * 32;
+            var shift: u4 = 0;
+            for (0..4) |_| {
+                const dl  = d_all * (@as(f32, @floatFromInt(sc[is])) - 32.0); is += 1;
+                for (0..16) |l| {
+                    const lo2 = @as(i32, (qs[q_base + l] >> shift) & 3);
+                    const hi  = (hmask[l] & m) != 0;
+                    out[out_idx] = dl * @as(f32, @floatFromInt(lo2 - if (hi) @as(i32, 0) else 4));
+                    out_idx += 1;
+                }
+                const dl2 = d_all * (@as(f32, @floatFromInt(sc[is])) - 32.0); is += 1;
+                for (0..16) |l| {
+                    const lo2 = @as(i32, (qs[q_base + l + 16] >> shift) & 3);
+                    const hi  = (hmask[l + 16] & m) != 0;
+                    out[out_idx] = dl2 * @as(f32, @floatFromInt(lo2 - if (hi) @as(i32, 0) else 4));
+                    out_idx += 1;
+                }
+                shift = @intCast((@as(usize, shift) + 2) % 8);
+                m *%= 2; // wrapping left-shift by 1: 1→2→4→8→(16 but loop ends)
+            }
+        }
+    }
+}
+
+// ── Q5_1 ──────────────────────────────────────────────────────────────────────
+//
+// Block layout (24 bytes for 32 elements):
+//   [0..1]  f16 d    — scale
+//   [2..3]  f16 m    — offset (min)
+//   [4..7]  u8[4] qh — 1 high bit per element, packed 8/byte
+//   [8..23] u8[16] qs — 4 low bits per element, 2 per byte (nibble-packed)
+//
+// Dequant: q5 = lo4 | (hi << 4);  val = d * q5 + m   — unsigned range [0..31]
+
+pub const Q5_1_BLOCK_ELEMS = 32;
+pub const Q5_1_BLOCK_BYTES = 2 + 2 + 4 + 16; // 24
+
+pub fn dequantQ5_1(data: []const u8, out: []f32) void {
+    const n_blocks = out.len / Q5_1_BLOCK_ELEMS;
+    for (0..n_blocks) |b| {
+        const blk = data[b * Q5_1_BLOCK_BYTES ..][0..Q5_1_BLOCK_BYTES];
+        const d   = f16Bytes(blk[0..2]);
+        const m   = f16Bytes(blk[2..4]);
+        const qh  = blk[4..8];
+        const qs  = blk[8..24];
+        for (0..16) |j| {
+            const hi0: u8 = @intCast(((qh[j / 8] >> @intCast(j      % 8)) & 1) << 4);
+            const hi1: u8 = @intCast(((qh[(j + 16) / 8] >> @intCast((j + 16) % 8)) & 1) << 4);
+            const q0 = @as(f32, @floatFromInt((qs[j] & 0xF) | hi0));
+            const q1 = @as(f32, @floatFromInt((qs[j] >> 4)  | hi1));
+            out[b * Q5_1_BLOCK_ELEMS + j]      = d * q0 + m;
+            out[b * Q5_1_BLOCK_ELEMS + j + 16] = d * q1 + m;
+        }
+    }
+}
+
+// ── IQ4_NL ────────────────────────────────────────────────────────────────────
+//
+// Block layout (18 bytes for 32 elements):
+//   [0..1]  f16 d  — scale
+//   [2..17] u8[16] — 4-bit nibble per element, 2 per byte
+//
+// Uses a fixed non-linear lookup table instead of linear scale.
+
+pub const IQ4_NL_BLOCK_ELEMS = 32;
+pub const IQ4_NL_BLOCK_BYTES = 2 + IQ4_NL_BLOCK_ELEMS / 2; // 18
+
+const IQ4_NL_TABLE: [16]f32 = .{
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+       1.0,   13.0,  25.0,  38.0,  53.0,  69.0,  89.0, 113.0,
+};
+
+pub fn dequantIQ4NL(data: []const u8, out: []f32) void {
+    const n_blocks = out.len / IQ4_NL_BLOCK_ELEMS;
+    for (0..n_blocks) |b| {
+        const blk = data[b * IQ4_NL_BLOCK_BYTES ..][0..IQ4_NL_BLOCK_BYTES];
+        const d   = f16Bytes(blk[0..2]);
+        const qs  = blk[2..18];
+        for (0..16) |j| {
+            out[b * IQ4_NL_BLOCK_ELEMS + j]      = d * IQ4_NL_TABLE[qs[j] & 0xF];
+            out[b * IQ4_NL_BLOCK_ELEMS + j + 16] = d * IQ4_NL_TABLE[qs[j] >> 4];
+        }
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 test "dequantF32: round-trips" {

@@ -48,6 +48,7 @@ All CI-equivalent checks must pass before committing: `zig build test`.
   ```
   Co-Authored-By: Claude <noreply@anthropic.com>
   ```
+  Claude may commit whenever tests pass and a logical unit of work is complete — no need to ask first.
 - **Phases**: each phase has its own doc in `docs/phases/phaseN-*.md` explaining the concepts and implementation choices.
 
 ## Philosophy
@@ -60,16 +61,15 @@ All CI-equivalent checks must pass before committing: `zig build test`.
 
 ## Current phase
 
-**Phase 5 complete.** See `docs/roadmap.md` for the full plan.
+**Phase 6 in progress.** See `docs/roadmap.md` for the full plan.
 
-Completed steps (Qwen2.5-0.5B Q4_K_M, Ryzen 3600):
-- Step 1: raw Thread.spawn multi-threading → 1.54× (1.45 → 2.23 tok/s)
-- Step 2: AVX2 SIMD dot (`@Vector(8, f32)`, 4 accumulators) + native target → 3.03× (4.40 tok/s 12t)
-- Step 3: fused Q8_0 dequant+dot (`dotQ8_0`) → 14.06 tok/s on Q8_0
-- Step 4: fused Q5_0 dequant+dot (`dotQ5_0`) → 3.32× (4.82 tok/s 1t; 12t regressed due to spawn)
-- Step 5: persistent thread pool (`ThreadPool`, `std.Io.Mutex/Condition`) → **9.72× overall** (14.1 tok/s 12t)
-
-Phase 6 candidates: MoE routing (Qwen3.6/Gemma4), BF16 weights, batched prefill.
+Target: Gemma4 26B A4B (APEX-I-Mini). Architecture notes:
+- `n_experts=128`, `d_expert_ffn=704`, fused gate+up (Q3_K), `d_dense_ffn=2112`
+- Dual FFN per layer: MoE (128 experts, top-k) + dense SwiGLU
+- Alternating local (sliding window) / global attention; shared V from previous layer in some blocks
+- 6 norm tensors per layer; scalar `layer_output_scale`
+- New quant types needed: Q3_K (138 tensors), Q5_K (2), Q5_1 (2), IQ4_NL (10)
+- Gemma4-specific RoPE: uses `rope_freqs.weight` tensor (256 dims) instead of computed θ
 
 ## Zig 0.16 API patterns
 
