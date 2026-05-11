@@ -47,9 +47,12 @@ Completed steps (Qwen2.5-0.5B Q4_K_M, Ryzen 3600):
 - Step 5: persistent thread pool → **9.72× overall** (14.1 tok/s 12t)
 
 ## Phase 6 — MoE Architecture
-- Expert routing layer
-- Sparse dispatch (top-k experts)
-- Target: Qwen3.6 35B A3B or Gemma4 26B A4B
+- [x] Gemma4-specific loader, KV cache, and forward pass
+- [x] Expert routing layer and sparse top-k dispatch
+- [x] Gemma4 tokenizer/chat-template fixes for smoke tests
+- [x] Educational writeup: `docs/phases/phase6-gemma4-moe.md`
+- [ ] Known-good regression fixtures against llama.cpp/transformers
+- [ ] Qwen3.6 MoE support
 
 ## Phase 7 — GPU Path
 - Evaluate Vulkan vs ROCm complexity, pick simpler
