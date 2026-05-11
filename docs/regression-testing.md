@@ -1,7 +1,8 @@
 # Regression Testing Against Reference Engines
 
 The goal is to compare `llmtoy` against known-good engines before doing more
-optimization. The first harness is intentionally small and JSON-based:
+optimization. The first harness is intentionally small: it prints a compact
+human-readable comparison by default and can also emit JSON for fixtures.
 
 Run one model/engine comparison at a time. These CPU runs are slow and memory
 hungry, and parallel reference runs can make failures look like correctness
@@ -28,7 +29,19 @@ nix shell nixpkgs#llama-cpp -c llama-cli ...
 
 A custom path can be passed with `--llama-cli`.
 
-The output is a JSON record:
+By default the output is designed for visual inspection:
+
+```text
+== llmtoy: exit=0 elapsed=...s ==
+-- generation --
+The forward pass of a Mixture-of-Experts ...
+
+== llama.cpp: exit=0 elapsed=...s ==
+-- generation --
+The forward pass of a Mixture of Experts ...
+```
+
+Use `--json-only` to print the machine-readable JSON record:
 
 ```json
 {
@@ -47,14 +60,15 @@ The output is a JSON record:
 }
 ```
 
-Use `--json-out path` to save a report.
+Use `--json-out path` to save the JSON report while still printing the
+human-readable comparison.
 
 ## llama.cpp Notes
 
 The script assumes modern `llama-cli` flags:
 
 ```text
--m <model> -p <prompt> -n <tokens> -t <threads> --temp <temperature> --seed <seed> --no-display-prompt
+-m <model> -p <prompt> -n <tokens> -t <threads> --temp <temperature> --seed <seed> --no-display-prompt --log-disable
 ```
 
 If the local llama.cpp clone changes CLI flags, update

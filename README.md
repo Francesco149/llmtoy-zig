@@ -59,6 +59,64 @@ The capital of France is Paris.
   generated: 4 tokens in 16341 ms (0 tok/s)
 ```
 
+## Gemma4 llama.cpp Comparison
+
+The main Phase 6 target is Gemma4 26B A4B APEX I Mini:
+
+```sh
+MODEL=/opt/ai-lab/models/mudler/gemma-4-26B-A4B-it-APEX-GGUF/gemma-4-26B-A4B-APEX-I-Mini.gguf
+PROMPT="Briefly explain the full forward pass of a MoE model"
+```
+
+Run the prompt through llmtoy:
+
+```sh
+./zig-out/bin/llmtoy generate "$MODEL" "$PROMPT" \
+  --chat \
+  --max-tokens 80 \
+  --threads 12 \
+  --temperature 0.1 \
+  --top-k 40 \
+  --top-p 0.9 \
+  --seed 42
+```
+
+Run the equivalent llama.cpp prompt through the Nix-provided `llama-cli`:
+
+```sh
+nix shell nixpkgs#llama-cpp -c llama-cli \
+  -m "$MODEL" \
+  -p "$PROMPT" \
+  -n 80 \
+  -t 12 \
+  --temp 0.1 \
+  --top-k 40 \
+  --top-p 0.9 \
+  --seed 42 \
+  --conversation \
+  --single-turn \
+  --reasoning off \
+  --no-display-prompt \
+  --no-warmup \
+  --log-disable
+```
+
+The regression helper runs both commands sequentially and prints compact output
+for visual inspection:
+
+```sh
+nix develop --command python3 scripts/regression_compare.py \
+  --model "$MODEL" \
+  --prompt "$PROMPT" \
+  --chat \
+  --max-tokens 32 \
+  --threads 12 \
+  --temperature 0.1 \
+  --top-k 40 \
+  --top-p 0.9 \
+  --expect-substring MoE
+```
+
 ## Roadmap
 
 See [docs/roadmap.md](docs/roadmap.md) for the phase-by-phase plan.

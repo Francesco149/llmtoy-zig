@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -65,6 +66,67 @@ def find_llama_cli(explicit: str | None) -> list[str] | None:
     if shutil.which("nix"):
         return ["nix", "shell", "nixpkgs#llama-cpp", "-c", "llama-cli"]
     return None
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def clean_text(text: str) -> str:
+    text = ANSI_RE.sub("", text)
+    # llama.cpp progress indicators can rewrite a terminal line with \r. Keep
+    # only the final visible segment for each such line.
+    lines = []
+    for line in text.splitlines():
+        lines.append(line.split("\r")[-1])
+    return "\n".join(lines).strip()
+
+
+def generation_text(result: dict[str, Any]) -> str:
+    text = clean_text(result.get("stdout", ""))
+    if result.get("name") == "llmtoy":
+        # In chat mode llmtoy echoes the rendered prompt to stdout before tokens.
+        # The answer begins after Gemma's empty thought-channel close marker.
+        if "<channel|>" in text:
+            return text.split("<channel|>", 1)[1].strip()
+        if "<|turn>model" in text:
+            return text.split("<|turn>model", 1)[1].strip()
+    return text
+
+
+def print_human_report(report: dict[str, Any]) -> None:
+    print("Regression comparison")
+    print(f"model: {report['model']}")
+    print(f"prompt: {report['prompt']}")
+    print(
+        "settings: "
+        f"tokens={report['max_tokens']} threads={report['threads']} "
+        f"temp={report['temperature']} top_k={report['top_k']} top_p={report['top_p']}"
+    )
+    print()
+
+    for result in report["results"]:
+        name = result["name"]
+        if result.get("skipped"):
+            print(f"== {name}: skipped ==")
+            print(result.get("reason", ""))
+            print()
+            continue
+
+        status = result.get("exit_code")
+        elapsed = result.get("elapsed_s")
+        print(f"== {name}: exit={status} elapsed={elapsed}s ==")
+        if result.get("expectation_failed"):
+            print(result["expectation_failed"])
+
+        gen = generation_text(result)
+        print("-- generation --")
+        print(gen if gen else "(no stdout)")
+
+        stderr = clean_text(result.get("stderr", ""))
+        if stderr and status != 0:
+            print("-- stderr --")
+            print(stderr[-2000:])
+        print()
 
 
 def run_transformers(args: argparse.Namespace) -> dict[str, Any]:
@@ -128,6 +190,7 @@ def main() -> int:
     parser.add_argument("--expect-substring", default=None)
     parser.add_argument("--timeout-s", type=int, default=120)
     parser.add_argument("--json-out", default=None)
+    parser.add_argument("--json-only", action="store_true")
     args = parser.parse_args()
 
     results: list[dict[str, Any]] = []
@@ -176,6 +239,7 @@ def main() -> int:
             str(args.seed),
             "--no-display-prompt",
             "--no-warmup",
+            "--log-disable",
         ]
         if args.chat:
             llama_cmd.extend(["--conversation", "--single-turn", "--reasoning", "off"])
@@ -210,7 +274,10 @@ def main() -> int:
     encoded = json.dumps(report, indent=2, ensure_ascii=False)
     if args.json_out:
         Path(args.json_out).write_text(encoded + "\n", encoding="utf-8")
-    print(encoded)
+    if args.json_only:
+        print(encoded)
+    else:
+        print_human_report(report)
     return 0 if ok else 1
 
 
