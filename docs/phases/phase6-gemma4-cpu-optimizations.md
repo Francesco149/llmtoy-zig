@@ -225,6 +225,30 @@ SIMD in the inner dot loop.
 
 ## Optimization 3: Vectorize Q3_K Row Expansion
 
+### Quiet-System Rerun Sequence
+
+After the first Q3_K-vectorization notes were written, stray `llama-cli`
+processes were found on the host. To make the optimization history trustworthy,
+the earlier checkpoints were replayed by selectively restoring only the relevant
+source files while keeping the current benchmark/profiling scripts:
+
+```text
+Checkpoint                         llmtoy generation
+RoPE correctness baseline           32 tokens in 19022 ms (1.68 tok/s)
+temp-buffer hoist only              32 tokens in 19159 ms (1.67 tok/s)
+IQ4_NL fused dot only               32 tokens in 19160 ms (1.67 tok/s)
+hoist + IQ4_NL fused dot            pending: paused when backup job started
+current Q3_K vector expansion       pending rerun after backup/noise clears
+```
+
+These reruns change the interpretation of the first two optimization attempts:
+on this 32-token Gemma4 fixture, the temp-buffer hoist and scalar IQ4_NL fused
+dot are cleanup/structure changes, not measured speedups. Their earlier apparent
+wins were benchmark noise. The Q3_K vector expansion remains the likely real
+optimization, but the combined pre-Q3 checkpoint and final current checkpoint
+should be rerun in the next quiet usage window before treating the exact delta as
+final.
+
 The failed fused-dot experiment taught us that removing the scratch row is not
 automatically faster. The scratch row is wasteful, but it lets the next stage use
 the existing SIMD `dotf32` loop:
