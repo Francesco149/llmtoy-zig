@@ -72,6 +72,7 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 def clean_text(text: str) -> str:
+    text = text.replace("\b", "")
     text = ANSI_RE.sub("", text)
     # llama.cpp progress indicators can rewrite a terminal line with \r. Keep
     # only the final visible segment for each such line.
@@ -90,6 +91,17 @@ def generation_text(result: dict[str, Any]) -> str:
             return text.split("<channel|>", 1)[1].strip()
         if "<|turn>model" in text:
             return text.split("<|turn>model", 1)[1].strip()
+    if result.get("name") == "llama.cpp":
+        # llama-cli conversation mode can print an interactive banner and prompt
+        # even with logging disabled. The assistant text follows the last user
+        # prompt line that starts with "> ".
+        prompt_markers = [i for i, line in enumerate(text.splitlines()) if line.startswith("> ")]
+        lines = text.splitlines()
+        if prompt_markers:
+            text = "\n".join(lines[prompt_markers[-1] + 1 :])
+        text = re.sub(r"^[\s|/\\-]+", "", text)
+        text = re.sub(r"\n\[ Prompt:.*", "", text, flags=re.S)
+        text = text.replace("Exiting...", "")
     return text
 
 
