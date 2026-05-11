@@ -495,6 +495,31 @@ pub fn dequantIQ4NL(data: []const u8, out: []f32) void {
     }
 }
 
+/// Fused IQ4_NL dequant + dot product against `vec`.
+///
+/// APEX I Mini Gemma4 stores most large matrices in IQ4_NL. The simple path
+/// expands each row to f32 and then runs a dot product. This path keeps the
+/// quantized row compressed: each nibble indexes the fixed non-linear table,
+/// gets multiplied by the block scale, and contributes directly to the sum.
+pub fn dotIQ4NL(data: []const u8, vec: []const f32) f32 {
+    const n_blocks = vec.len / IQ4_NL_BLOCK_ELEMS;
+    var total: f32 = 0.0;
+    for (0..n_blocks) |b| {
+        const blk = data[b * IQ4_NL_BLOCK_BYTES ..][0..IQ4_NL_BLOCK_BYTES];
+        const d   = f16Bytes(blk[0..2]);
+        const qs  = blk[2..18];
+        const base = b * IQ4_NL_BLOCK_ELEMS;
+        var acc: f32 = 0.0;
+        for (0..16) |j| {
+            const q = qs[j];
+            acc += IQ4_NL_TABLE[q & 0xF] * vec[base + j];
+            acc += IQ4_NL_TABLE[q >> 4]  * vec[base + j + 16];
+        }
+        total += d * acc;
+    }
+    return total;
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 test "dequantF32: round-trips" {
@@ -568,6 +593,29 @@ test "dotQ5_0: matches dequant+scalar-dot" {
     for (decoded, vec) |d, v| expected += d * v;
 
     const got = dotQ5_0(&data, &vec);
+    try std.testing.expectApproxEqAbs(expected, got, 1e-3);
+}
+
+test "dotIQ4NL: matches dequant+scalar-dot" {
+    var data: [IQ4_NL_BLOCK_BYTES * 2]u8 = @splat(0);
+    data[0] = 0x00;
+    data[1] = 0x3C; // f16 1.0
+    data[IQ4_NL_BLOCK_BYTES] = 0x00;
+    data[IQ4_NL_BLOCK_BYTES + 1] = 0x40; // f16 2.0
+    for (0..16) |i| {
+        data[2 + i] = @intCast((i & 0xF) | ((15 - i) << 4));
+        data[IQ4_NL_BLOCK_BYTES + 2 + i] = @intCast(((i + 3) & 0xF) | (((i + 5) & 0xF) << 4));
+    }
+
+    var vec: [IQ4_NL_BLOCK_ELEMS * 2]f32 = undefined;
+    for (&vec, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i % 7) + 1)) * 0.25;
+
+    var decoded: [IQ4_NL_BLOCK_ELEMS * 2]f32 = undefined;
+    dequantIQ4NL(&data, &decoded);
+    var expected: f32 = 0.0;
+    for (decoded, vec) |w, x| expected += w * x;
+
+    const got = dotIQ4NL(&data, &vec);
     try std.testing.expectApproxEqAbs(expected, got, 1e-3);
 }
 

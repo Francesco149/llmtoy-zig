@@ -54,6 +54,11 @@ pub fn forwardOne(
     const xb         = try allocator.alloc(f32, d); defer allocator.free(xb);
     const attn_buf   = try allocator.alloc(f32, d); defer allocator.free(attn_buf);
     const ffn_buf    = try allocator.alloc(f32, d); defer allocator.free(ffn_buf);
+    const moe_buf    = try allocator.alloc(f32, d); defer allocator.free(moe_buf);
+    const moe_in     = try allocator.alloc(f32, d); defer allocator.free(moe_in);
+    const router_in  = try allocator.alloc(f32, d); defer allocator.free(router_in);
+    const router_out = try allocator.alloc(f32, cfg.n_experts); defer allocator.free(router_out);
+    const top_idx    = try allocator.alloc(usize, cfg.n_experts_used); defer allocator.free(top_idx);
 
     // Q/K/V buffers: sized for the largest layer (global).
     const q_buf = try allocator.alloc(f32, max_nq);  defer allocator.free(q_buf);
@@ -67,6 +72,15 @@ pub fn forwardOne(
     defer allocator.free(ks_head);
     const vs_head    = try allocator.alloc(f32, max_win * cfg.head_dim_global);
     defer allocator.free(vs_head);
+
+    // FFN and expert temporaries are reused for every layer. These used to be
+    // allocated inside the layer loop, which made the allocator part of the hot
+    // path for every generated token.
+    const gate_buf  = try allocator.alloc(f32, cfg.d_ffn); defer allocator.free(gate_buf);
+    const up_buf    = try allocator.alloc(f32, cfg.d_ffn); defer allocator.free(up_buf);
+    const eg        = try allocator.alloc(f32, cfg.d_expert); defer allocator.free(eg);
+    const eu        = try allocator.alloc(f32, cfg.d_expert); defer allocator.free(eu);
+    const ed        = try allocator.alloc(f32, d); defer allocator.free(ed);
 
     // Embedding lookup.  Gemma scales embeddings by sqrt(d_model).
     embedLookup(x, w.token_emb, token, d, scratch[0..max_cols]);
@@ -168,8 +182,6 @@ pub fn forwardOne(
         // ── Dense FFN path ────────────────────────────────────────────────────
 
         math.rmsnorm(xb, x, lw.ffn_norm, cfg.eps);
-        const gate_buf  = try allocator.alloc(f32, cfg.d_ffn); defer allocator.free(gate_buf);
-        const up_buf    = try allocator.alloc(f32, cfg.d_ffn); defer allocator.free(up_buf);
         math.quantMatvecPar(gate_buf, lw.w_gate.data, lw.w_gate.type_, xb, cfg.d_ffn, d, scratch, pool);
         math.quantMatvecPar(up_buf,   lw.w_up.data,   lw.w_up.type_,   xb, cfg.d_ffn, d, scratch, pool);
         for (gate_buf, up_buf) |*g, u| g.* = math.gelu(g.*) * u;
@@ -179,55 +191,44 @@ pub fn forwardOne(
         // ── MoE FFN path ──────────────────────────────────────────────────────
 
         // Expert input (named norm).
-        const moe_in = try allocator.alloc(f32, d); defer allocator.free(moe_in);
         math.rmsnorm(moe_in, x, lw.pre_ffw_norm_2, cfg.eps);
 
         // Router input: raw rmsnorm(x) * (1/sqrt(d)) * router_scale.
-        const router_in = try allocator.alloc(f32, d); defer allocator.free(router_in);
         math.rmsnormRaw(router_in, x, cfg.eps);
         const inv_sqrt_d = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
         for (router_in, lw.router_scale) |*r, s| r.* *= inv_sqrt_d * s;
 
         // Router logits → softmax → top-k indices.
-        const router_out = try allocator.alloc(f32, cfg.n_experts); defer allocator.free(router_out);
         math.quantMatvec(router_out, lw.router_w.data, lw.router_w.type_,
             router_in, cfg.n_experts, d, scratch[0..d]);
         math.softmax(router_out);
 
-        const top_idx = try allocator.alloc(usize, cfg.n_experts_used);
-        defer allocator.free(top_idx);
         topK(router_out, top_idx);
 
         // Run each selected expert; accumulate into moe_buf.
-        const moe_buf = try allocator.alloc(f32, d); defer allocator.free(moe_buf);
         @memset(moe_buf, 0.0);
 
         const gu_row_bytes   = math.rowBytes(lw.gate_up_exps.type_, d);
         const gu_per_expert  = 2 * cfg.d_expert * gu_row_bytes;
         const dn_row_bytes   = math.rowBytes(lw.down_exps.type_, cfg.d_expert);
         const dn_per_expert  = d * dn_row_bytes;
-        const expert_scratch = try allocator.alloc(f32, n_threads * @max(d, cfg.d_expert));
-        defer allocator.free(expert_scratch);
-        const eg = try allocator.alloc(f32, cfg.d_expert); defer allocator.free(eg);
-        const eu = try allocator.alloc(f32, cfg.d_expert); defer allocator.free(eu);
-        const ed = try allocator.alloc(f32, d);            defer allocator.free(ed);
 
         for (top_idx) |eidx| {
             const w_score = router_out[eidx];
 
             const gate_data = lw.gate_up_exps.data[eidx * gu_per_expert ..];
             math.quantMatvecPar(eg, gate_data, lw.gate_up_exps.type_,
-                moe_in, cfg.d_expert, d, expert_scratch, pool);
+                moe_in, cfg.d_expert, d, scratch, pool);
 
             const up_data = gate_data[cfg.d_expert * gu_row_bytes ..];
             math.quantMatvecPar(eu, up_data, lw.gate_up_exps.type_,
-                moe_in, cfg.d_expert, d, expert_scratch, pool);
+                moe_in, cfg.d_expert, d, scratch, pool);
 
             for (eg, eu) |*g, u| g.* = math.gelu(g.*) * u;
 
             const dn_data = lw.down_exps.data[eidx * dn_per_expert ..];
             math.quantMatvecPar(ed, dn_data, lw.down_exps.type_,
-                eg, d, cfg.d_expert, expert_scratch, pool);
+                eg, d, cfg.d_expert, scratch, pool);
 
             // Scale by per-expert output scale and router weight.
             const expert_scale = lw.down_exps_scale[eidx] * w_score;

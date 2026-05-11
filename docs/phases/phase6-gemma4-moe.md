@@ -476,3 +476,6 @@ Keep architecture-specific code isolated. The Gemma4 path lives under
 [src/model/gemma4](/opt/ai-lab/llmtoy-zig/src/model/gemma4/), while the dense
 Qwen path stays simple. That keeps the educational version readable and makes it
 clear which ideas are universal and which are model-family details.
+
+Gemma4-specific CPU optimization notes live in
+[phase6-gemma4-cpu-optimizations.md](/opt/ai-lab/llmtoy-zig/docs/phases/phase6-gemma4-cpu-optimizations.md).

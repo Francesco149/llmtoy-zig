@@ -1,0 +1,139 @@
+# Phase 6 Addendum: Gemma4 CPU Optimizations
+
+This addendum tracks optimization work for the current concrete target:
+
+```text
+CPU:   Ryzen 5 3600, 6 cores / 12 threads, Zen 2, AVX2 + F16C
+RAM:   64 GB
+Model: gemma-4-26B-A4B-APEX-I-Mini.gguf
+Run:   32 generated tokens, 12 threads, temperature 0.1, top-k 40, top-p 0.9
+```
+
+The rule for this phase is simple: make one meaningful change at a time, run the
+Gemma4 llama.cpp comparison, and write down what changed. A faster number is not
+enough; the goal is to understand why the change helped or why it did not.
+
+## Baseline
+
+Command:
+
+```sh
+nix develop --command python3 scripts/regression_compare.py \
+  --model /opt/ai-lab/models/mudler/gemma-4-26B-A4B-it-APEX-GGUF/gemma-4-26B-A4B-APEX-I-Mini.gguf \
+  --prompt "Briefly explain the full forward pass of a MoE model" \
+  --chat \
+  --max-tokens 32 \
+  --threads 12 \
+  --temperature 0.1 \
+  --top-k 40 \
+  --top-p 0.9 \
+  --expect-substring MoE \
+  --timeout-s 240
+```
+
+Initial measured result after the NeoX RoPE correctness fix:
+
+```text
+llmtoy:   33.573 s
+llama.cpp 24.265 s
+```
+
+Both engines include model load, prefill, and generation time in this harness.
+The comparison is still useful because it is run the same way each time.
+
+## Optimization 1: Hoist Per-Layer Temporary Buffers
+
+Gemma4's forward pass used to allocate dense FFN buffers, MoE input buffers,
+router buffers, selected-expert buffers, and expert scratch inside the layer loop.
+That meant every generated token performed allocator work for every layer.
+
+The first cleanup moved those buffers to the top of `forwardOne` and reused them
+for all layers:
+
+```zig
+const gate_buf  = try allocator.alloc(f32, cfg.d_ffn);
+const up_buf    = try allocator.alloc(f32, cfg.d_ffn);
+const eg        = try allocator.alloc(f32, cfg.d_expert);
+const eu        = try allocator.alloc(f32, cfg.d_expert);
+const ed        = try allocator.alloc(f32, d);
+```
+
+Result:
+
+```text
+llmtoy:   33.921 s
+llama.cpp 24.343 s
+```
+
+This did not improve wall time. That is a useful negative result: allocator churn
+was untidy, but the hot path is dominated by quantized matrix-vector products,
+especially the dense FFN and the top-8 expert gate/up/down matvecs.
+
+## Optimization 2: Fused IQ4_NL Dot Product
+
+APEX I Mini uses `IQ4_NL` for many large matrices. The generic path was:
+
+```text
+compressed row bytes -> dequantize full row to f32 scratch -> f32 dot(vec)
+```
+
+For a row with 2816 columns, that writes 2816 floats to scratch just so the next
+loop can immediately read them back. The fused path is:
+
+```text
+compressed row bytes -> table lookup + scale + multiply with vec -> sum
+```
+
+`IQ4_NL` stores 32 weights per block:
+
+```text
+[ f16 scale ][ 16 bytes of packed nibbles ]
+              lo nibble -> weight 0..15
+              hi nibble -> weight 16..31
+```
+
+Each 4-bit value indexes a small non-linear table:
+
+```zig
+acc += IQ4_NL_TABLE[q & 0xF] * vec[base + j];
+acc += IQ4_NL_TABLE[q >> 4]  * vec[base + j + 16];
+```
+
+Then the block sum is multiplied by the f16 scale. This is like reading a
+dictionary-compressed sentence without expanding the whole sentence first: each
+code points to a real value, and we use it immediately.
+
+Result:
+
+```text
+llmtoy:   33.451 s
+llama.cpp 24.007 s
+```
+
+This is only a small improvement in the current scalar implementation, but it is
+directionally correct and removes the f32 row materialization for `IQ4_NL`.
+
+## Disassembly Notes
+
+The ReleaseFast disassembly for `quant.dequant.dotIQ4NL` shows what the compiler
+made from the scalar fused loop:
+
+```text
+vcvtph2ps       convert the f16 block scale to f32
+movzbl/shr/and  unpack each packed nibble
+vmovss          load one table value
+vmulss          multiply table value by vec element
+vaddss          accumulate scalar products
+```
+
+The important part is what is absent on the `IQ4_NL` fast path: there is no call
+to `dequantRow`, no f32 scratch-row write, and no separate `dotf32` pass.
+
+It is still scalar per nibble. A future version can try to batch the 16 low
+nibbles and 16 high nibbles into vector lanes, but AVX2 has no cheap f32 gather
+for this exact 16-entry lookup table. The likely next wins are:
+
+- reduce thread-pool wakeups around small expert matvecs
+- specialize Gemma4/A4B row types so `mat_type` branches disappear in hot loops
+- fuse gate and up expert projections for the packed `gate_up_exps` tensor
+- add a benchmark mode that excludes model load and reports prefill vs decode
