@@ -143,3 +143,77 @@ for this exact 16-entry lookup table. The likely next wins are:
 - fuse gate and up expert projections for the packed `gate_up_exps` tensor
 - add a benchmark mode that excludes model load entirely for stable decode-only
   measurements
+
+## Profile 1: Where The Time Actually Goes
+
+After adding the profiling wrapper, a sampled run used:
+
+```sh
+TOKENS=8 scripts/profile_gemma4.sh record
+```
+
+Run shape:
+
+```text
+prefill:    25 tokens in 17762 ms (1.41 tok/s)
+generation:  8 tokens in  5749 ms (1.39 tok/s)
+samples:    14488
+```
+
+Top symbols from `perf report --stdio --no-children`:
+
+```text
+43.31% ops.math.dequantRow
+        37.90% dequantQ3K
+26.53% quant.dequant.dequantQ6K
+13.79% quant.dequant.dequantQ4K
+ 5.32% ops.math.RowJob.poolRun
+ 5.11% quant.dequant.dotQ5_0
+ 1.99% quant.dequant.dotIQ4NL
+ 0.39% model.gemma4.forward.forwardOne
+```
+
+The main lesson is that the Gemma4 path is not currently bottlenecked on the
+high-level transformer structure. Attention, RoPE, softmax, RMSNorm, GELU, and
+MoE routing barely show up compared with quantized row decoding.
+
+For this APEX I Mini quant, the expensive loop is:
+
+```text
+packed K-quant row -> dequantize row to f32 scratch -> vector dot with activation
+```
+
+Q3_K is the largest single target because Gemma4 uses it for the dense FFN
+gate/up matrices and the packed expert gate/up tensor. Those are called
+repeatedly for every token.
+
+### Negative Experiment: Scalar Q3_K Fused Dot
+
+A simple fused Q3_K dot was tested:
+
+```text
+packed Q3_K row -> decode each value -> multiply activation immediately
+```
+
+Correctness held for the fixed-seed smoke output, but performance got worse:
+
+```text
+baseline short run:       generation 1.41 tok/s
+scalar fused Q3_K:        generation 1.17 tok/s
+grouped scalar Q3_K:      generation 1.33 tok/s
+```
+
+The reason is that the old path, while wasteful, still feeds a fully dequantized
+row into `dotf32`, which uses 8-wide SIMD with multiple accumulators. The scalar
+fused loop saved scratch traffic but gave up too much SIMD throughput.
+
+So the lowest hanging fruit is not "fuse Q3_K naively"; it is one of:
+
+- implement a real AVX2 Q3_K/Q4_K/Q6_K vector-dot path
+- quantize the activation vector to Q8 blocks and port the llama.cpp
+  `q*_K × q8_K` dot strategy
+- specialize the K-quant matvec path enough that the compiler can see fixed
+  quant types and fewer branches inside hot row loops
+
+The profile makes Q3_K the first target, but the implementation needs to keep
+SIMD in the inner dot loop.
