@@ -3,3 +3,5 @@ zig-out/
 result
 result-*
 .claude/
+__pycache__/
+*.py[cod]

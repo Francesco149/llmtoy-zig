@@ -14,6 +14,7 @@
         gdb
         perf
         hyperfine
+        python3
       ];
 
       shellHook = ''
