@@ -103,6 +103,16 @@ Known-good reference source:
 6. Run only one model/engine at a time for reference comparisons. CPU inference
    is already slow and memory hungry; parallel model runs can distort timings or
    exhaust RAM.
+7. Before recording benchmark/profile numbers, check host CPU noise:
+
+   ```sh
+   scripts/check_benchmark_noise.sh
+   ```
+
+   Look especially for stray `llama-cli`, `llmtoy generate`,
+   `regression_compare.py`, `profile_gemma4.sh`, or `perf` processes. A sandboxed
+   Codex `ps` only sees the sandbox namespace unless the command is run outside
+   the sandbox, so use the host check when the number matters.
 
 ## Known Follow-Ups
 

@@ -41,6 +41,11 @@ llama.cpp 24.265 s
 The current CLI reports setup, prefill, and generation separately. Older notes
 below list total harness wall time because they were captured before that split.
 Use the split timings for future comparisons, especially `generation tok/s`.
+Before recording numbers, run `scripts/check_benchmark_noise.sh` on the host and
+make sure no stray `llama-cli`, `llmtoy generate`, `regression_compare.py`,
+`profile_gemma4.sh`, or `perf` process is still active. Some earlier numbers in
+this addendum were taken while stray llama.cpp processes were running, so the
+quiet-system reruns are the authoritative scores.
 
 Profiling workflow lives in [profiling.md](/opt/ai-lab/llmtoy-zig/docs/profiling.md).
 Run `scripts/profile_gemma4.sh stat` for counters and
@@ -259,19 +264,17 @@ f32 row because the following dot product is already good AVX2 code.
 Short fixed-seed check:
 
 ```text
-llmtoy:   prefill 25 tokens in 12378 ms (2.02 tok/s)
-          generation 8 tokens in 4026 ms (1.99 tok/s)
-llama.cpp prefill 25 tokens in 6759 ms (3.70 tok/s)
-          generation 8 tokens in 3635 ms (2.20 tok/s)
+llmtoy:   prefill 25 tokens in 10462 ms (2.39 tok/s)
+          generation 8 tokens in 3310 ms (2.42 tok/s)
 ```
 
 Longer 32-token comparison:
 
 ```text
-llmtoy:   prefill 25 tokens in 12552 ms (1.99 tok/s)
-          generation 32 tokens in 16170 ms (1.98 tok/s)
-llama.cpp prefill 25 tokens in 6760 ms (3.70 tok/s)
-          generation 32 tokens in 15972 ms (2.00 tok/s)
+llmtoy:   prefill 25 tokens in 10362 ms (2.41 tok/s)
+          generation 32 tokens in 13437 ms (2.38 tok/s)
+llama.cpp prefill 25 tokens at 4.20 tok/s
+          generation 32 tokens at 2.80 tok/s
 ```
 
 The generated prefix stayed stable:
@@ -283,25 +286,27 @@ The forward pass of a Mixture-of-Experts (MoE) model follows the standard transf
 This is the first optimization in this addendum that materially changes the
 Gemma4 generation rate. The profiled baseline was about `1.39 tok/s` generation;
 after vectorizing Q3_K expansion, the same short profile run measured about
-`1.98 tok/s`.
+`2.42 tok/s` on a quiet host. The earlier `1.98 tok/s` post-change number was
+still a real improvement, but it was recorded with stray llama.cpp work on the
+machine and should not be used as the benchmark score.
 
 Profile after this change:
 
 ```text
-36.76% quant.dequant.dequantQ6K
-21.38% ops.math.dequantRow
-        12.53% dequantQ3KGroup
-         3.81% dotf32
-         2.16% dequantQ3K
-19.02% quant.dequant.dequantQ4K
- 7.57% ops.math.RowJob.poolRun
- 7.11% quant.dequant.dotQ5_0
- 2.87% quant.dequant.dotIQ4NL
+37.12% quant.dequant.dequantQ6K
+21.20% ops.math.dequantRow
+        12.29% dequantQ3KGroup
+         4.00% dotf32
+         2.20% dequantQ3K
+19.47% quant.dequant.dequantQ4K
+ 7.70% quant.dequant.dotQ5_0
+ 6.91% ops.math.RowJob.poolRun
+ 2.81% quant.dequant.dotIQ4NL
 ```
 
 Before the change, Q3_K alone accounted for about `37.90%` under
 `dequantRow`. After the change, the inlined vector group helper is about
-`12.53%` under `dequantRow` plus `3.14%` under `RowJob.poolRun`, with a small
+`12.29%` under `dequantRow` plus `2.55%` under `RowJob.poolRun`, with a small
 amount of remaining Q3_K loop overhead. Some of that apparent movement is perf
 attribution around inlined code, but the overall shift is clear: Q3_K stopped
 being the dominant hotspot, and Q6_K/Q4_K are now the next targets.

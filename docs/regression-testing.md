@@ -8,6 +8,12 @@ Run one model/engine comparison at a time. These CPU runs are slow and memory
 hungry, and parallel reference runs can make failures look like correctness
 problems when they are really resource contention.
 
+When using this as a benchmark, check that the host is quiet before every run:
+
+```sh
+scripts/check_benchmark_noise.sh
+```
+
 ```sh
 nix develop --command python3 scripts/regression_compare.py \
   --model /opt/ai-lab/models/mudler/gemma-4-26B-A4B-it-APEX-GGUF/gemma-4-26B-A4B-APEX-I-Mini.gguf \

@@ -4,6 +4,20 @@ Optimization work should start from a profile, not from a guess. The current
 Gemma4 helper profiles one model run at a time and defaults to the Phase 6 APEX
 I Mini target.
 
+## Quiet-System Preflight
+
+Before recording numbers, check for noisy host processes:
+
+```sh
+scripts/check_benchmark_noise.sh
+```
+
+Do not record benchmark/profile results while unrelated high-CPU work is active.
+In particular, kill or wait for stray `llama-cli`, `llmtoy generate`,
+`regression_compare.py`, `profile_gemma4.sh`, or `perf` processes from earlier
+runs. Idle `llama-server` processes are less damaging to CPU timings, but they
+can still matter if memory pressure or swapping shows up.
+
 ## Quick Counter Run
 
 ```sh
@@ -74,7 +88,8 @@ scripts/profile_gemma4.sh record
 ```
 
 Only run one large model/profile at a time. CPU Gemma4 runs are memory-heavy, and
-parallel runs make profiles hard to interpret.
+parallel runs make profiles hard to interpret. Re-run the quiet-system preflight
+before each number you intend to publish in the phase notes.
 
 ## Reading Results
 
