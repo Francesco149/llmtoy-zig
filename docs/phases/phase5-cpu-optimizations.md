@@ -391,6 +391,60 @@ See `docs/benchmarks/phase5.md` for full numbers and hyperfine data.
 
 ---
 
+## Step 5: Persistent thread pool (`ThreadPool`)
+
+### The problem with raw spawn
+
+Every `quantMatvecPar` call spawned new OS threads. Linux `Thread.spawn` costs
+~200 µs. With 24 layers × ~27 matmuls × a few threads each, this added ~130 ms
+of pure spawn overhead per token — dwarfing the actual compute for fast quant types.
+
+After step 4's fused Q5_0, each row is so fast that even `min_rows=512` could not
+prevent spawn overhead from dominating. 12 threads ran *slower* than 1 thread.
+
+### Design
+
+```
+ThreadPool:
+  workers[N]  — threads blocked on work_ready condvar
+  queue[]     — ring-buffer of (func, ctx) entries
+  head/tail   — absolute counters; index via % cap
+  pending     — jobs submitted but not yet complete
+
+submit(func, ctx):   acquire mutex, enqueue, pending++, signal one worker
+wait():              acquire mutex, sleep on all_done while pending > 0
+workerLoop:          hold mutex, wait for work, release, execute, reacquire, pending--
+```
+
+Workers hold the mutex only when checking/modifying queue state, not during
+execution. The lock is never held across the actual compute.
+
+Zig 0.16 moved synchronisation primitives from `std.Thread.Mutex/Condition` to
+`std.Io.Mutex/Condition`, which require an `io: std.Io` parameter on every call
+(to support async cancellation). `ThreadPool` stores `io` at init time; all
+`lockUncancelable`, `unlock`, `waitUncancelable`, `signal`, `broadcast` calls
+pass `pool.io`.
+
+`min_rows_per_thread` dropped 512 → 64: pool wakeup costs ~5–20 µs, so the
+amortisation threshold is ~10× lower than for raw spawn.
+
+### Results
+
+| Threads | tok/s (step 4) | tok/s (step 5) | gain |
+|---------|----------------|----------------|------|
+| 1       | 4.82           | 4.77           | ~same |
+| 4       | —              | 10.7           | —     |
+| 8       | —              | 12.9           | —     |
+| 12      | 4.65           | **14.1**       | **3.0×** |
+
+12-thread pool (14.1 tok/s) is **9.72× faster than the Phase 4 serial baseline**
+(1.45 tok/s). The multi-threading that was a regression at step 4 is now the
+fastest configuration.
+
+See `docs/benchmarks/phase5.md` for full hyperfine data and analysis.
+
+---
+
 ## What's missing (Phase 6)
 
 - **MoE routing**: Qwen3.6 and Gemma4 use Mixture-of-Experts FFN layers. The loader

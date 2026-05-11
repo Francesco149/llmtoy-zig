@@ -6,6 +6,7 @@ const loader      = @import("model/loader.zig");
 const fwd         = @import("model/forward.zig");
 const kv_mod      = @import("model/kv_cache.zig");
 const sample_mod  = @import("model/sample.zig");
+const tp          = @import("ops/thread_pool.zig");
 
 // Pull tests from sub-modules into the test binary.
 comptime {
@@ -14,6 +15,7 @@ comptime {
     _ = @import("ops/math.zig");
     _ = @import("ops/attn.zig");
     _ = @import("ops/rope.zig");
+    _ = @import("ops/thread_pool.zig");
     _ = @import("quant/dequant.zig");
     _ = @import("model/forward.zig");
     _ = @import("model/sample.zig");
@@ -240,11 +242,13 @@ fn cmdGenerate(
     const clk = std.Io.Clock.real;
     const t_start = clk.now(io);
     const n_threads: usize = if (opts.threads > 0) opts.threads else std.Thread.getCpuCount() catch 1;
+    const pool = try tp.ThreadPool.init(gpa, n_threads, io);
+    defer pool.deinit(gpa);
     std.debug.print("prefilling {} prompt tokens (threads={})...\n", .{ prompt_ids.len, n_threads });
     var last_logits: []f32 = undefined;
     for (prompt_ids, 0..) |tok, pos| {
         if (pos > 0) gpa.free(last_logits);
-        last_logits = try fwd.forwardOneModel(tok, pos, &kv, &weights, cfg, n_threads, gpa);
+        last_logits = try fwd.forwardOneModel(tok, pos, &kv, &weights, cfg, pool, gpa);
     }
     const t_prefill = clk.now(io);
     const prefill_ms = @divTrunc(t_start.durationTo(t_prefill).nanoseconds, std.time.ns_per_ms);
@@ -268,7 +272,7 @@ fn cmdGenerate(
         try out.writeAll(tok_buf[0..tok_len]);
         try out.flush();
 
-        last_logits = try fwd.forwardOneModel(next_tok, pos, &kv, &weights, cfg, n_threads, gpa);
+        last_logits = try fwd.forwardOneModel(next_tok, pos, &kv, &weights, cfg, pool, gpa);
         pos += 1;
     }
     gpa.free(last_logits);

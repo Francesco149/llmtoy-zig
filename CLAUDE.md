@@ -60,12 +60,16 @@ All CI-equivalent checks must pass before committing: `zig build test`.
 
 ## Current phase
 
-**Phase 5 in progress.** See `docs/roadmap.md` for the full plan.
+**Phase 5 complete.** See `docs/roadmap.md` for the full plan.
 
-Multi-threading (`quantMatvecPar`, raw Thread.spawn/join) is done: 1.54× speedup
-on Qwen2.5-0.5B, `--threads N` CLI flag added for benchmarking.
+Completed steps (Qwen2.5-0.5B Q4_K_M, Ryzen 3600):
+- Step 1: raw Thread.spawn multi-threading → 1.54× (1.45 → 2.23 tok/s)
+- Step 2: AVX2 SIMD dot (`@Vector(8, f32)`, 4 accumulators) + native target → 3.03× (4.40 tok/s 12t)
+- Step 3: fused Q8_0 dequant+dot (`dotQ8_0`) → 14.06 tok/s on Q8_0
+- Step 4: fused Q5_0 dequant+dot (`dotQ5_0`) → 3.32× (4.82 tok/s 1t; 12t regressed due to spawn)
+- Step 5: persistent thread pool (`ThreadPool`, `std.Io.Mutex/Condition`) → **9.72× overall** (14.1 tok/s 12t)
 
-Next: AVX2 SIMD dot product — `@Vector(8, f32)` loop + fused Q8_0 dequant+dot.
+Phase 6 candidates: MoE routing (Qwen3.6/Gemma4), BF16 weights, batched prefill.
 
 ## Zig 0.16 API patterns
 
@@ -137,6 +141,20 @@ try w.writeAll("hello");
 ```
 
 **Testing I/O** — `std.testing.io` available inside tests.
+
+**Synchronisation** — `std.Thread.Mutex`/`std.Thread.Condition` do not exist in 0.16.
+Use `std.Io.Mutex` and `std.Io.Condition`; every operation requires `io: std.Io`:
+```zig
+mutex: std.Io.Mutex = std.Io.Mutex.init,
+cond:  std.Io.Condition = std.Io.Condition.init,
+
+mutex.lockUncancelable(io);
+defer mutex.unlock(io);
+cond.waitUncancelable(io, &mutex);
+cond.signal(io);
+cond.broadcast(io);
+```
+Store `io: std.Io` in any struct that needs sync (passed from `init.io` in main).
 
 **build.zig** — `root_source_file` moved into `root_module`:
 ```zig

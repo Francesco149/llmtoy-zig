@@ -1,6 +1,7 @@
 const std    = @import("std");
 const GgmlType = @import("../gguf/types.zig").GgmlType;
 const dq       = @import("../quant/dequant.zig");
+pub const ThreadPool = @import("thread_pool.zig").ThreadPool;
 
 /// Matrix-vector multiply: out[rows] = mat[rows×cols] · vec[cols]
 /// mat is row-major: row i starts at mat[i*cols].
@@ -128,6 +129,11 @@ const RowJob = struct {
     n_rows:    usize,
     cols:      usize,
 
+    fn poolRun(ctx: *anyopaque) void {
+        const job: *RowJob = @ptrCast(@alignCast(ctx));
+        job.run();
+    }
+
     fn run(job: *RowJob) void {
         const row_bytes: usize = switch (job.mat_type) {
             .f32   => job.cols * 4,
@@ -162,12 +168,11 @@ const RowJob = struct {
     }
 };
 
-/// Parallel version of quantMatvec.
+/// Parallel version of quantMatvec using a persistent thread pool.
 ///
-/// Splits output rows across `n_threads` threads. Each thread gets its own
-/// row_buf from `scratch` (caller must supply `n_threads * cols` floats).
-/// Falls back to the serial path when there are fewer rows than threads or
-/// rows-per-thread would be too few to amortize spawn overhead.
+/// Splits output rows across workers. Each worker gets its own row_buf
+/// from `scratch` (caller must supply `pool.threads.len × cols` floats).
+/// Falls back to the serial path when the matrix is too small to benefit.
 pub fn quantMatvecPar(
     out: []f32,
     mat_data: []const u8,
@@ -175,49 +180,42 @@ pub fn quantMatvecPar(
     vec: []const f32,
     rows: usize,
     cols: usize,
-    scratch: []f32,   // length >= n_threads * cols
-    n_threads: usize,
+    scratch: []f32,   // length >= pool.threads.len * cols
+    pool: *ThreadPool,
 ) void {
-    // Minimum rows-per-thread to amortize thread-spawn overhead (~200 µs each
-    // on Linux). 512 ensures tiny matrices (e.g. wk/wv at 128 rows) stay
-    // single-threaded, while large matrices (w_gate at 4864 rows) still use
-    // all available threads.
-    const min_rows_per_thread = 512;
-    const nt = @min(n_threads, rows / min_rows_per_thread + 1);
+    // With a persistent pool there is no spawn cost, so the threshold can be
+    // much lower than the old 512. 64 rows-per-thread still amortises the
+    // condition-variable wakeup (a few µs) without leaving parallelism on the
+    // table for mid-sized matrices like wq/wo (896 rows).
+    const min_rows: usize = 64;
+    const n = pool.threads.len;
+    const nt = @min(n, (rows + min_rows - 1) / min_rows);
 
     if (nt <= 1) {
         quantMatvec(out, mat_data, mat_type, vec, rows, cols, scratch[0..cols]);
         return;
     }
 
-    var jobs: [64]RowJob = undefined; // 64 threads is more than enough
-    var threads: [64]std.Thread = undefined;
-    var n_spawned: usize = 0;
-
+    var jobs: [64]RowJob = undefined;
     const base = rows / nt;
     const extra = rows % nt;
     var row: usize = 0;
     for (0..nt) |t| {
-        const n = base + if (t < extra) @as(usize, 1) else @as(usize, 0);
+        const n_rows = base + if (t < extra) @as(usize, 1) else @as(usize, 0);
         jobs[t] = .{
             .mat_data  = mat_data,
             .mat_type  = mat_type,
             .vec       = vec,
-            .out       = out[row..][0..n],
+            .out       = out[row..][0..n_rows],
             .row_buf   = scratch[t * cols ..][0..cols],
             .row_start = row,
-            .n_rows    = n,
+            .n_rows    = n_rows,
             .cols      = cols,
         };
-        threads[n_spawned] = std.Thread.spawn(.{}, RowJob.run, .{&jobs[t]}) catch {
-            jobs[t].run(); // spawn failed: run this slice on the caller thread
-            row += n;
-            continue;
-        };
-        n_spawned += 1;
-        row += n;
+        pool.submit(RowJob.poolRun, &jobs[t]);
+        row += n_rows;
     }
-    for (0..n_spawned) |t| threads[t].join();
+    pool.wait();
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

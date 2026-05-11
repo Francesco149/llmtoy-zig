@@ -280,3 +280,79 @@ eliminates the SIMD-scalar boundary crossing that `dequantQ5_0 + dotf32` require
 fast that `min_rows_per_thread=512` no longer adequately amortises the 200 µs
 spawn cost for medium matrices (wq at 896 rows spawns 2 threads = 400 µs overhead
 vs < 100 µs of useful work gained). A persistent thread pool would fix this.
+
+---
+
+## Step 5 — Persistent thread pool
+
+### Problem
+
+Each `quantMatvecPar` call spawned new threads (200 µs each). After fused Q5_0,
+per-row work is fast enough that spawn overhead exceeded parallelism gains at any
+matrix size. 12 threads was slower than 1 thread at step 4.
+
+### Changes
+
+- `src/ops/thread_pool.zig`: new `ThreadPool` struct with persistent worker threads
+  sleeping on a condition variable, draining a bounded ring-buffer work queue.
+  `submit(func, ctx)` enqueues without spawning. `wait()` blocks until all pending
+  jobs finish. No allocation inside the hot path.
+- `min_rows_per_thread` dropped from 512 → 64: pool wakeup costs ~5–20 µs, not
+  200 µs. wq/wo (896 rows) now gets all 12 threads instead of 2.
+- `quantMatvecPar` signature: `n_threads: usize` → `pool: *ThreadPool`.
+- `ThreadPool.init` takes `io: std.Io` (required by `std.Io.Mutex`/`std.Io.Condition`
+  in Zig 0.16's async-cancellation-aware sync API).
+- Pool created once in `cmdGenerate`, passed through `forwardOneModel`.
+
+### Results (50 tokens, ReleaseFast)
+
+| Threads | Wall time (mean ± σ) | tok/s | vs 1-thread |
+|---------|----------------------|-------|-------------|
+| 1       | 10.493 s ± 0.091 s   | 4.77  | —           |
+| 4       | 4.661 s ± 0.168 s    | 10.7  | 2.25×       |
+| 8       | 3.863 s ± 0.181 s    | 12.9  | 2.71×       |
+| 12      | 3.546 s ± 0.065 s    | 14.1  | **2.96×**   |
+
+### hyperfine (50 tokens, 5 runs each)
+
+```
+threads=1:   10.493 s ± 0.091 s
+threads=4:    4.661 s ± 0.168 s
+threads=8:    3.863 s ± 0.181 s
+threads=12:   3.546 s ± 0.065 s
+threads=12 is 2.96× faster than threads=1
+```
+
+### vs step 4 (12-thread)
+
+Step 4 (raw spawn): 4.65 tok/s (12t was *slower* than 1t at 4.82)
+Step 5 (pool):     14.1 tok/s — **3.0× faster at 12 threads**
+
+### Analysis
+
+**Spawn overhead removed**: Raw spawn was ~200 µs × ~650 spawns/token ≈ 130 ms
+overhead, consuming nearly all the per-token budget. Pool wakeup (condition-variable
+signal + futex) costs ~5–20 µs — 10–40× cheaper. The same 650 dispatches now add
+< 13 ms total overhead.
+
+**min_rows threshold**: Lowered from 512 → 64 because the amortisation criterion
+changed from "is the work > 200 µs?" to "is the work > 20 µs?". At 64 rows ÷ 12
+threads ≈ 6 rows/thread, a single wq (896×896) split is still 74 rows/thread —
+well above threshold. wk/wv (128 rows) get 10 rows/thread; below the threshold for
+small thread counts but submits correctly for 2 threads.
+
+**Scaling ceiling** (4.77 → 14.1 = 2.96× for 12 threads): Amdahl's law; sequential
+ops (rmsnorm, softmax, RoPE, residuals, sampling) are ~25% of wall time. The
+theoretical max at 12 threads is 12/((1-0.75)+0.75/12) ≈ 4.4×. Achieving 2.96× at
+12 threads means ~67% of the compute-bound work is parallelised effectively.
+
+### Cumulative from Phase 4 baseline
+
+| Step | tok/s (best config) | overall speedup |
+|------|---------------------|----------------|
+| Phase 4 serial scalar | 1.45 | — |
+| 5.1 threading (raw spawn) | 2.23 (12t) | 1.54× |
+| 5.2 SIMD dot + native target | 4.40 (12t) | 3.03× |
+| 5.3 fused Q8_0 | 4.40 (12t) | 3.03× (Q4_K unchanged) |
+| 5.4 fused Q5_0 | 4.82 (1t, spawn regressed MT) | 3.32× |
+| **5.5 thread pool** | **14.1 (12t)** | **9.72×** |
