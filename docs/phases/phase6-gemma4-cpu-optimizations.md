@@ -217,3 +217,105 @@ So the lowest hanging fruit is not "fuse Q3_K naively"; it is one of:
 
 The profile makes Q3_K the first target, but the implementation needs to keep
 SIMD in the inner dot loop.
+
+## Optimization 3: Vectorize Q3_K Row Expansion
+
+The failed fused-dot experiment taught us that removing the scratch row is not
+automatically faster. The scratch row is wasteful, but it lets the next stage use
+the existing SIMD `dotf32` loop:
+
+```text
+Q3_K bytes -> f32 scratch row -> AVX2 f32 dot
+```
+
+The next attempt kept that shape and only changed how a Q3_K block is expanded.
+Q3_K stores 256 weights per block. Each weight is built from two low bits in
+`qs` plus one high-bit decision in `hmask`, then scaled:
+
+```text
+low bits:    0..3
+hmask bit:   selects whether to subtract 0 or 4
+signed q:    low - correction        => range roughly -4..3
+weight:      signed q * per-group dl
+```
+
+The scalar loop decoded one lane at a time. The optimized helper decodes 16
+lanes at once with Zig vectors:
+
+```zig
+const lo_u8 = (qv >> @as(@Vector(Q3_GROUP_LANES, u3), @splat(shift))) &
+    @as(@Vector(Q3_GROUP_LANES, u8), @splat(3));
+const hi = (hv & @as(@Vector(Q3_GROUP_LANES, u8), @splat(m))) !=
+    @as(@Vector(Q3_GROUP_LANES, u8), @splat(0));
+const correction = @select(i32, hi, zeros, fours);
+const signed = lo_i32 - correction;
+```
+
+Intuitively, this is like grading 16 multiple-choice answers at once. The low
+bits provide each answer, the high-bit mask says which answer key to use, and
+the scale turns the small integer into the real weight. We still write the final
+f32 row because the following dot product is already good AVX2 code.
+
+Short fixed-seed check:
+
+```text
+llmtoy:   prefill 25 tokens in 12378 ms (2.02 tok/s)
+          generation 8 tokens in 4026 ms (1.99 tok/s)
+llama.cpp prefill 25 tokens in 6759 ms (3.70 tok/s)
+          generation 8 tokens in 3635 ms (2.20 tok/s)
+```
+
+Longer 32-token comparison:
+
+```text
+llmtoy:   prefill 25 tokens in 12552 ms (1.99 tok/s)
+          generation 32 tokens in 16170 ms (1.98 tok/s)
+llama.cpp prefill 25 tokens in 6760 ms (3.70 tok/s)
+          generation 32 tokens in 15972 ms (2.00 tok/s)
+```
+
+The generated prefix stayed stable:
+
+```text
+The forward pass of a Mixture-of-Experts (MoE) model follows the standard transformer architecture...
+```
+
+This is the first optimization in this addendum that materially changes the
+Gemma4 generation rate. The profiled baseline was about `1.39 tok/s` generation;
+after vectorizing Q3_K expansion, the same short profile run measured about
+`1.98 tok/s`.
+
+Profile after this change:
+
+```text
+36.76% quant.dequant.dequantQ6K
+21.38% ops.math.dequantRow
+        12.53% dequantQ3KGroup
+         3.81% dotf32
+         2.16% dequantQ3K
+19.02% quant.dequant.dequantQ4K
+ 7.57% ops.math.RowJob.poolRun
+ 7.11% quant.dequant.dotQ5_0
+ 2.87% quant.dequant.dotIQ4NL
+```
+
+Before the change, Q3_K alone accounted for about `37.90%` under
+`dequantRow`. After the change, the inlined vector group helper is about
+`12.53%` under `dequantRow` plus `3.14%` under `RowJob.poolRun`, with a small
+amount of remaining Q3_K loop overhead. Some of that apparent movement is perf
+attribution around inlined code, but the overall shift is clear: Q3_K stopped
+being the dominant hotspot, and Q6_K/Q4_K are now the next targets.
+
+The relevant disassembly shape in `ops.math.RowJob.poolRun` still shows the
+post-dequant dot loop using wide float operations:
+
+```text
+vmovups  load f32 scratch lanes
+vmulps   multiply scratch lanes by activation lanes
+vaddps   accumulate several vector sums
+```
+
+That is the practical lesson from this step: for this educational engine,
+specializing row expansion can be a good middle ground. It keeps the code easier
+to understand than a full `q3_K x q8_K` kernel, while preserving enough SIMD
+throughput to catch up with llama.cpp's generation speed on this small fixture.

@@ -383,6 +383,7 @@ pub fn dequantQ5K(data: []const u8, out: []f32) void {
 // Matches GGML dequantize_row_q3_K exactly.
 
 pub const Q3_K_BLOCK_BYTES = QK_K / 8 + QK_K / 4 + K_SCALE_SIZE + 2; // 110
+const Q3_GROUP_LANES = 16;
 
 pub fn dequantQ3K(data: []const u8, out: []f32) void {
     const n_blocks = out.len / QK_K;
@@ -414,24 +415,42 @@ pub fn dequantQ3K(data: []const u8, out: []f32) void {
             var shift: u3 = 0;
             for (0..4) |_| {
                 const dl  = d_all * (@as(f32, @floatFromInt(sc[is])) - 32.0); is += 1;
-                for (0..16) |l| {
-                    const lo2 = @as(i32, (qs[q_base + l] >> shift) & 3);
-                    const hi  = (hmask[l] & m) != 0;
-                    out[out_idx] = dl * @as(f32, @floatFromInt(lo2 - if (hi) @as(i32, 0) else 4));
-                    out_idx += 1;
-                }
+                dequantQ3KGroup(out[out_idx..][0..Q3_GROUP_LANES], qs[q_base..][0..Q3_GROUP_LANES], hmask[0..Q3_GROUP_LANES], shift, m, dl);
+                out_idx += Q3_GROUP_LANES;
+
                 const dl2 = d_all * (@as(f32, @floatFromInt(sc[is])) - 32.0); is += 1;
-                for (0..16) |l| {
-                    const lo2 = @as(i32, (qs[q_base + l + 16] >> shift) & 3);
-                    const hi  = (hmask[l + 16] & m) != 0;
-                    out[out_idx] = dl2 * @as(f32, @floatFromInt(lo2 - if (hi) @as(i32, 0) else 4));
-                    out_idx += 1;
-                }
+                dequantQ3KGroup(out[out_idx..][0..Q3_GROUP_LANES], qs[q_base + Q3_GROUP_LANES ..][0..Q3_GROUP_LANES], hmask[Q3_GROUP_LANES..][0..Q3_GROUP_LANES], shift, m, dl2);
+                out_idx += Q3_GROUP_LANES;
+
                 shift = @intCast((@as(u8, shift) +% 2) & 7);
                 m *%= 2; // wrapping left-shift by 1: 1→2→4→8→(16 but loop ends)
             }
         }
     }
+}
+
+inline fn dequantQ3KGroup(
+    out: *[Q3_GROUP_LANES]f32,
+    qs: *const [Q3_GROUP_LANES]u8,
+    hmask: *const [Q3_GROUP_LANES]u8,
+    shift: u3,
+    m: u8,
+    dl: f32,
+) void {
+    const qv: @Vector(Q3_GROUP_LANES, u8) = qs.*;
+    const hv: @Vector(Q3_GROUP_LANES, u8) = hmask.*;
+    const lo_u8 = (qv >> @as(@Vector(Q3_GROUP_LANES, u3), @splat(shift))) & @as(@Vector(Q3_GROUP_LANES, u8), @splat(3));
+    const lo_i32: @Vector(Q3_GROUP_LANES, i32) = @intCast(lo_u8);
+    const hi = (hv & @as(@Vector(Q3_GROUP_LANES, u8), @splat(m))) != @as(@Vector(Q3_GROUP_LANES, u8), @splat(0));
+    const correction: @Vector(Q3_GROUP_LANES, i32) = @select(
+        i32,
+        hi,
+        @as(@Vector(Q3_GROUP_LANES, i32), @splat(0)),
+        @as(@Vector(Q3_GROUP_LANES, i32), @splat(4)),
+    );
+    const signed = lo_i32 - correction;
+    const decoded = @as(@Vector(Q3_GROUP_LANES, f32), @floatFromInt(signed)) * @as(@Vector(Q3_GROUP_LANES, f32), @splat(dl));
+    out.* = decoded;
 }
 
 // ── Q5_1 ──────────────────────────────────────────────────────────────────────
