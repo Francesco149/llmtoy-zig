@@ -41,7 +41,11 @@ llmtoy generate model.gguf "The capital of France is" \
 llmtoy generate model.gguf "def fibonacci(n):" \
     --max-tokens 60 --temperature 0.8 --top-p 0.9 --top-k 40
 
-# Flags:  --max-tokens N   --temperature T   --top-p P   --top-k K   --seed S   --threads N
+# Wrap the prompt in the model's minimal chat template before generation
+llmtoy generate model.gguf "What is the capital of France?" \
+    --chat --max-tokens 8 --temperature 0.1 --threads 12
+
+# Flags:  --chat   --max-tokens N   --temperature T   --top-p P   --top-k K   --seed S   --threads N
 ```
 
 The `generate` command writes the completed text to stdout and progress/timing to stderr:

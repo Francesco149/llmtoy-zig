@@ -9,7 +9,7 @@ Command:
 ```sh
 ./zig-out/bin/llmtoy generate \
   /opt/ai-lab/models/mudler/gemma-4-26B-A4B-it-APEX-GGUF/gemma-4-26B-A4B-APEX-I-Mini.gguf \
-  $'<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\nThe capital of France is' \
+  $'<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>The capital of France is' \
   --max-tokens 8 --threads 12 --temperature 0.1
 ```
 

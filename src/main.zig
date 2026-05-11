@@ -2,6 +2,7 @@ const std         = @import("std");
 const gguf_reader = @import("gguf/reader.zig");
 const vocab_mod   = @import("tokenizer/vocab.zig");
 const bpe         = @import("tokenizer/bpe.zig");
+const chat_tmpl   = @import("tokenizer/chat_template.zig");
 const loader      = @import("model/loader.zig");
 const fwd         = @import("model/forward.zig");
 const kv_mod      = @import("model/kv_cache.zig");
@@ -15,6 +16,7 @@ const g4_kv       = @import("model/gemma4/kv_cache.zig");
 comptime {
     _ = @import("gguf/reader.zig");
     _ = @import("tokenizer/bpe.zig");
+    _ = @import("tokenizer/chat_template.zig");
     _ = @import("ops/math.zig");
     _ = @import("ops/attn.zig");
     _ = @import("ops/rope.zig");
@@ -57,7 +59,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, args[1], "generate")) {
         if (args.len < 4) {
             std.debug.print(
-                "usage: llmtoy generate <model.gguf> <prompt> [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N]\n",
+                "usage: llmtoy generate <model.gguf> <prompt> [--chat] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N]\n",
                 .{},
             );
             return error.MissingArg;
@@ -72,10 +74,16 @@ pub fn main(init: std.process.Init) !void {
         var top_k:       u32   = 40;
         var seed:        u64   = 42;
         var threads:     u32   = 0; // 0 = auto (getCpuCount)
+        var chat:        bool  = false;
         var i: usize = 4;
-        while (i < args.len) : (i += 2) {
-            if (i + 1 >= args.len) break;
+        while (i < args.len) {
             const flag = args[i];
+            if (std.mem.eql(u8, flag, "--chat")) {
+                chat = true;
+                i += 1;
+                continue;
+            }
+            if (i + 1 >= args.len) break;
             const val  = args[i + 1];
             if (std.mem.eql(u8, flag, "--max-tokens"))  max_tokens  = try std.fmt.parseInt(u32, val, 10);
             if (std.mem.eql(u8, flag, "--temperature")) temperature = try std.fmt.parseFloat(f32, val);
@@ -83,6 +91,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, flag, "--top-k"))       top_k       = try std.fmt.parseInt(u32, val, 10);
             if (std.mem.eql(u8, flag, "--seed"))        seed        = try std.fmt.parseInt(u64, val, 10);
             if (std.mem.eql(u8, flag, "--threads"))     threads     = try std.fmt.parseInt(u32, val, 10);
+            i += 2;
         }
 
         try cmdGenerate(out, model_path, prompt, .{
@@ -92,6 +101,7 @@ pub fn main(init: std.process.Init) !void {
             .top_k       = top_k,
             .seed        = seed,
             .threads     = threads,
+            .chat        = chat,
         }, io, gpa);
     } else {
         try usagePrint(out);
@@ -104,7 +114,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\
         \\  llmtoy info <model.gguf>              print model metadata and tensor summary
         \\  llmtoy tokenize <model.gguf> <text>   BPE-encode text, print IDs and decoded tokens
-        \\  llmtoy generate <model.gguf> <prompt> [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N]
+        \\  llmtoy generate <model.gguf> <prompt> [--chat] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N]
         \\
     );
 }
@@ -223,6 +233,7 @@ const GenerateOptions = struct {
     top_k:       u32  = 40,
     seed:        u64  = 42,
     threads:     u32  = 0, // 0 = auto
+    chat:        bool = false,
 };
 
 fn cmdGenerate(
@@ -241,7 +252,16 @@ fn cmdGenerate(
     var vocab = try vocab_mod.fromGguf(&reader, gpa);
     defer vocab.deinit();
 
-    const prompt_ids = try bpe.encode(prompt, &vocab, gpa);
+    const rendered_prompt = if (opts.chat) blk: {
+        const messages = [_]chat_tmpl.Message{.{ .role = .user, .content = prompt }};
+        break :blk try chat_tmpl.apply(gpa, &vocab, &messages, true);
+    } else null;
+    defer {
+        if (rendered_prompt) |p| gpa.free(p);
+    }
+
+    const prompt_text = rendered_prompt orelse prompt;
+    const prompt_ids = try bpe.encode(prompt_text, &vocab, gpa);
     defer gpa.free(prompt_ids);
 
     const clk = std.Io.Clock.real;
@@ -258,7 +278,7 @@ fn cmdGenerate(
         .top_k       = opts.top_k,
     };
 
-    try out.print("{s}", .{prompt});
+    try out.print("{s}", .{prompt_text});
     try out.flush();
 
     if (g4_loader.isGemma4(&reader)) {
