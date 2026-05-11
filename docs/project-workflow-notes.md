@@ -88,6 +88,8 @@ Known-good reference source:
   optional per-layer embedding path in llama.cpp is inactive.
 - `gemma4.attention.shared_kv_layers = 0`, so every layer owns KV.
 - llama.cpp confirms Gemma4 attention scale is `1.0`.
+- Gemma4 uses GPT-NeoX-style RoPE pairing: rotate `(i, i + head_dim/2)`, not
+  consecutive pairs.
 - V gets raw RMSNorm after projection. For global layers without `attn_v.weight`,
   copy raw K into V before applying K's learned norm.
 

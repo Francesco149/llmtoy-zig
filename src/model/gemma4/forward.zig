@@ -110,14 +110,14 @@ pub fn forwardOne(
         // RoPE on Q heads.
         if (is_swa) {
             for (0..cfg.n_heads) |h|
-                rope_mod.applyRope(q[h * hd ..][0..hd], pos, cfg.rope_theta_swa);
+                rope_mod.applyRopeNeox(q[h * hd ..][0..hd], pos, cfg.rope_theta_swa);
             for (0..n_kv_l) |h|
-                rope_mod.applyRope(k_cur[h * hd ..][0..hd], pos, cfg.rope_theta_swa);
+                rope_mod.applyRopeNeox(k_cur[h * hd ..][0..hd], pos, cfg.rope_theta_swa);
         } else {
             for (0..cfg.n_heads) |h|
-                rope_mod.applyRopeFreqs(q[h * hd ..][0..hd], w.rope_freqs, pos);
+                rope_mod.applyRopeFreqsNeox(q[h * hd ..][0..hd], w.rope_freqs, pos);
             for (0..n_kv_l) |h|
-                rope_mod.applyRopeFreqs(k_cur[h * hd ..][0..hd], w.rope_freqs, pos);
+                rope_mod.applyRopeFreqsNeox(k_cur[h * hd ..][0..hd], w.rope_freqs, pos);
         }
 
         // Write K, V into KV cache.

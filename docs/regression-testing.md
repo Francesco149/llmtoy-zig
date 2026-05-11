@@ -10,17 +10,23 @@ problems when they are really resource contention.
 ```sh
 nix develop --command python3 scripts/regression_compare.py \
   --model /opt/ai-lab/models/mudler/gemma-4-26B-A4B-it-APEX-GGUF/gemma-4-26B-A4B-APEX-I-Mini.gguf \
-  --prompt "What is the capital of France?" \
+  --prompt "Briefly explain the full forward pass of a MoE model" \
   --chat \
-  --max-tokens 8 \
+  --max-tokens 32 \
   --threads 12 \
   --temperature 0.1 \
-  --expect-substring Paris
+  --expect-substring MoE
 ```
 
 The script always runs `./zig-out/bin/llmtoy`. If `llama-cli` is available in
 `PATH`, or at `/opt/ai-lab/llama.cpp/build/bin/llama-cli`, it also runs
-llama.cpp. A custom path can be passed with `--llama-cli`.
+llama.cpp. Otherwise it falls back to:
+
+```sh
+nix shell nixpkgs#llama-cpp -c llama-cli ...
+```
+
+A custom path can be passed with `--llama-cli`.
 
 The output is a JSON record:
 
@@ -54,9 +60,10 @@ The script assumes modern `llama-cli` flags:
 If the local llama.cpp clone changes CLI flags, update
 `scripts/regression_compare.py` rather than encoding those details in test docs.
 
-The current script does not apply llama.cpp chat templates. For chat-template
-comparison, either pass an already-rendered prompt or add model-specific
-rendering support to the harness.
+When `--chat` is passed, the script runs llama.cpp with `--conversation
+--single-turn --reasoning off` so llama.cpp applies the model's chat template to
+the raw user prompt. `llmtoy` uses its own minimal chat-template helper for the
+same raw prompt.
 
 ## transformers Notes
 

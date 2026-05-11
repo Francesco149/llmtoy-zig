@@ -49,6 +49,46 @@ pub fn applyRopeFreqs(vec: []f32, freqs: []const f32, pos: usize) void {
     }
 }
 
+/// Apply GPT-NeoX style RoPE pairing.
+///
+/// Instead of rotating consecutive pairs `(0,1), (2,3), ...`, NeoX-style RoPE
+/// rotates dimensions across the two halves of the head:
+/// `(0, half), (1, half+1), ...`. llama.cpp uses this RoPE layout for Gemma4.
+pub fn applyRopeNeox(vec: []f32, pos: usize, theta: f32) void {
+    std.debug.assert(vec.len % 2 == 0);
+    const half = vec.len / 2;
+    for (0..half) |i| {
+        const freq = 1.0 / std.math.pow(
+            f32,
+            theta,
+            @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(vec.len)),
+        );
+        const angle = @as(f32, @floatFromInt(pos)) * freq;
+        const cos_a = @cos(angle);
+        const sin_a = @sin(angle);
+        const x0 = vec[i];
+        const x1 = vec[i + half];
+        vec[i]        = x0 * cos_a - x1 * sin_a;
+        vec[i + half] = x0 * sin_a + x1 * cos_a;
+    }
+}
+
+/// Apply GPT-NeoX style RoPE using an explicit pre-computed frequency table.
+pub fn applyRopeFreqsNeox(vec: []f32, freqs: []const f32, pos: usize) void {
+    std.debug.assert(vec.len == freqs.len * 2);
+    const half = vec.len / 2;
+    const fpos: f32 = @floatFromInt(pos);
+    for (0..half) |i| {
+        const angle = fpos * freqs[i];
+        const cos_a = @cos(angle);
+        const sin_a = @sin(angle);
+        const x0 = vec[i];
+        const x1 = vec[i + half];
+        vec[i]        = x0 * cos_a - x1 * sin_a;
+        vec[i + half] = x0 * sin_a + x1 * cos_a;
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 test "applyRope: pos=0 is identity" {
@@ -79,4 +119,19 @@ test "applyRope: same pos gives same rotation" {
     applyRope(&v1, 5, 10000.0);
     applyRope(&v2, 5, 10000.0);
     for (v1, v2) |a, b| try @import("std").testing.expectEqual(a, b);
+}
+
+test "applyRopeNeox: rotates across head halves" {
+    var v = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    applyRopeNeox(&v, 0, 10000.0);
+    try @import("std").testing.expectApproxEqAbs(@as(f32, 1.0), v[0], 1e-6);
+    try @import("std").testing.expectApproxEqAbs(@as(f32, 2.0), v[1], 1e-6);
+    try @import("std").testing.expectApproxEqAbs(@as(f32, 3.0), v[2], 1e-6);
+    try @import("std").testing.expectApproxEqAbs(@as(f32, 4.0), v[3], 1e-6);
+
+    applyRopeNeox(&v, 1, 10000.0);
+    // Pair (0,2) changes under the first frequency while dimensions 1 and 3
+    // use the much slower second frequency.
+    try @import("std").testing.expect(v[0] != 1.0);
+    try @import("std").testing.expect(v[2] != 3.0);
 }

@@ -180,8 +180,19 @@ then V gets the learned K scale too, which the model did not train with.
 
 ## RoPE: Two Flavors In One Model
 
-SWA layers use the usual computed RoPE frequencies with `rope_theta_swa = 10000`.
-Global layers use explicit `rope_freqs.weight` from the GGUF.
+SWA layers use computed RoPE frequencies with `rope_theta_swa = 10000`.
+Global layers use explicit `rope_freqs.weight` from the GGUF. Both layer types
+use GPT-NeoX-style pairing, which rotates across the two halves of a head:
+
+```text
+standard pair layout:  (0,1), (2,3), (4,5), ...
+NeoX pair layout:      (0,h), (1,h+1), (2,h+2), ... where h = head_dim / 2
+```
+
+This pairing is not a cosmetic detail. It changes which coordinates are mixed
+by the positional rotation. A model trained with NeoX pairing will still produce
+finite activations if consecutive-pair RoPE is used, but attention positions are
+wrong and generation can drift into repetition.
 
 Phase 4's RoPE function computes:
 
@@ -192,7 +203,7 @@ freq_i = theta ^ (-2i / head_dim)
 Gemma4 global layers can instead load `freq_i` directly:
 
 ```zig
-rope_mod.applyRopeFreqs(q_head, w.rope_freqs, pos);
+rope_mod.applyRopeFreqsNeox(q_head, w.rope_freqs, pos);
 ```
 
 Conceptually this is the same rotation math. The difference is where the
@@ -404,6 +415,18 @@ not:
 
 After the tokenizer path and prompt format matched Gemma4, the model generated
 `Paris.` for the target factual smoke test.
+
+The standalone template at `/opt/ai-lab/templates/new-chat-template-gemma.jinja`
+matches the relevant simple-chat behavior from the GGUF template:
+
+- user messages render as `<|turn>user\n{content}<turn|>\n`
+- assistant generation starts with `<|turn>model\n`
+- when thinking is disabled, an empty thought channel is inserted:
+  `<|channel>thought\n<channel|>`
+
+That empty thought channel is not an answer prefix; it tells the model the
+reasoning section is already closed, so visible answer text should begin after
+`<channel|>`.
 
 ## What Phase 6 Adds To The Mental Model
 

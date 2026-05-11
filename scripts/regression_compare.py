@@ -51,9 +51,9 @@ def run_command(name: str, cmd: list[str], timeout_s: int) -> dict[str, Any]:
         }
 
 
-def find_llama_cli(explicit: str | None) -> str | None:
+def find_llama_cli(explicit: str | None) -> list[str] | None:
     if explicit:
-        return explicit
+        return [explicit]
     for candidate in (
         "llama-cli",
         "/opt/ai-lab/llama.cpp/build/bin/llama-cli",
@@ -61,7 +61,9 @@ def find_llama_cli(explicit: str | None) -> str | None:
     ):
         found = shutil.which(candidate) if "/" not in candidate else candidate
         if found and Path(found).exists():
-            return found
+            return [found]
+    if shutil.which("nix"):
+        return ["nix", "shell", "nixpkgs#llama-cpp", "-c", "llama-cli"]
     return None
 
 
@@ -119,6 +121,8 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--threads", type=int, default=12)
     parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--top-k", type=int, default=40)
+    parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--chat", action="store_true", help="Pass --chat to llmtoy")
     parser.add_argument("--expect-substring", default=None)
@@ -139,6 +143,10 @@ def main() -> int:
         str(args.threads),
         "--temperature",
         str(args.temperature),
+        "--top-k",
+        str(args.top_k),
+        "--top-p",
+        str(args.top_p),
         "--seed",
         str(args.seed),
     ]
@@ -146,10 +154,10 @@ def main() -> int:
         llmtoy_cmd.insert(4, "--chat")
     results.append(run_command("llmtoy", llmtoy_cmd, args.timeout_s))
 
-    llama_cli = find_llama_cli(args.llama_cli)
-    if llama_cli:
+    llama_cmd_base = find_llama_cli(args.llama_cli)
+    if llama_cmd_base:
         llama_cmd = [
-            llama_cli,
+            *llama_cmd_base,
             "-m",
             args.model,
             "-p",
@@ -160,10 +168,17 @@ def main() -> int:
             str(args.threads),
             "--temp",
             str(args.temperature),
+            "--top-k",
+            str(args.top_k),
+            "--top-p",
+            str(args.top_p),
             "--seed",
             str(args.seed),
             "--no-display-prompt",
+            "--no-warmup",
         ]
+        if args.chat:
+            llama_cmd.extend(["--conversation", "--single-turn", "--reasoning", "off"])
         results.append(run_command("llama.cpp", llama_cmd, args.timeout_s))
     else:
         results.append({"name": "llama.cpp", "skipped": True, "reason": "llama-cli not found"})
@@ -176,6 +191,8 @@ def main() -> int:
         "prompt": args.prompt,
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
+        "top_k": args.top_k,
+        "top_p": args.top_p,
         "threads": args.threads,
         "results": results,
     }

@@ -85,6 +85,9 @@ llama.cpp cross-checks:
 - V is unweighted RMS-normalized after projection
 - global layers omit `attn_v.weight`; llama.cpp uses `Kcur` as `Vcur`, then
   applies unweighted V RMSNorm
+- Gemma4 uses GPT-NeoX-style RoPE pairing: rotate `(i, i + head_dim/2)`, not
+  consecutive pairs. Using consecutive pairs caused coherent short factual
+  answers but repetition on longer explanatory prompts, e.g. repeated `(MoE)`.
 - router input is `rmsnormRaw(attn_out) * 1/sqrt(d_model) * ffn_gate_inp.scale`
 - dense and MoE FFN outputs are each post-normalized, added, post-normalized
   again, then added to the residual
