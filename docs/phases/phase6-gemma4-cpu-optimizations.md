@@ -237,17 +237,18 @@ Checkpoint                         llmtoy generation
 RoPE correctness baseline           32 tokens in 19022 ms (1.68 tok/s)
 temp-buffer hoist only              32 tokens in 19159 ms (1.67 tok/s)
 IQ4_NL fused dot only               32 tokens in 19160 ms (1.67 tok/s)
-hoist + IQ4_NL fused dot            pending: paused when backup job started
-current Q3_K vector expansion       pending rerun after backup/noise clears
+hoist + IQ4_NL fused dot            32 tokens in 18683 ms (1.71 tok/s)
+current Q3_K vector expansion       32 tokens in 13571 ms (2.36 tok/s)
 ```
 
 These reruns change the interpretation of the first two optimization attempts:
 on this 32-token Gemma4 fixture, the temp-buffer hoist and scalar IQ4_NL fused
 dot are cleanup/structure changes, not measured speedups. Their earlier apparent
-wins were benchmark noise. The Q3_K vector expansion remains the likely real
-optimization, but the combined pre-Q3 checkpoint and final current checkpoint
-should be rerun in the next quiet usage window before treating the exact delta as
-final.
+wins were benchmark noise. The combined pre-Q3 checkpoint is only slightly above
+the RoPE baseline and still within the normal noise band for this setup. The
+Q3_K vector expansion is the real measured optimization in this sequence:
+`1.71 -> 2.36 tok/s`, about a 38% generation-speed improvement over the
+immediately preceding code checkpoint.
 
 The failed fused-dot experiment taught us that removing the scratch row is not
 automatically faster. The scratch row is wasteful, but it lets the next stage use
@@ -295,10 +296,10 @@ llmtoy:   prefill 25 tokens in 10462 ms (2.39 tok/s)
 Longer 32-token comparison:
 
 ```text
-llmtoy:   prefill 25 tokens in 10362 ms (2.41 tok/s)
-          generation 32 tokens in 13437 ms (2.38 tok/s)
+llmtoy:   prefill 25 tokens in 10323 ms (2.42 tok/s)
+          generation 32 tokens in 13571 ms (2.36 tok/s)
 llama.cpp prefill 25 tokens at 4.20 tok/s
-          generation 32 tokens at 2.80 tok/s
+          generation 32 tokens at 2.90 tok/s
 ```
 
 The generated prefix stayed stable:
@@ -308,11 +309,12 @@ The forward pass of a Mixture-of-Experts (MoE) model follows the standard transf
 ```
 
 This is the first optimization in this addendum that materially changes the
-Gemma4 generation rate. The profiled baseline was about `1.39 tok/s` generation;
-after vectorizing Q3_K expansion, the same short profile run measured about
-`2.42 tok/s` on a quiet host. The earlier `1.98 tok/s` post-change number was
-still a real improvement, but it was recorded with stray llama.cpp work on the
-machine and should not be used as the benchmark score.
+Gemma4 generation rate. The quiet RoPE-baseline rerun measured `1.68 tok/s`,
+and the quiet combined pre-Q3 checkpoint measured `1.71 tok/s`; after vectorizing
+Q3_K expansion, the same 32-token fixture measured `2.36 tok/s`. The earlier
+`1.98 tok/s` post-change number was still a real improvement, but it was
+recorded with stray llama.cpp work on the machine and should not be used as the
+benchmark score.
 
 Profile after this change:
 
