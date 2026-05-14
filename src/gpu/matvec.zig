@@ -296,6 +296,20 @@ pub const MatvecSession = struct {
         };
     }
 
+    // Allocate mat_buf (device-local, empty) + vec_buf/out_buf (host-coherent).
+    // Used by batch upload: caller writes mat data via staging + GpuContext.recordCopy,
+    // then calls submitBatchCopy before calling run().
+    pub fn allocEmpty(ctx: *const GpuContext, mat_size: usize, rows: u32, cols: u32) !MatvecSession {
+        var mat_buf = try GpuBuffer.initDeviceLocal(ctx, mat_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        errdefer mat_buf.deinit();
+        var vec_buf = try GpuBuffer.initHostCoherent(ctx, cols * @sizeOf(f32),
+            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        errdefer vec_buf.deinit();
+        const out_buf = try GpuBuffer.initHostCoherent(ctx, rows * @sizeOf(f32),
+            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        return .{ .mat_buf = mat_buf, .vec_buf = vec_buf, .out_buf = out_buf, .rows = rows, .cols = cols };
+    }
+
     fn initBytes(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
         var staging = try GpuBuffer.initStaging(ctx, mat_bytes.len);
         defer staging.deinit();

@@ -1,25 +1,34 @@
 /// GPU-resident weight sessions for Gemma4.
 ///
-/// Uploads per-layer attention and dense-FFN weight matrices to VRAM once at
-/// model-load time. MoE expert tensors stay on CPU: they are too large to
-/// pre-upload in full (≈20 GB across 62 layers) and are accessed sparsely
-/// (8 of 128 experts per token), so staging overhead would exceed the benefit.
+/// Uploads per-layer attention and dense-FFN weight matrices to VRAM one
+/// layer at a time: each layer's ≤7 matrices go into a single command buffer
+/// → single vkQueueSubmit → free staging.  Peak HOST_COHERENT staging is
+/// ~22 MiB (one layer) rather than ~1 GiB (all layers at once).
+///
+/// lm_head is uploaded separately and falls back to CPU if the allocation
+/// fails (vocab_size=262144 can make it 400+ MiB of staging).
+///
+/// MoE expert tensors stay on CPU: too large to pre-upload (~20 GB across
+/// all layers) and accessed sparsely (8 of 128 experts per token).
 ///
 /// Matrices whose quant type has no GPU shader (Q5_K, IQ4_NL, …) get a null
 /// session and fall back to the CPU path transparently.
 
-const std       = @import("std");
-const GgmlType  = @import("../../gguf/types.zig").GgmlType;
-const GpuCtx    = @import("../../gpu/context.zig").GpuContext;
-const mv_mod    = @import("../../gpu/matvec.zig");
-const MatvecPipeline = mv_mod.MatvecPipeline;
-const MatvecSession  = mv_mod.MatvecSession;
-const wt_       = @import("weights.zig");
-const Gemma4Weights  = wt_.Gemma4Weights;
-const RawMatrix      = wt_.RawMatrix;
+const std        = @import("std");
+const vk_mod     = @import("../../gpu/vk.zig");
+const vk         = vk_mod.vk;
+const GgmlType   = @import("../../gguf/types.zig").GgmlType;
+const GpuCtx     = @import("../../gpu/context.zig").GpuContext;
+const GpuBuffer  = @import("../../gpu/buffer.zig").GpuBuffer;
+const mv_mod     = @import("../../gpu/matvec.zig");
+const MatvecPipeline     = mv_mod.MatvecPipeline;
+const MatvecSession      = mv_mod.MatvecSession;
+const wt_                = @import("weights.zig");
+const Gemma4Weights      = wt_.Gemma4Weights;
+const Gemma4LayerWeights = wt_.Gemma4LayerWeights;
+const RawMatrix          = wt_.RawMatrix;
 const Gemma4Config   = @import("config.zig").Gemma4Config;
 
-// Sessions for one layer's attention + dense FFN projections.
 pub const GpuLayerWeights = struct {
     wq:     ?MatvecSession,
     wk:     ?MatvecSession,
@@ -51,6 +60,10 @@ pub const GpuWeights = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(g4w: *const Gemma4Weights, g4cfg: Gemma4Config, allocator: std.mem.Allocator) !GpuWeights {
+        const avail_mb = availableMemoryMB();
+        std.debug.print("  available system RAM: {} MiB\n", .{avail_mb});
+        if (avail_mb < 500) return error.InsufficientMemory;
+
         var ctx = try GpuCtx.init();
         errdefer ctx.deinit();
 
@@ -70,39 +83,25 @@ pub const GpuWeights = struct {
             .w_gate = null, .w_up = null, .w_down = null,
         };
 
-        // n_layers_done tracks how many layers have fully-uploaded sessions so
-        // that the outer errdefer only deinits layers we've completed.
-        var n_layers_done: usize = 0;
-        errdefer for (0..n_layers_done) |l| layers[l].deinitAll();
+        var gw = GpuWeights{
+            .ctx = ctx, .pl_f32 = pl_f32, .pl_q8_0 = pl_q8_0,
+            .pl_q3_k = pl_q3_k, .pl_q4_k = pl_q4_k,
+            .layers = layers, .lm_head = null, .allocator = allocator,
+        };
+        errdefer gw.deinit();
 
+        // One vkQueueSubmit per layer: peak staging ~22 MiB instead of ~1 GiB.
         for (0..g4cfg.n_layers) |l| {
-            const lw = &g4w.layers[l];
-            // Per-iteration errdefer cleans up any partial uploads within this layer.
-            errdefer layers[l].deinitAll();
-
-            layers[l].wq     = try upload(&ctx, lw.wq);
-            layers[l].wk     = try upload(&ctx, lw.wk);
-            if (lw.wv) |wv| layers[l].wv = try upload(&ctx, wv);
-            layers[l].wo     = try upload(&ctx, lw.wo);
-            layers[l].w_gate = try upload(&ctx, lw.w_gate);
-            layers[l].w_up   = try upload(&ctx, lw.w_up);
-            layers[l].w_down = try upload(&ctx, lw.w_down);
-
-            n_layers_done = l + 1;
+            try uploadLayerBatch(&ctx, &gw.layers[l], &g4w.layers[l]);
         }
 
-        const lm_head = try upload(&ctx, g4w.lm_head);
-
-        return .{
-            .ctx     = ctx,
-            .pl_f32  = pl_f32,
-            .pl_q8_0 = pl_q8_0,
-            .pl_q3_k = pl_q3_k,
-            .pl_q4_k = pl_q4_k,
-            .layers  = layers,
-            .lm_head = lm_head,
-            .allocator = allocator,
+        // lm_head staging can be 400+ MiB; fall back to CPU on alloc failure.
+        gw.lm_head = uploadSingleBatch(&ctx, g4w.lm_head) catch |e| blk: {
+            std.debug.print("  lm_head GPU upload failed ({s}), using CPU\n", .{@errorName(e)});
+            break :blk null;
         };
+
+        return gw;
     }
 
     pub fn deinit(self: *GpuWeights) void {
@@ -116,8 +115,6 @@ pub const GpuWeights = struct {
         self.ctx.deinit();
     }
 
-    // Return the pipeline for a supported quant type. Only call when a
-    // session exists for that type (session creation implies support).
     pub fn pipelineFor(self: *const GpuWeights, t: GgmlType) *const MatvecPipeline {
         return switch (t) {
             .f32  => &self.pl_f32,
@@ -129,7 +126,90 @@ pub const GpuWeights = struct {
     }
 };
 
-fn upload(ctx: *const GpuCtx, mat: RawMatrix) !?MatvecSession {
-    return MatvecSession.initFromRaw(ctx, mat.data, mat.type_,
+// --- module-level helpers ---
+
+fn isGpuSupported(t: GgmlType) bool {
+    return switch (t) {
+        .f32, .q8_0, .q3_k, .q4_k => true,
+        else => false,
+    };
+}
+
+// Schedule one matrix upload into an open command buffer.
+// Commits the staging buffer to sbufs[nsb.*] and increments nsb.
+// Returns null for unsupported quant types (→ CPU fallback).
+fn schedUpload(
+    ctx: *const GpuCtx,
+    mat: RawMatrix,
+    cmd: vk.VkCommandBuffer,
+    sbufs: []GpuBuffer,
+    nsb: *usize,
+) !?MatvecSession {
+    if (!isGpuSupported(mat.type_)) return null;
+
+    var tmp: ?GpuBuffer = null;
+    errdefer if (tmp) |*s| s.deinit();
+
+    tmp = try GpuBuffer.initStaging(ctx, mat.data.len);
+    try tmp.?.upload(mat.data);
+
+    const sess = try MatvecSession.allocEmpty(
+        ctx, mat.data.len,
         @intCast(mat.rows), @intCast(mat.cols));
+
+    GpuCtx.recordCopy(cmd, tmp.?.handle, sess.mat_buf.handle, mat.data.len);
+
+    sbufs[nsb.*] = tmp.?;
+    tmp = null; // committed → cancel errdefer
+    nsb.* += 1;
+
+    return sess;
+}
+
+// Upload one layer's ≤7 matrices in a single command buffer submission.
+fn uploadLayerBatch(ctx: *const GpuCtx, glayer: *GpuLayerWeights, lw: *const Gemma4LayerWeights) !void {
+    var stagings: [7]GpuBuffer = undefined;
+    var n_stagings: usize = 0;
+    errdefer for (0..n_stagings) |i| stagings[i].deinit();
+
+    const cmd = try ctx.beginBatchCopy();
+    glayer.wq     = try schedUpload(ctx, lw.wq,     cmd, &stagings, &n_stagings);
+    glayer.wk     = try schedUpload(ctx, lw.wk,     cmd, &stagings, &n_stagings);
+    if (lw.wv) |wv|
+        glayer.wv = try schedUpload(ctx, wv,          cmd, &stagings, &n_stagings);
+    glayer.wo     = try schedUpload(ctx, lw.wo,     cmd, &stagings, &n_stagings);
+    glayer.w_gate = try schedUpload(ctx, lw.w_gate, cmd, &stagings, &n_stagings);
+    glayer.w_up   = try schedUpload(ctx, lw.w_up,   cmd, &stagings, &n_stagings);
+    glayer.w_down = try schedUpload(ctx, lw.w_down, cmd, &stagings, &n_stagings);
+
+    try ctx.submitBatchCopy(cmd);
+    for (0..n_stagings) |i| stagings[i].deinit();
+}
+
+// Upload a single matrix in its own command buffer submission.
+fn uploadSingleBatch(ctx: *const GpuCtx, mat: RawMatrix) !?MatvecSession {
+    var stagings: [1]GpuBuffer = undefined;
+    var n_stagings: usize = 0;
+    errdefer for (0..n_stagings) |i| stagings[i].deinit();
+
+    const cmd = try ctx.beginBatchCopy();
+    const sess = try schedUpload(ctx, mat, cmd, &stagings, &n_stagings);
+    try ctx.submitBatchCopy(cmd);
+    for (0..n_stagings) |i| stagings[i].deinit();
+    return sess;
+}
+
+// Read MemAvailable from /proc/meminfo; returns maxInt on any failure.
+fn availableMemoryMB() u64 {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/meminfo", .{}, 0) catch return std.math.maxInt(u64);
+    defer _ = std.os.linux.close(fd);
+    var buf: [4096]u8 = undefined;
+    const n = std.posix.read(fd, &buf) catch return std.math.maxInt(u64);
+    const text = buf[0..n];
+    const prefix = "MemAvailable:";
+    const pos = std.mem.indexOf(u8, text, prefix) orelse return std.math.maxInt(u64);
+    const after = std.mem.trim(u8, text[pos + prefix.len..][0..@min(32, text.len - pos - prefix.len)], " \t\n");
+    const end = std.mem.indexOfAny(u8, after, " \t\n") orelse after.len;
+    const kb = std.fmt.parseInt(u64, after[0..end], 10) catch return std.math.maxInt(u64);
+    return kb / 1024;
 }

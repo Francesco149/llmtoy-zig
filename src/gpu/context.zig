@@ -137,6 +137,51 @@ pub const GpuContext = struct {
         return error.NoSuitableMemoryType;
     }
 
+    // Open a command buffer for recording multiple buffer copies.
+    // Call recordCopy() for each pair, then submitBatchCopy() once.
+    // One submission = one GPU power-state wakeup; much faster than copyBuffer per matrix.
+    pub fn beginBatchCopy(self: *const GpuContext) !vk.VkCommandBuffer {
+        const ci = vk.VkCommandBufferAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .pNext = null,
+            .commandPool = self.cmd_pool,
+            .level = vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        var cmd: vk.VkCommandBuffer = undefined;
+        if (vk.vkAllocateCommandBuffers(self.device, &ci, &cmd) != vk.VK_SUCCESS)
+            return error.VkCommandBufferAllocFailed;
+        const begin_ci = vk.VkCommandBufferBeginInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = null,
+            .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = null,
+        };
+        _ = vk.vkBeginCommandBuffer(cmd, &begin_ci);
+        return cmd;
+    }
+
+    pub fn recordCopy(cmd: vk.VkCommandBuffer, src: vk.VkBuffer, dst: vk.VkBuffer, size: vk.VkDeviceSize) void {
+        const region = vk.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = size };
+        vk.vkCmdCopyBuffer(cmd, src, dst, 1, &region);
+    }
+
+    // End recording, submit all recorded copies, wait for completion, free command buffer.
+    pub fn submitBatchCopy(self: *const GpuContext, cmd: vk.VkCommandBuffer) !void {
+        _ = vk.vkEndCommandBuffer(cmd);
+        defer vk.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, &cmd);
+        const submit = vk.VkSubmitInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext = null,
+            .waitSemaphoreCount = 0, .pWaitSemaphores = null, .pWaitDstStageMask = null,
+            .commandBufferCount = 1, .pCommandBuffers = &cmd,
+            .signalSemaphoreCount = 0, .pSignalSemaphores = null,
+        };
+        if (vk.vkQueueSubmit(self.queue, 1, &submit, null) != vk.VK_SUCCESS)
+            return error.VkQueueSubmitFailed;
+        _ = vk.vkQueueWaitIdle(self.queue);
+    }
+
     // Copy `size` bytes from src to dst using a one-shot command buffer.
     // Blocks until the transfer completes. Used for staging uploads/downloads.
     pub fn copyBuffer(self: *const GpuContext, src: vk.VkBuffer, dst: vk.VkBuffer, size: vk.VkDeviceSize) !void {
