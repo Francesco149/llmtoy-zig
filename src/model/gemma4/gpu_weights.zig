@@ -68,17 +68,29 @@ pub const GpuWeights = struct {
         std.debug.print("  available system RAM: {} MiB\n", .{avail_mb});
         if (avail_mb < 500) return error.InsufficientMemory;
 
+        std.debug.print("  init: creating Vulkan context (VRAM={} MiB GTT={} MiB)\n",
+            .{ vramUsedMB(), gttUsedMB() });
         var ctx = try GpuCtx.init();
         errdefer ctx.deinit();
+        std.debug.print("  init: VkDevice ready (VRAM={} MiB GTT={} MiB sys={} MiB)\n",
+            .{ vramUsedMB(), gttUsedMB(), availableMemoryMB() });
 
         var pl_f32  = try MatvecPipeline.initF32(&ctx);
         errdefer pl_f32.deinit();
+        std.debug.print("  init: pl_f32  ok (VRAM={} MiB GTT={} MiB sys={} MiB)\n",
+            .{ vramUsedMB(), gttUsedMB(), availableMemoryMB() });
         var pl_q8_0 = try MatvecPipeline.initQ8_0(&ctx);
         errdefer pl_q8_0.deinit();
+        std.debug.print("  init: pl_q8_0 ok (VRAM={} MiB GTT={} MiB sys={} MiB)\n",
+            .{ vramUsedMB(), gttUsedMB(), availableMemoryMB() });
         var pl_q3_k = try MatvecPipeline.initQ3K(&ctx);
         errdefer pl_q3_k.deinit();
+        std.debug.print("  init: pl_q3_k ok (VRAM={} MiB GTT={} MiB sys={} MiB)\n",
+            .{ vramUsedMB(), gttUsedMB(), availableMemoryMB() });
         var pl_q4_k = try MatvecPipeline.initQ4K(&ctx);
         errdefer pl_q4_k.deinit();
+        std.debug.print("  init: pl_q4_k ok (VRAM={} MiB GTT={} MiB sys={} MiB)\n",
+            .{ vramUsedMB(), gttUsedMB(), availableMemoryMB() });
 
         const layers = try allocator.alloc(GpuLayerWeights, g4cfg.n_layers);
         errdefer allocator.free(layers);
@@ -97,8 +109,21 @@ pub const GpuWeights = struct {
         errdefer gw.deinit();
 
         // One vkQueueSubmit per layer: peak staging ~22 MiB instead of ~1 GiB.
+        // Preemptive abort: if sys RAM drops below 8 GiB, return error so the
+        // caller falls back to CPU instead of letting the OOM killer fire.
         for (0..g4cfg.n_layers) |l| {
+            const mem_before = availableMemoryMB();
+            if (mem_before < 8 * 1024) {
+                std.debug.print("  GPU upload aborted at layer {}: only {} MiB available\n",
+                    .{ l, mem_before });
+                return error.InsufficientMemory;
+            }
             try uploadLayerBatch(&ctx, &gw.layers[l], &g4w.layers[l]);
+            const vram_used = vramUsedMB();
+            const gtt_used  = gttUsedMB();
+            const mem_avail = availableMemoryMB();
+            std.debug.print("  layer {:2}: VRAM={} MiB GTT={} MiB sys_avail={} MiB\n",
+                .{ l, vram_used, gtt_used, mem_avail });
         }
 
         // lm_head staging can be 400+ MiB; fall back to CPU on alloc failure.
@@ -228,6 +253,23 @@ fn uploadSingleBatch(ctx: *const GpuCtx, mat: RawMatrix) !?MatvecSession {
     try ctx.submitBatchCopy(cmd);
     for (0..n_stagings) |i| stagings[i].deinit();
     return sess;
+}
+
+fn readSysU64(path: []const u8) u64 {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{}, 0) catch return 0;
+    defer _ = std.os.linux.close(fd);
+    var buf: [32]u8 = undefined;
+    const n = std.posix.read(fd, &buf) catch return 0;
+    const s = std.mem.trim(u8, buf[0..n], " \t\n");
+    return std.fmt.parseInt(u64, s, 10) catch 0;
+}
+
+fn vramUsedMB() u64 {
+    return readSysU64("/sys/class/drm/card1/device/mem_info_vram_used") / (1024 * 1024);
+}
+
+fn gttUsedMB() u64 {
+    return readSysU64("/sys/class/drm/card1/device/mem_info_gtt_used") / (1024 * 1024);
 }
 
 // Read MemAvailable from /proc/meminfo; returns maxInt on any failure.

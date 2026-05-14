@@ -133,4 +133,42 @@ pub const TensorInfo = struct {
         for (self.dims) |d| n *= d;
         return n;
     }
+
+    /// Exact byte size of this tensor's weight data as stored in GGUF.
+    pub fn byteSize(self: TensorInfo) u64 {
+        const n = self.n_elements();
+        return switch (self.type_) {
+            // Scalar types: bytes = n × elem_size
+            .f32  => n * 4,
+            .f16  => n * 2,
+            .bf16 => n * 2,
+            .i8   => n * 1,
+            .i16  => n * 2,
+            .i32  => n * 4,
+            .i64  => n * 8,
+            // Block-quantized: bytes = (n / block_elems) × block_bytes
+            .q4_0    => (n / 32)  * 18,
+            .q4_1    => (n / 32)  * 20,
+            .q5_0    => (n / 32)  * 22,
+            .q5_1    => (n / 32)  * 24,
+            .q8_0    => (n / 32)  * 34,
+            .q8_1    => (n / 32)  * 40,
+            .q2_k    => (n / 256) * 84,
+            .q3_k    => (n / 256) * 110,
+            .q4_k    => (n / 256) * 144,
+            .q5_k    => (n / 256) * 176,
+            .q6_k    => (n / 256) * 210,
+            .q8_k    => (n / 256) * 292,
+            .iq2_xxs => (n / 256) * 66,
+            .iq2_xs  => (n / 256) * 74,
+            .iq2_s   => (n / 256) * 82,
+            .iq3_xxs => (n / 256) * 98,
+            .iq3_s   => (n / 256) * 110,
+            .iq4_nl  => (n / 32)  * 18,
+            .iq4_xs  => (n / 256) * 136,
+            .iq1_s   => (n / 256) * 50,
+            .iq1_m   => (n / 256) * 56,
+            else     => 0,
+        };
+    }
 };

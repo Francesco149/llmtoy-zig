@@ -139,9 +139,11 @@ pub const GgufReader = struct {
         std.Io.File.close(self.file, self.io);
     }
 
-    /// Raw bytes for a tensor's weight data.
+    /// Raw bytes for a tensor's weight data — exactly byteSize() bytes.
     pub fn tensorBytes(self: *const GgufReader, info: t.TensorInfo) []const u8 {
-        return self.mmap[self.data.data_offset + info.offset ..];
+        const start = self.data.data_offset + info.offset;
+        const size  = info.byteSize();
+        return self.mmap[start .. start + size];
     }
 
     pub fn metaString(self: *const GgufReader, key: []const u8) ?[]const u8 {
