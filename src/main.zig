@@ -136,7 +136,7 @@ fn cmdGpuInfo(out: *std.Io.Writer) !void {
     try out.print("GPU device: {s}\n", .{std.mem.sliceTo(&name, 0)});
 
     // Smoke test: 4×4 identity * [1,2,3,4] = [1,2,3,4]
-    var pipeline = gpu_matvec.MatvecPipeline.init(&ctx) catch |e| {
+    var pipeline = gpu_matvec.MatvecPipeline.initF32(&ctx) catch |e| {
         try out.print("pipeline init failed: {}\n", .{e});
         return;
     };

@@ -1,4 +1,4 @@
-// GPU fp32 matrix-vector multiply.
+// GPU matrix-vector multiply for fp32 and quantized weight formats.
 // Wraps pipeline creation, descriptor management, and dispatch into a simple API.
 const std = @import("std");
 const vk = @import("vk.zig").vk;
@@ -8,9 +8,13 @@ const shaders = @import("gpu_shaders");
 
 const WORKGROUP_SIZE: u32 = 64;
 
-// Push-constant layout must match the GLSL shader.
+// Push-constant layout must match the GLSL shaders.
 const PushConst = extern struct { rows: u32, cols: u32 };
 
+// ── MatvecPipeline ────────────────────────────────────────────────────────────
+
+// Compiled compute pipeline for one matvec shader variant.
+// Create one per quant format; reuse across all calls with that format.
 pub const MatvecPipeline = struct {
     pipeline: vk.VkPipeline,
     layout: vk.VkPipelineLayout,
@@ -18,7 +22,24 @@ pub const MatvecPipeline = struct {
     desc_pool: vk.VkDescriptorPool,
     device: vk.VkDevice,
 
-    pub fn init(ctx: *const GpuContext) !MatvecPipeline {
+    pub fn initF32(ctx: *const GpuContext) !MatvecPipeline {
+        // SPIR-V size must be a multiple of 4 words — checked at comptime.
+        comptime std.debug.assert(shaders.matvec_f32.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.matvec_f32);
+    }
+
+    pub fn initQ8_0(ctx: *const GpuContext) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_q8_0.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.matvec_q8_0);
+    }
+
+    fn initFromSpv(ctx: *const GpuContext, spv: anytype) !MatvecPipeline {
+        // align(4) on the const in shaders.zig should guarantee this, but
+        // assert the actual runtime address in case @embedFile doesn't honour it.
+        std.debug.assert(@intFromPtr(spv) % 4 == 0);
+        // Redundant with the comptime len check at each call site, but belt-and-suspenders.
+        std.debug.assert(spv.len % 4 == 0);
+
         const dev = ctx.device;
 
         // Descriptor set layout: bindings 0/1/2 are storage buffers (mat, vec, out)
@@ -56,15 +77,11 @@ pub const MatvecPipeline = struct {
             return error.VkPipelineLayoutFailed;
         errdefer vk.vkDestroyPipelineLayout(dev, layout, null);
 
-        // shaders.matvec_f32 is declared align(4) in the generated shaders.zig,
-        // so &shaders.matvec_f32 satisfies VkShaderModuleCreateInfo.pCode's
-        // 4-byte alignment requirement without an extra allocation.
-        const spv = &shaders.matvec_f32;
         const shader_ci = vk.VkShaderModuleCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
             .pNext = null,
             .flags = 0,
-            .codeSize = shaders.matvec_f32.len,
+            .codeSize = spv.len,
             .pCode = @ptrCast(spv),
         };
         var shader_mod: vk.VkShaderModule = null;
@@ -87,16 +104,14 @@ pub const MatvecPipeline = struct {
             .flags = 0,
             .stage = stage,
             .layout = layout,
-            .basePipelineHandle = null, // no derivative pipeline
+            .basePipelineHandle = null,
             .basePipelineIndex = -1,
         };
         var pipeline: vk.VkPipeline = null;
-        // null pipeline cache: no caching for now
         if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
             return error.VkComputePipelineFailed;
         errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
-        // Descriptor pool: capacity for a few concurrent sets
         const pool_size = vk.VkDescriptorPoolSize{
             .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .descriptorCount = 3 * 8,
@@ -129,8 +144,8 @@ pub const MatvecPipeline = struct {
         vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
     }
 
-    // Compute out = mat * vec_in where mat is (rows x cols) row-major f32.
-    // All buffers must be host-coherent GpuBuffers.
+    // Submit one matvec dispatch and block until complete.
+    // mat_buf, vec_buf, out_buf must already be bound to the right data.
     pub fn run(
         self: *const MatvecPipeline,
         ctx: *const GpuContext,
@@ -142,7 +157,6 @@ pub const MatvecPipeline = struct {
     ) !void {
         const dev = ctx.device;
 
-        // Allocate and update a descriptor set for this call
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .pNext = null,
@@ -167,7 +181,6 @@ pub const MatvecPipeline = struct {
         };
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
-        // Record and submit a one-shot command buffer
         const cmd_alloc = vk.VkCommandBufferAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .pNext = null,
@@ -196,7 +209,6 @@ pub const MatvecPipeline = struct {
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
             0, @sizeOf(PushConst), &pc);
 
-        // One workgroup per 64 rows
         const groups = (rows + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
 
@@ -213,86 +225,38 @@ pub const MatvecPipeline = struct {
             .signalSemaphoreCount = 0,
             .pSignalSemaphores = null,
         };
-        // null fence: block via vkQueueWaitIdle instead
         if (vk.vkQueueSubmit(ctx.queue, 1, &submit, null) != vk.VK_SUCCESS)
             return error.VkQueueSubmitFailed;
         _ = vk.vkQueueWaitIdle(ctx.queue);
     }
 };
 
-fn mkStorageBuf(binding: u32) vk.VkDescriptorSetLayoutBinding {
-    return .{
-        .binding = binding,
-        .descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT,
-        .pImmutableSamplers = null,
-    };
-}
+// ── MatvecSession ─────────────────────────────────────────────────────────────
 
-fn mkWrite(dset: vk.VkDescriptorSet, binding: u32, info: *const vk.VkDescriptorBufferInfo) vk.VkWriteDescriptorSet {
-    return .{
-        .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .pNext = null,
-        .dstSet = dset,
-        .dstBinding = binding,
-        .dstArrayElement = 0,
-        .descriptorCount = 1,
-        .descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pImageInfo = null,
-        .pBufferInfo = info,
-        .pTexelBufferView = null,
-    };
-}
-
-// Convenience: upload mat to device-local VRAM, run compute, download result.
-// Use MatvecSession for repeated calls with the same matrix.
-// mat is row-major f32[rows * cols], vec is f32[cols], out receives f32[rows].
-pub fn matvecF32(
-    ctx: *const GpuContext,
-    pipeline: *const MatvecPipeline,
-    mat: []const f32,
-    vec: []const f32,
-    out: []f32,
-    rows: u32,
-    cols: u32,
-) !void {
-    const mat_bytes = std.mem.sliceAsBytes(mat);
-    const vec_bytes = std.mem.sliceAsBytes(vec);
-
-    // mat lives in VRAM; uploaded once via a staging buffer
-    var staging = try GpuBuffer.initStaging(ctx, mat_bytes.len);
-    defer staging.deinit();
-    try staging.upload(mat_bytes);
-    var mat_buf = try GpuBuffer.initDeviceLocal(ctx, mat_bytes.len,
-        vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    defer mat_buf.deinit();
-    try ctx.copyBuffer(staging.handle, mat_buf.handle, mat_bytes.len);
-
-    // vec and out are host-coherent (one token at a time, PCIe latency is fine)
-    var vec_buf = try GpuBuffer.initHostCoherent(ctx, vec_bytes.len,
-        vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    defer vec_buf.deinit();
-    var out_buf = try GpuBuffer.initHostCoherent(ctx, out.len * @sizeOf(f32),
-        vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    defer out_buf.deinit();
-
-    try vec_buf.upload(vec_bytes);
-    try pipeline.run(ctx, &mat_buf, &vec_buf, &out_buf, rows, cols);
-    try out_buf.download(std.mem.sliceAsBytes(out));
-}
-
-// Pre-uploaded matrix for repeated matvec calls (e.g. weight layers).
-// Upload the matrix once, then call run() for every token.
+// Pre-loaded weight matrix that stays resident in VRAM across token steps.
+// Upload the matrix once at model-load time, then call run() for every token.
+// The quant format is baked into the MatvecPipeline passed to run().
 pub const MatvecSession = struct {
-    mat_buf: GpuBuffer,
-    vec_buf: GpuBuffer,
-    out_buf: GpuBuffer,
+    mat_buf: GpuBuffer, // device-local VRAM: holds raw matrix bytes (any format)
+    vec_buf: GpuBuffer, // host-coherent: fp32 activation input, updated each token
+    out_buf: GpuBuffer, // host-coherent: fp32 output, read each token
     rows: u32,
     cols: u32,
 
+    // Upload an fp32 row-major matrix to VRAM.
     pub fn init(ctx: *const GpuContext, mat: []const f32, rows: u32, cols: u32) !MatvecSession {
-        const mat_bytes = std.mem.sliceAsBytes(mat);
+        return initBytes(ctx, std.mem.sliceAsBytes(mat), rows, cols);
+    }
+
+    // Upload a Q8_0 quantized matrix (raw GGUF bytes) to VRAM.
+    // mat_bytes must be exactly rows * (cols/32) * 34 bytes.
+    pub fn initQ8_0(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
+        std.debug.assert(cols % 32 == 0);
+        std.debug.assert(mat_bytes.len == rows * (cols / 32) * 34);
+        return initBytes(ctx, mat_bytes, rows, cols);
+    }
+
+    fn initBytes(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
         var staging = try GpuBuffer.initStaging(ctx, mat_bytes.len);
         defer staging.deinit();
         try staging.upload(mat_bytes);
@@ -338,15 +302,62 @@ pub const MatvecSession = struct {
     }
 };
 
+// ── convenience functions ─────────────────────────────────────────────────────
+
+// One-shot fp32 matvec: upload matrix to VRAM, run, download result.
+// For repeated calls on the same matrix use MatvecSession instead.
+pub fn matvecF32(
+    ctx: *const GpuContext,
+    pipeline: *const MatvecPipeline,
+    mat: []const f32,
+    vec: []const f32,
+    out: []f32,
+    rows: u32,
+    cols: u32,
+) !void {
+    var session = try MatvecSession.init(ctx, mat, rows, cols);
+    defer session.deinit();
+    try session.run(ctx, pipeline, vec, out);
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn mkStorageBuf(binding: u32) vk.VkDescriptorSetLayoutBinding {
+    return .{
+        .binding = binding,
+        .descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT,
+        .pImmutableSamplers = null,
+    };
+}
+
+fn mkWrite(dset: vk.VkDescriptorSet, binding: u32, info: *const vk.VkDescriptorBufferInfo) vk.VkWriteDescriptorSet {
+    return .{
+        .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .pNext = null,
+        .dstSet = dset,
+        .dstBinding = binding,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pImageInfo = null,
+        .pBufferInfo = info,
+        .pTexelBufferView = null,
+    };
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
 test "gpu matvec f32 correctness" {
     const ctx = GpuContext.init() catch |e| {
         std.debug.print("gpu init failed: {}\n", .{e});
-        return; // skip if no GPU
+        return;
     };
     var gpu = ctx;
     defer gpu.deinit();
 
-    var pipeline = try MatvecPipeline.init(&gpu);
+    var pipeline = try MatvecPipeline.initF32(&gpu);
     defer pipeline.deinit();
 
     // 4×4 identity matrix times [1,2,3,4] = [1,2,3,4]
@@ -367,4 +378,45 @@ test "gpu matvec f32 correctness" {
     try std.testing.expectApproxEqAbs(out[1], 2.0, 1e-5);
     try std.testing.expectApproxEqAbs(out[2], 3.0, 1e-5);
     try std.testing.expectApproxEqAbs(out[3], 4.0, 1e-5);
+}
+
+test "gpu matvec Q8_0 correctness" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    var pipeline = try MatvecPipeline.initQ8_0(&gpu);
+    defer pipeline.deinit();
+
+    // 32 rows × 32 cols — one Q8_0 block per row (n_blocks = 1).
+    // Row i: scale = 1.0 (f16 = 0x3C00, LE bytes [0x00, 0x3C]),
+    //        quants all zero except qs[i] = 1.
+    // Input vec = [1, 2, ..., 32].
+    // Expected output[i] = 1.0 * 1 * vec[i] = i + 1.
+    const rows: u32 = 32;
+    const cols: u32 = 32;
+    const block_bytes = 34; // 2 (f16) + 32 (i8)
+
+    var mat_bytes: [rows * block_bytes]u8 = [_]u8{0} ** (rows * block_bytes);
+    for (0..rows) |row| {
+        const b = row * block_bytes;
+        mat_bytes[b + 0] = 0x00; // f16 1.0 low byte
+        mat_bytes[b + 1] = 0x3C; // f16 1.0 high byte
+        mat_bytes[b + 2 + row] = 1; // qs[row] = 1, rest = 0
+    }
+
+    var vec: [cols]f32 = undefined;
+    for (0..cols) |i| vec[i] = @floatFromInt(i + 1);
+    var out: [rows]f32 = [_]f32{0} ** rows;
+
+    var session = try MatvecSession.initQ8_0(&gpu, &mat_bytes, rows, cols);
+    defer session.deinit();
+    try session.run(&gpu, &pipeline, &vec, &out);
+
+    for (0..rows) |i| {
+        try std.testing.expectApproxEqAbs(out[i], @as(f32, @floatFromInt(i + 1)), 1e-4);
+    }
 }

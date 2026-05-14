@@ -310,9 +310,36 @@ matvec smoke test: [1, 2, 3, 4] (expect [1, 2, 3, 4])
 The full test suite (`zig build test`) includes a GPU matvec correctness test
 that skips gracefully if no Vulkan device is available.
 
+## Quantized matvec: Q8_0
+
+`matvec_q8_0.glsl` dequantizes on the fly inside the shader, so weights live in
+VRAM in their compact form and the shader reads fewer bytes from memory.
+
+**Q8_0 block layout** (34 bytes per 32 elements):
+```
+[d: f16 (2 bytes)][q0: i8][q1: i8] ... [q31: i8]
+```
+Dequant: `out[row] = Σ_i( d × qᵢ × vec[i] )`
+
+The shader treats the matrix buffer as a flat `uint[]` array and reads individual
+bytes by shifting and masking — no `GL_EXT_shader_8bit_storage` extension needed.
+Sign extension uses GLSL's `bitfieldExtract(value, 0, 8)`.
+
+**f16 → f32 conversion** is done inline. Denormals map to zero (safe for quant
+scales which are always positive normal numbers).
+
+**Alignment sanity check**: SPIR-V requires 4-byte aligned data. The `align(4)`
+declaration in `shaders.zig` should guarantee this, but `initFromSpv` also
+asserts `@intFromPtr(spv) % 4 == 0` at runtime to catch any `@embedFile`
+alignment surprises. The SPIR-V size is verified at comptime (`spv.len % 4 == 0`).
+
+**MatvecPipeline** now has named constructors (`initF32`, `initQ8_0`) sharing a
+common `initFromSpv`. `run` is identical for all formats — the pipeline carries
+the compiled shader and `MatvecSession` carries the pre-uploaded weight bytes.
+
 ## Next steps
 
-- Add quantized matvec shaders (Q8×fp32, Q4_K×fp32, Q3_K×fp32) matching the
-  GGUF quant types used by Gemma4 APEX I Mini
+- Add Q3_K matvec shader (Gemma4's dominant quant: 138 tensors)
+- Add Q4_K matvec shader (K-quant super-blocks, 256 elements each)
 - Wire `MatvecSession` into the Gemma4 forward pass as an optional `--gpu` backend
 - Benchmark GPU matvec throughput vs the AVX2 CPU path on Gemma4 generation speed
