@@ -137,6 +137,17 @@ pub const GpuContext = struct {
         return error.NoSuitableMemoryType;
     }
 
+    // Open a command buffer for recording any mix of GPU commands (copies, dispatches).
+    // Call recordCopy() or MatvecPipeline.record() for each command, then submitBatch() once.
+    // One submission = one GPU power-state wakeup.
+    pub fn beginBatch(self: *const GpuContext) !vk.VkCommandBuffer {
+        return self.beginBatchCopy();
+    }
+
+    pub fn submitBatch(self: *const GpuContext, cmd: vk.VkCommandBuffer) !void {
+        return self.submitBatchCopy(cmd);
+    }
+
     // Open a command buffer for recording multiple buffer copies.
     // Call recordCopy() for each pair, then submitBatchCopy() once.
     // One submission = one GPU power-state wakeup; much faster than copyBuffer per matrix.

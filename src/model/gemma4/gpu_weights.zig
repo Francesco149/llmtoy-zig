@@ -64,7 +64,23 @@ pub const GpuWeights = struct {
     expert_gate: ?[]?MatvecSession,
     expert_up:   ?[]?MatvecSession,
     expert_down: ?[]?MatvecSession,
-    n_experts:   usize,
+    n_experts:      usize,
+    n_experts_used: usize,
+    // Per-slot I/O buffers for batched expert dispatch.
+    // expert_in_buf: shared moe_in input for all gate+up dispatches (d_model floats).
+    // expert_mid_bufs[k]: gate output → gelu*up result → down input (d_expert floats).
+    // expert_up_bufs[k]:  up output used during gelu step (d_expert floats).
+    // expert_out_bufs[k]: down output before scale+accumulate (d_model floats).
+    expert_in_buf:   ?GpuBuffer,
+    expert_mid_bufs: ?[]GpuBuffer,
+    expert_up_bufs:  ?[]GpuBuffer,
+    expert_out_bufs: ?[]GpuBuffer,
+    // Persistently mapped slices — valid for the lifetime of GpuWeights.
+    // Eliminates vkMapMemory/vkUnmapMemory on the hot path (720 calls/token).
+    expert_in_slice:   ?[]f32,
+    expert_mid_slices: ?[][]f32,
+    expert_up_slices:  ?[][]f32,
+    expert_out_slices: ?[][]f32,
     allocator:   std.mem.Allocator,
 
     pub fn init(g4w: *const Gemma4Weights, g4cfg: Gemma4Config, allocator: std.mem.Allocator) !GpuWeights {
@@ -118,7 +134,11 @@ pub const GpuWeights = struct {
             .layers = layers, .lm_head = null,
             .shared_vec = null, .shared_out = null,
             .expert_gate = null, .expert_up = null, .expert_down = null,
-            .n_experts = g4cfg.n_experts,
+            .n_experts = g4cfg.n_experts, .n_experts_used = g4cfg.n_experts_used,
+            .expert_in_buf = null, .expert_mid_bufs = null,
+            .expert_up_bufs = null, .expert_out_bufs = null,
+            .expert_in_slice = null, .expert_mid_slices = null,
+            .expert_up_slices = null, .expert_out_slices = null,
             .allocator = allocator,
         };
         errdefer gw.deinit();
@@ -170,16 +190,83 @@ pub const GpuWeights = struct {
         std.debug.print("  shared I/O bufs: vec={} KiB out={} KiB\n",
             .{ max_cols * @sizeOf(f32) / 1024, max_rows * @sizeOf(f32) / 1024 });
 
-        // MoE experts intentionally NOT uploaded to VRAM.
-        // Measured: per-expert GPU dispatch (720 vkQueueSubmit/token at 8 experts×3
-        // matmuls×30 layers) costs more than it saves — 1.52 tok/s vs 2.44 tok/s.
-        // expert_gate/up/down stay null → expertGate/Up/Down return null → CPU fallback.
-        // TODO: batched dispatch (all 8 active experts in one command buffer per layer).
+        // Upload all MoE experts to VRAM (128 experts × 30 layers ≈ 9.6 GiB).
+        // Batched by 16 experts per command buffer (~47 MiB staging peak per batch).
+        const n_total = g4cfg.n_layers * g4cfg.n_experts;
+        gw.expert_gate = try allocator.alloc(?MatvecSession, n_total);
+        @memset(gw.expert_gate.?, null);
+        gw.expert_up   = try allocator.alloc(?MatvecSession, n_total);
+        @memset(gw.expert_up.?, null);
+        gw.expert_down = try allocator.alloc(?MatvecSession, n_total);
+        @memset(gw.expert_down.?, null);
+        std.debug.print("  uploading {} experts × {} layers to GPU...\n",
+            .{g4cfg.n_experts, g4cfg.n_layers});
+        for (0..g4cfg.n_layers) |l| {
+            const off = l * g4cfg.n_experts;
+            uploadExpertsBatch(
+                &gw.ctx,
+                gw.expert_gate.?[off..][0..g4cfg.n_experts],
+                gw.expert_up.?[off..][0..g4cfg.n_experts],
+                gw.expert_down.?[off..][0..g4cfg.n_experts],
+                &g4w.layers[l], g4cfg.d_model, g4cfg.d_expert,
+            ) catch |e| std.debug.print("  layer {}: expert upload failed ({s})\n",
+                .{l, @errorName(e)});
+        }
+        std.debug.print("  experts done: VRAM={} MiB GTT={} MiB\n",
+            .{vramUsedMB(), gttUsedMB()});
+
+        // Allocate HOST_COHERENT I/O buffers for batched expert dispatch.
+        // Map them persistently so the hot path does zero vkMapMemory calls.
+        const nu = g4cfg.n_experts_used;
+        gw.expert_in_buf  = try GpuBuffer.initHostCoherent(&gw.ctx,
+            g4cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.expert_in_slice = try gw.expert_in_buf.?.mapSlice(f32, g4cfg.d_model);
+
+        gw.expert_mid_bufs  = try allocator.alloc(GpuBuffer, nu);
+        gw.expert_up_bufs   = try allocator.alloc(GpuBuffer, nu);
+        gw.expert_out_bufs  = try allocator.alloc(GpuBuffer, nu);
+        gw.expert_mid_slices = try allocator.alloc([]f32, nu);
+        gw.expert_up_slices  = try allocator.alloc([]f32, nu);
+        gw.expert_out_slices = try allocator.alloc([]f32, nu);
+        for (0..nu) |k| {
+            gw.expert_mid_bufs.?[k] = try GpuBuffer.initHostCoherent(&gw.ctx,
+                g4cfg.d_expert * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            gw.expert_up_bufs.?[k]  = try GpuBuffer.initHostCoherent(&gw.ctx,
+                g4cfg.d_expert * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            gw.expert_out_bufs.?[k] = try GpuBuffer.initHostCoherent(&gw.ctx,
+                g4cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            gw.expert_mid_slices.?[k] = try gw.expert_mid_bufs.?[k].mapSlice(f32, g4cfg.d_expert);
+            gw.expert_up_slices.?[k]  = try gw.expert_up_bufs.?[k].mapSlice(f32, g4cfg.d_expert);
+            gw.expert_out_slices.?[k] = try gw.expert_out_bufs.?[k].mapSlice(f32, g4cfg.d_model);
+        }
+        std.debug.print("  expert I/O bufs: {} slots × ({} + {} + {}) KiB (persistently mapped)\n", .{
+            nu,
+            g4cfg.d_expert * @sizeOf(f32) / 1024,
+            g4cfg.d_expert * @sizeOf(f32) / 1024,
+            g4cfg.d_model  * @sizeOf(f32) / 1024,
+        });
 
         return gw;
     }
 
     pub fn deinit(self: *GpuWeights) void {
+        // Unmap persistent slices before destroying buffers.
+        if (self.expert_out_slices) |ss| { self.allocator.free(ss); }
+        if (self.expert_up_slices)  |ss| { self.allocator.free(ss); }
+        if (self.expert_mid_slices) |ss| { self.allocator.free(ss); }
+        if (self.expert_out_bufs) |bs| {
+            for (bs) |*b| { b.unmap(); b.deinit(); }
+            self.allocator.free(bs);
+        }
+        if (self.expert_up_bufs)  |bs| {
+            for (bs) |*b| { b.unmap(); b.deinit(); }
+            self.allocator.free(bs);
+        }
+        if (self.expert_mid_bufs) |bs| {
+            for (bs) |*b| { b.unmap(); b.deinit(); }
+            self.allocator.free(bs);
+        }
+        if (self.expert_in_buf)   |*b| { b.unmap(); b.deinit(); }
         if (self.expert_down) |ed| { for (ed) |*ms| if (ms.*) |*s| s.deinit(); self.allocator.free(ed); }
         if (self.expert_up)   |eu| { for (eu) |*ms| if (ms.*) |*s| s.deinit(); self.allocator.free(eu); }
         if (self.expert_gate) |eg| { for (eg) |*ms| if (ms.*) |*s| s.deinit(); self.allocator.free(eg); }
@@ -220,6 +307,93 @@ pub const GpuWeights = struct {
             .q5_0 => &self.pl_q5_0,
             else  => unreachable,
         };
+    }
+
+    // Run all active experts for one layer in two GPU submissions:
+    //   1. gate + up matmuls (n experts × 2 dispatches, all sharing moe_in input)
+    //   2. down matmuls (n experts × 1 dispatch, each with its own eg[k] input)
+    // CPU does gelu*up between the two submits.
+    // Returns error.ExpertNotOnGpu if any session is missing → caller falls back to CPU.
+    pub fn runExpertBatch(
+        self: *const GpuWeights,
+        layer: usize,
+        top_idx: []const usize,
+        gate_up_type: GgmlType,
+        down_type: GgmlType,
+        down_exps_scale: []const f32,
+        moe_in: []const f32,
+        router_out: []const f32,
+        moe_buf: []f32,
+    ) !void {
+        const n = top_idx.len;
+        const eg_sessions = self.expert_gate orelse return error.ExpertNotOnGpu;
+        const eu_sessions = self.expert_up   orelse return error.ExpertNotOnGpu;
+        const ed_sessions = self.expert_down orelse return error.ExpertNotOnGpu;
+        const mid_bufs    = self.expert_mid_bufs   orelse return error.ExpertNotOnGpu;
+        const up_bufs     = self.expert_up_bufs    orelse return error.ExpertNotOnGpu;
+        const out_bufs    = self.expert_out_bufs   orelse return error.ExpertNotOnGpu;
+        const in_buf      = &(self.expert_in_buf   orelse return error.ExpertNotOnGpu);
+        const in_slice    = self.expert_in_slice   orelse return error.ExpertNotOnGpu;
+        const mid_slices  = self.expert_mid_slices orelse return error.ExpertNotOnGpu;
+        const up_slices   = self.expert_up_slices  orelse return error.ExpertNotOnGpu;
+        const out_slices  = self.expert_out_slices orelse return error.ExpertNotOnGpu;
+
+        // Pre-check: all required sessions must be on GPU.
+        for (top_idx) |eidx| {
+            if (eg_sessions[layer * self.n_experts + eidx] == null or
+                eu_sessions[layer * self.n_experts + eidx] == null or
+                ed_sessions[layer * self.n_experts + eidx] == null)
+                return error.ExpertNotOnGpu;
+        }
+
+        const pl_gu = self.pipelineFor(gate_up_type);
+        const pl_dn = self.pipelineFor(down_type);
+
+        // ── Phase 1: gate + up (all n experts, 2n dispatches, 1 submit) ──────────
+        @memcpy(in_slice, moe_in);
+
+        const cmd1 = try self.ctx.beginBatch();
+        var dsets1: [32]vk.VkDescriptorSet = undefined;
+        var n_dsets1: usize = 0;
+        for (0..n) |k| {
+            const sg = eg_sessions[layer * self.n_experts + top_idx[k]].?;
+            const su = eu_sessions[layer * self.n_experts + top_idx[k]].?;
+            dsets1[n_dsets1] = try pl_gu.record(cmd1, &sg.mat_buf, in_buf,       &mid_bufs[k], sg.rows, sg.cols);
+            n_dsets1 += 1;
+            dsets1[n_dsets1] = try pl_gu.record(cmd1, &su.mat_buf, in_buf,       &up_bufs[k],  su.rows, su.cols);
+            n_dsets1 += 1;
+        }
+        try self.ctx.submitBatch(cmd1);
+        for (dsets1[0..n_dsets1]) |*ds|
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_gu.desc_pool, 1, ds);
+
+        // ── Phase 2: gelu*up in-place (CPU, after vkQueueWaitIdle) ──────────────
+        for (0..n) |k| {
+            const gate = mid_slices[k];
+            const up   = up_slices[k];
+            for (gate, up) |*g, u| g.* = math.gelu(g.*) * u;
+        }
+
+        // ── Phase 3: down (n experts, n dispatches, 1 submit) ────────────────────
+        const cmd2 = try self.ctx.beginBatch();
+        var dsets2: [16]vk.VkDescriptorSet = undefined;
+        var n_dsets2: usize = 0;
+        for (0..n) |k| {
+            const sd = ed_sessions[layer * self.n_experts + top_idx[k]].?;
+            dsets2[n_dsets2] = try pl_dn.record(cmd2, &sd.mat_buf, &mid_bufs[k], &out_bufs[k], sd.rows, sd.cols);
+            n_dsets2 += 1;
+        }
+        try self.ctx.submitBatch(cmd2);
+        for (dsets2[0..n_dsets2]) |*ds|
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_dn.desc_pool, 1, ds);
+
+        // ── Phase 4: scale and accumulate into moe_buf (CPU) ─────────────────────
+        for (0..n) |k| {
+            const eidx = top_idx[k];
+            const expert_scale = down_exps_scale[eidx] * router_out[eidx];
+            const out = out_slices[k];
+            for (moe_buf, out) |*m, ev| m.* += expert_scale * ev;
+        }
     }
 };
 

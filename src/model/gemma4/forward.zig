@@ -216,33 +216,38 @@ pub fn forwardOne(
         // Run each selected expert; accumulate into moe_buf.
         @memset(moe_buf, 0.0);
 
-        const gu_row_bytes   = math.rowBytes(lw.gate_up_exps.type_, d);
-        const gu_per_expert  = 2 * cfg.d_expert * gu_row_bytes;
-        const dn_row_bytes   = math.rowBytes(lw.down_exps.type_, cfg.d_expert);
-        const dn_per_expert  = d * dn_row_bytes;
+        // Batched GPU path: 2 submits per layer (n gate+up dispatches, then n down).
+        // Falls back to per-expert CPU path if experts aren't on GPU.
+        const expert_gpu_ok = if (gpu) |g|
+            g.runExpertBatch(l, top_idx,
+                lw.gate_up_exps.type_, lw.down_exps.type_,
+                lw.down_exps_scale, moe_in, router_out, moe_buf)
+        else
+            error.ExpertNotOnGpu;
 
-        for (top_idx) |eidx| {
-            const w_score   = router_out[eidx];
-            const gate_data = lw.gate_up_exps.data[eidx * gu_per_expert ..];
-            const up_data   = gate_data[cfg.d_expert * gu_row_bytes ..];
-            const dn_data   = lw.down_exps.data[eidx * dn_per_expert ..];
-
-            try mv(eg, .{ .data = gate_data, .type_ = lw.gate_up_exps.type_,
-                          .rows = cfg.d_expert, .cols = d },
-                moe_in, scratch, pool,
-                if (gpu) |gw| gw.expertGate(l, eidx) else null, gpu);
-            try mv(eu, .{ .data = up_data, .type_ = lw.gate_up_exps.type_,
-                          .rows = cfg.d_expert, .cols = d },
-                moe_in, scratch, pool,
-                if (gpu) |gw| gw.expertUp(l, eidx) else null, gpu);
-            for (eg, eu) |*g, u| g.* = math.gelu(g.*) * u;
-            try mv(ed, .{ .data = dn_data, .type_ = lw.down_exps.type_,
-                          .rows = d, .cols = cfg.d_expert },
-                eg, scratch, pool,
-                if (gpu) |gw| gw.expertDown(l, eidx) else null, gpu);
-
-            const expert_scale = lw.down_exps_scale[eidx] * w_score;
-            for (moe_buf, ed) |*m, ev| m.* += expert_scale * ev;
+        if (expert_gpu_ok) |_| {
+            // GPU path completed; moe_buf already accumulated.
+        } else |_| {
+            // CPU fallback: one expert at a time with thread pool.
+            const gu_row_bytes  = math.rowBytes(lw.gate_up_exps.type_, d);
+            const gu_per_expert = 2 * cfg.d_expert * gu_row_bytes;
+            const dn_row_bytes  = math.rowBytes(lw.down_exps.type_, cfg.d_expert);
+            const dn_per_expert = d * dn_row_bytes;
+            for (top_idx) |eidx| {
+                const w_score   = router_out[eidx];
+                const gate_data = lw.gate_up_exps.data[eidx * gu_per_expert ..];
+                const up_data   = gate_data[cfg.d_expert * gu_row_bytes ..];
+                const dn_data   = lw.down_exps.data[eidx * dn_per_expert ..];
+                math.quantMatvecPar(eg, gate_data, lw.gate_up_exps.type_,
+                    moe_in, cfg.d_expert, d, scratch, pool);
+                math.quantMatvecPar(eu, up_data, lw.gate_up_exps.type_,
+                    moe_in, cfg.d_expert, d, scratch, pool);
+                for (eg, eu) |*g, u| g.* = math.gelu(g.*) * u;
+                math.quantMatvecPar(ed, dn_data, lw.down_exps.type_,
+                    eg, d, cfg.d_expert, scratch, pool);
+                const expert_scale = lw.down_exps_scale[eidx] * w_score;
+                for (moe_buf, ed) |*m, ev| m.* += expert_scale * ev;
+            }
         }
 
         math.rmsnorm(moe_buf, moe_buf, lw.post_ffw_norm_2, cfg.eps);

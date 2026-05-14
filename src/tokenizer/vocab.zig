@@ -9,6 +9,9 @@ pub const Vocab = struct {
     merge_rank: std.StringHashMap(u32),
     bos_token_id: u32,
     eos_token_id: u32,
+    // End-of-turn token — auto-detected from the vocab, null if not found.
+    // Stops generation the same way EOS does (without printing the token).
+    eot_token_id: ?u32,
     add_bos: bool,
     allocator: std.mem.Allocator,
 
@@ -55,6 +58,21 @@ pub fn fromGguf(reader: *const reader_mod.GgufReader, allocator: std.mem.Allocat
     const eos_id = data.metaU32("tokenizer.ggml.eos_token_id") orelse 2;
     const add_bos = data.metaBool("tokenizer.ggml.add_bos_token") orelse false;
 
+    // Auto-detect end-of-turn token by scanning for well-known EOT strings.
+    // Models use different markers: APEX uses <turn|>, Llama uses <|eot_id|>, etc.
+    const eot_candidates = [_][]const u8{
+        "<turn|>", "<|eot_id|>", "<|im_end|>", "<end_of_turn>",
+    };
+    var eot_id: ?u32 = if (data.metaU32("tokenizer.ggml.eot_token_id")) |id| id else null;
+    if (eot_id == null) {
+        for (eot_candidates) |candidate| {
+            if (token_to_id.get(candidate)) |id| {
+                eot_id = id;
+                break;
+            }
+        }
+    }
+
     return .{
         .model = model,
         .tokens = tokens,
@@ -62,6 +80,7 @@ pub fn fromGguf(reader: *const reader_mod.GgufReader, allocator: std.mem.Allocat
         .merge_rank = merge_rank,
         .bos_token_id = bos_id,
         .eos_token_id = eos_id,
+        .eot_token_id = eot_id,
         .add_bos = add_bos,
         .allocator = allocator,
     };

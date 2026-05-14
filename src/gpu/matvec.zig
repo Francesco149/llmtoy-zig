@@ -133,15 +133,17 @@ pub const MatvecPipeline = struct {
             return error.VkComputePipelineFailed;
         errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
+        // 64 sets: enough for one-shot run() (1 set) and batched record() (up to 16
+        // gate+up or 8 down dispatches per layer, with room for concurrent calls).
         const pool_size = vk.VkDescriptorPoolSize{
             .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = 3 * 8,
+            .descriptorCount = 3 * 64,
         };
         const pool_ci = vk.VkDescriptorPoolCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = null,
             .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = 8,
+            .maxSets = 64,
             .poolSizeCount = 1,
             .pPoolSizes = &pool_size,
         };
@@ -156,6 +158,57 @@ pub const MatvecPipeline = struct {
             .desc_pool = desc_pool,
             .device = dev,
         };
+    }
+
+    // Record one dispatch into an already-open command buffer.
+    // Returns the descriptor set allocated from this pipeline's pool.
+    // Caller must free the returned set after vkQueueWaitIdle.
+    pub fn record(
+        self: *const MatvecPipeline,
+        cmd: vk.VkCommandBuffer,
+        mat_buf: *const GpuBuffer,
+        vec_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+        rows: u32,
+        cols: u32,
+    ) !vk.VkDescriptorSet {
+        const dev = self.device;
+
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [3]vk.VkDescriptorBufferInfo{
+            .{ .buffer = mat_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = vec_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = out_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [3]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+            mkWrite(dset, 2, &buf_infos[2]),
+        };
+        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            self.layout, 0, 1, &dset, 0, null);
+
+        const pc = PushConst{ .rows = rows, .cols = cols };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            0, @sizeOf(PushConst), &pc);
+
+        const groups = (rows + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        vk.vkCmdDispatch(cmd, groups, 1, 1);
+
+        return dset;
     }
 
     pub fn deinit(self: *MatvecPipeline) void {

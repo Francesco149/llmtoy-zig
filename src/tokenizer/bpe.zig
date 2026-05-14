@@ -395,6 +395,7 @@ test "Gemma4 tokenizer normalizes spaces before BPE" {
         .merge_rank = merge_rank,
         .bos_token_id = 1,
         .eos_token_id = 0,
+        .eot_token_id = null,
         .add_bos = true,
         .allocator = allocator,
     };
@@ -430,6 +431,7 @@ test "Gemma4 tokenizer keeps angle-bracket control tokens intact" {
         .merge_rank = merge_rank,
         .bos_token_id = 1,
         .eos_token_id = 0,
+        .eot_token_id = 3,
         .add_bos = true,
         .allocator = allocator,
     };

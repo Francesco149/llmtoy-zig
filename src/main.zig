@@ -75,14 +75,15 @@ pub fn main(init: std.process.Init) !void {
         const prompt     = args[3];
 
         // Parse optional flags.
-        var max_tokens:  u32   = 256;
-        var temperature: f32   = 0.8;
-        var top_p:       f32   = 0.9;
-        var top_k:       u32   = 40;
-        var seed:        u64   = 42;
-        var threads:     u32   = 0; // 0 = auto (getCpuCount)
-        var chat:        bool  = false;
-        var use_gpu:     bool  = false;
+        var max_tokens:  u32         = 256;
+        var temperature: f32         = 0.8;
+        var top_p:       f32         = 0.9;
+        var top_k:       u32         = 40;
+        var seed:        u64         = 42;
+        var threads:     u32         = 0; // 0 = auto (getCpuCount)
+        var chat:        bool        = false;
+        var use_gpu:     bool        = false;
+        var stop_token:  ?[]const u8 = null;
         var i: usize = 4;
         while (i < args.len) {
             const flag = args[i];
@@ -104,6 +105,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, flag, "--top-k"))       top_k       = try std.fmt.parseInt(u32, val, 10);
             if (std.mem.eql(u8, flag, "--seed"))        seed        = try std.fmt.parseInt(u64, val, 10);
             if (std.mem.eql(u8, flag, "--threads"))     threads     = try std.fmt.parseInt(u32, val, 10);
+            if (std.mem.eql(u8, flag, "--stop-token"))  stop_token  = val;
             i += 2;
         }
 
@@ -116,6 +118,7 @@ pub fn main(init: std.process.Init) !void {
             .threads     = threads,
             .chat        = chat,
             .gpu         = use_gpu,
+            .stop_token  = stop_token,
         }, io, gpa);
     } else {
         try usagePrint(out);
@@ -129,9 +132,10 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\  llmtoy gpu-info                        list Vulkan device and run a matvec smoke test
         \\  llmtoy info <model.gguf>               print model metadata and tensor summary
         \\  llmtoy tokenize <model.gguf> <text>    BPE-encode text, print IDs and decoded tokens
-        \\  llmtoy generate <model.gguf> <prompt> [--chat] [--gpu] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N]
+        \\  llmtoy generate <model.gguf> <prompt> [--chat] [--gpu] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N] [--stop-token TOKEN]
         \\
-        \\  --gpu: offload attention + dense-FFN matmuls to the GPU via Vulkan (Gemma4 only)
+        \\  --gpu:        offload attention + dense-FFN matmuls to the GPU via Vulkan (Gemma4 only)
+        \\  --stop-token: stop generation when this token is sampled (default: auto-detect from vocab)
         \\
     );
 }
@@ -278,6 +282,8 @@ const GenerateOptions = struct {
     threads:     u32  = 0, // 0 = auto
     chat:        bool = false,
     gpu:         bool = false,
+    // Override the auto-detected EOT token. null = use vocab.eot_token_id.
+    stop_token:  ?[]const u8 = null,
 };
 
 fn cmdGenerate(
@@ -297,6 +303,18 @@ fn cmdGenerate(
 
     var vocab = try vocab_mod.fromGguf(&reader, gpa);
     defer vocab.deinit();
+
+    // Resolve stop token: explicit --stop-token overrides auto-detected EOT.
+    const stop_id: ?u32 = blk: {
+        if (opts.stop_token) |s| {
+            if (vocab.token_to_id.get(s)) |id| break :blk id;
+            std.debug.print("warning: --stop-token '{s}' not found in vocab, ignoring\n", .{s});
+            break :blk null;
+        }
+        break :blk vocab.eot_token_id;
+    };
+    if (stop_id) |id| std.debug.print("  stop token: {} '{s}'\n",
+        .{ id, if (id < vocab.tokens.len) vocab.tokens[id] else "?" });
 
     const rendered_prompt = if (opts.chat) blk: {
         const messages = [_]chat_tmpl.Message{.{ .role = .user, .content = prompt }};
@@ -374,10 +392,8 @@ fn cmdGenerate(
         while (n_gen < opts.max_tokens) : (n_gen += 1) {
             const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
             gpa.free(last_logits);
-            if (next_tok == vocab.eos_token_id) {
-                last_logits = &.{};
-                break;
-            }
+            if (next_tok == vocab.eos_token_id) { last_logits = &.{}; break; }
+            if (stop_id != null and next_tok == stop_id.?) { last_logits = &.{}; break; }
             var tok_buf: [64]u8 = undefined;
             const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
             try out.writeAll(tok_buf[0..tok_len]);
@@ -414,10 +430,8 @@ fn cmdGenerate(
         while (n_gen < opts.max_tokens) : (n_gen += 1) {
             const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
             gpa.free(last_logits);
-            if (next_tok == vocab.eos_token_id) {
-                last_logits = &.{};
-                break;
-            }
+            if (next_tok == vocab.eos_token_id) { last_logits = &.{}; break; }
+            if (stop_id != null and next_tok == stop_id.?) { last_logits = &.{}; break; }
             var tok_buf: [64]u8 = undefined;
             const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
             try out.writeAll(tok_buf[0..tok_len]);

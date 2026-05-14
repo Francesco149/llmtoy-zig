@@ -99,4 +99,19 @@ pub const GpuBuffer = struct {
         const src: [*]const u8 = @ptrCast(ptr.?);
         @memcpy(dest, src[0..dest.len]);
     }
+
+    // Map host-coherent buffer for direct CPU read/write. Call unmap() when done.
+    // Safe to read immediately after vkQueueWaitIdle; writes visible to GPU after unmap.
+    pub fn mapSlice(self: *const GpuBuffer, comptime T: type, count: usize) ![]T {
+        std.debug.assert(count * @sizeOf(T) <= self.size);
+        var ptr: ?*anyopaque = null;
+        if (vk.vkMapMemory(self.device, self.memory, 0, count * @sizeOf(T), 0, &ptr) != vk.VK_SUCCESS)
+            return error.VkMapFailed;
+        const typed: [*]T = @alignCast(@ptrCast(ptr.?));
+        return typed[0..count];
+    }
+
+    pub fn unmap(self: *const GpuBuffer) void {
+        vk.vkUnmapMemory(self.device, self.memory);
+    }
 };

@@ -109,6 +109,7 @@ test "Gemma4 chat template renders turn markers" {
         .merge_rank = std.StringHashMap(u32).init(std.testing.allocator),
         .bos_token_id = 2,
         .eos_token_id = 1,
+        .eot_token_id = null,
         .add_bos = true,
         .allocator = std.testing.allocator,
     };
@@ -132,6 +133,7 @@ test "ChatML template renders assistant generation prompt" {
         .merge_rank = std.StringHashMap(u32).init(std.testing.allocator),
         .bos_token_id = 1,
         .eos_token_id = 2,
+        .eot_token_id = null,
         .add_bos = false,
         .allocator = std.testing.allocator,
     };
