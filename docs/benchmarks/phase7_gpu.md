@@ -27,11 +27,20 @@ Prompt: "What is 2+2?" (chat template, --seed 42)
 | GPU (attn + dense FFN) | 2.41 |
 | Speedup | +20% |
 
+## Phase 7b — Q5_1 + Q5_0 added (all w_down on GPU)
+
+| Mode | tok/s prefill | tok/s decode |
+|------|--------------|--------------|
+| GPU (attn + full dense FFN) | 2.62 | 2.41 |
+| Speedup vs CPU (+16% / +9%) | | |
+
+- VRAM: 984 MiB (182 MiB baseline → 984 MiB after upload)
+- Q5_0 adds 24 layers of ffn_down to GPU (48 tensors); Q5_1 adds layer 0
+
 ## Notes
 
 - Modest speedup because MoE expert compute (128 experts, 8 active/token) still runs on CPU
 - GPU dispatch overhead for small-ish matrices limits gains
-- w_down (Q5_1) not GPU-supported, falls back to CPU
 - systemd-run --scope -p MemoryMax=40G required for safe testing
 
 ## Bugs fixed during GPU bringup
