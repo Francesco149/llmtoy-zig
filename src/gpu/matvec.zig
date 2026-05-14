@@ -247,10 +247,12 @@ pub const MatvecPipeline = struct {
 // Pre-loaded weight matrix that stays resident in VRAM across token steps.
 // Upload the matrix once at model-load time, then call run() for every token.
 // The quant format is baked into the MatvecPipeline passed to run().
+//
+// vec_buf and out_buf are NOT owned by the session — callers share a single
+// pair (sized to the largest matrix) across all sessions to avoid 400+
+// separate HOST_COHERENT Vulkan allocations. GpuWeights owns the shared bufs.
 pub const MatvecSession = struct {
     mat_buf: GpuBuffer, // device-local VRAM: holds raw matrix bytes (any format)
-    vec_buf: GpuBuffer, // host-coherent: fp32 activation input, updated each token
-    out_buf: GpuBuffer, // host-coherent: fp32 output, read each token
     rows: u32,
     cols: u32,
 
@@ -260,7 +262,6 @@ pub const MatvecSession = struct {
     }
 
     // Upload a Q8_0 quantized matrix (raw GGUF bytes) to VRAM.
-    // mat_bytes must be exactly rows * (cols/32) * 34 bytes.
     pub fn initQ8_0(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
         std.debug.assert(cols % 32 == 0);
         std.debug.assert(mat_bytes.len == rows * (cols / 32) * 34);
@@ -268,7 +269,6 @@ pub const MatvecSession = struct {
     }
 
     // Upload a Q3_K quantized matrix (raw GGUF bytes) to VRAM.
-    // mat_bytes must be exactly rows * (cols/256) * 110 bytes.
     pub fn initQ3K(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
         std.debug.assert(cols % 256 == 0);
         std.debug.assert(mat_bytes.len == rows * (cols / 256) * 110);
@@ -276,16 +276,13 @@ pub const MatvecSession = struct {
     }
 
     // Upload a Q4_K quantized matrix (raw GGUF bytes) to VRAM.
-    // mat_bytes must be exactly rows * (cols/256) * 144 bytes.
     pub fn initQ4K(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
         std.debug.assert(cols % 256 == 0);
         std.debug.assert(mat_bytes.len == rows * (cols / 256) * 144);
         return initBytes(ctx, mat_bytes, rows, cols);
     }
 
-    // Upload any GPU-supported quant type. Returns null for unsupported types
-    // (caller falls back to CPU). f32 bytes are passed through as-is since the
-    // f32 shader reads float[] directly from the std430 buffer.
+    // Upload any GPU-supported quant type. Returns null for unsupported types.
     pub fn initFromRaw(ctx: *const GpuContext, mat_data: []const u8, mat_type: GgmlType, rows: u32, cols: u32) !?MatvecSession {
         return switch (mat_type) {
             .f32  => try initBytes(ctx, mat_data, rows, cols),
@@ -296,18 +293,12 @@ pub const MatvecSession = struct {
         };
     }
 
-    // Allocate mat_buf (device-local, empty) + vec_buf/out_buf (host-coherent).
-    // Used by batch upload: caller writes mat data via staging + GpuContext.recordCopy,
+    // Allocate mat_buf (device-local, empty) for batch upload.
+    // Caller records the staging→VRAM copy via GpuContext.recordCopy,
     // then calls submitBatchCopy before calling run().
     pub fn allocEmpty(ctx: *const GpuContext, mat_size: usize, rows: u32, cols: u32) !MatvecSession {
-        var mat_buf = try GpuBuffer.initDeviceLocal(ctx, mat_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        errdefer mat_buf.deinit();
-        var vec_buf = try GpuBuffer.initHostCoherent(ctx, cols * @sizeOf(f32),
-            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        errdefer vec_buf.deinit();
-        const out_buf = try GpuBuffer.initHostCoherent(ctx, rows * @sizeOf(f32),
-            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        return .{ .mat_buf = mat_buf, .vec_buf = vec_buf, .out_buf = out_buf, .rows = rows, .cols = cols };
+        const mat_buf = try GpuBuffer.initDeviceLocal(ctx, mat_size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        return .{ .mat_buf = mat_buf, .rows = rows, .cols = cols };
     }
 
     fn initBytes(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
@@ -320,39 +311,46 @@ pub const MatvecSession = struct {
         errdefer mat_buf.deinit();
         try ctx.copyBuffer(staging.handle, mat_buf.handle, mat_bytes.len);
 
-        var vec_buf = try GpuBuffer.initHostCoherent(ctx, cols * @sizeOf(f32),
-            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        errdefer vec_buf.deinit();
-
-        var out_buf = try GpuBuffer.initHostCoherent(ctx, rows * @sizeOf(f32),
-            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        errdefer out_buf.deinit();
-
-        return .{
-            .mat_buf = mat_buf,
-            .vec_buf = vec_buf,
-            .out_buf = out_buf,
-            .rows = rows,
-            .cols = cols,
-        };
+        return .{ .mat_buf = mat_buf, .rows = rows, .cols = cols };
     }
 
     pub fn deinit(self: *MatvecSession) void {
-        self.out_buf.deinit();
-        self.vec_buf.deinit();
         self.mat_buf.deinit();
     }
 
+    // Run matvec using caller-provided host-coherent buffers.
+    // vec_buf must be at least cols*4 bytes; out_buf at least rows*4 bytes.
+    // GpuWeights shares one max-sized pair across all sessions.
     pub fn run(
+        self: *const MatvecSession,
+        ctx: *const GpuContext,
+        pipeline: *const MatvecPipeline,
+        vec_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+        vec: []const f32,
+        out: []f32,
+    ) !void {
+        try vec_buf.upload(std.mem.sliceAsBytes(vec));
+        try pipeline.run(ctx, &self.mat_buf, vec_buf, out_buf, self.rows, self.cols);
+        try out_buf.download(std.mem.sliceAsBytes(out));
+    }
+
+    // Convenience wrapper for tests and one-shot ops.
+    // Creates temporary host-coherent buffers for this call only.
+    pub fn runOwned(
         self: *const MatvecSession,
         ctx: *const GpuContext,
         pipeline: *const MatvecPipeline,
         vec: []const f32,
         out: []f32,
     ) !void {
-        try self.vec_buf.upload(std.mem.sliceAsBytes(vec));
-        try pipeline.run(ctx, &self.mat_buf, &self.vec_buf, &self.out_buf, self.rows, self.cols);
-        try self.out_buf.download(std.mem.sliceAsBytes(out));
+        var vb = try GpuBuffer.initHostCoherent(ctx, self.cols * @sizeOf(f32),
+            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        defer vb.deinit();
+        var ob = try GpuBuffer.initHostCoherent(ctx, self.rows * @sizeOf(f32),
+            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        defer ob.deinit();
+        return self.run(ctx, pipeline, &vb, &ob, vec, out);
     }
 };
 
@@ -371,7 +369,7 @@ pub fn matvecF32(
 ) !void {
     var session = try MatvecSession.init(ctx, mat, rows, cols);
     defer session.deinit();
-    try session.run(ctx, pipeline, vec, out);
+    try session.runOwned(ctx, pipeline, vec, out);
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -468,7 +466,7 @@ test "gpu matvec Q8_0 correctness" {
 
     var session = try MatvecSession.initQ8_0(&gpu, &mat_bytes, rows, cols);
     defer session.deinit();
-    try session.run(&gpu, &pipeline, &vec, &out);
+    try session.runOwned(&gpu, &pipeline, &vec, &out);
 
     for (0..rows) |i| {
         try std.testing.expectApproxEqAbs(out[i], @as(f32, @floatFromInt(i + 1)), 1e-4);
@@ -518,7 +516,7 @@ test "gpu matvec Q3_K positive q3" {
 
     var session = try MatvecSession.initQ3K(&gpu, &mat_bytes, 1, 256);
     defer session.deinit();
-    try session.run(&gpu, &pipeline, &vec, &out);
+    try session.runOwned(&gpu, &pipeline, &vec, &out);
 
     try std.testing.expectApproxEqAbs(out[0], 1.0, 1e-4);
 }
@@ -558,7 +556,7 @@ test "gpu matvec Q3_K negative q3" {
 
     var session = try MatvecSession.initQ3K(&gpu, &mat_bytes, 1, 256);
     defer session.deinit();
-    try session.run(&gpu, &pipeline, &vec, &out);
+    try session.runOwned(&gpu, &pipeline, &vec, &out);
 
     try std.testing.expectApproxEqAbs(out[0], -1024.0, 0.1);
 }
@@ -590,7 +588,7 @@ test "gpu matvec Q4_K scale" {
 
     var session = try MatvecSession.initQ4K(&gpu, &mat_bytes, 1, 256);
     defer session.deinit();
-    try session.run(&gpu, &pipeline, &vec, &out);
+    try session.runOwned(&gpu, &pipeline, &vec, &out);
 
     try std.testing.expectApproxEqAbs(out[0], 32.0, 1e-4);
 }
@@ -620,7 +618,7 @@ test "gpu matvec Q4_K min" {
 
     var session = try MatvecSession.initQ4K(&gpu, &mat_bytes, 1, 256);
     defer session.deinit();
-    try session.run(&gpu, &pipeline, &vec, &out);
+    try session.runOwned(&gpu, &pipeline, &vec, &out);
 
     try std.testing.expectApproxEqAbs(out[0], -64.0, 1e-4);
 }

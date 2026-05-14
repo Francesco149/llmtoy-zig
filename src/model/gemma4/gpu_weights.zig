@@ -50,14 +50,18 @@ pub const GpuLayerWeights = struct {
 };
 
 pub const GpuWeights = struct {
-    ctx:     GpuCtx,
-    pl_f32:  MatvecPipeline,
-    pl_q8_0: MatvecPipeline,
-    pl_q3_k: MatvecPipeline,
-    pl_q4_k: MatvecPipeline,
-    layers:  []GpuLayerWeights,
-    lm_head: ?MatvecSession,
-    allocator: std.mem.Allocator,
+    ctx:        GpuCtx,
+    pl_f32:     MatvecPipeline,
+    pl_q8_0:    MatvecPipeline,
+    pl_q3_k:    MatvecPipeline,
+    pl_q4_k:    MatvecPipeline,
+    layers:     []GpuLayerWeights,
+    lm_head:    ?MatvecSession,
+    // Shared host-coherent I/O buffers sized to the largest matrix across all
+    // sessions. Eliminates 420+ individual per-session HOST_COHERENT allocations.
+    shared_vec: ?GpuBuffer,
+    shared_out: ?GpuBuffer,
+    allocator:  std.mem.Allocator,
 
     pub fn init(g4w: *const Gemma4Weights, g4cfg: Gemma4Config, allocator: std.mem.Allocator) !GpuWeights {
         const avail_mb = availableMemoryMB();
@@ -86,7 +90,9 @@ pub const GpuWeights = struct {
         var gw = GpuWeights{
             .ctx = ctx, .pl_f32 = pl_f32, .pl_q8_0 = pl_q8_0,
             .pl_q3_k = pl_q3_k, .pl_q4_k = pl_q4_k,
-            .layers = layers, .lm_head = null, .allocator = allocator,
+            .layers = layers, .lm_head = null,
+            .shared_vec = null, .shared_out = null,
+            .allocator = allocator,
         };
         errdefer gw.deinit();
 
@@ -101,10 +107,35 @@ pub const GpuWeights = struct {
             break :blk null;
         };
 
+        // Create ONE shared vec_buf + out_buf sized to the largest matrix.
+        // Replaces 420+ per-session HOST_COHERENT allocations with 2.
+        var max_rows: u32 = 1;
+        var max_cols: u32 = 1;
+        for (gw.layers) |l| {
+            for ([_]?MatvecSession{ l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down }) |ms| {
+                if (ms) |s| {
+                    if (s.rows > max_rows) max_rows = s.rows;
+                    if (s.cols > max_cols) max_cols = s.cols;
+                }
+            }
+        }
+        if (gw.lm_head) |s| {
+            if (s.rows > max_rows) max_rows = s.rows;
+            if (s.cols > max_cols) max_cols = s.cols;
+        }
+        gw.shared_vec = try GpuBuffer.initHostCoherent(&gw.ctx,
+            max_cols * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.shared_out = try GpuBuffer.initHostCoherent(&gw.ctx,
+            max_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std.debug.print("  shared I/O bufs: vec={} KiB out={} KiB\n",
+            .{ max_cols * @sizeOf(f32) / 1024, max_rows * @sizeOf(f32) / 1024 });
+
         return gw;
     }
 
     pub fn deinit(self: *GpuWeights) void {
+        if (self.shared_out) |*b| b.deinit();
+        if (self.shared_vec) |*b| b.deinit();
         if (self.lm_head) |*s| s.deinit();
         for (self.layers) |*l| l.deinitAll();
         self.allocator.free(self.layers);

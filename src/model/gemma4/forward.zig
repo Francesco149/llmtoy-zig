@@ -290,7 +290,9 @@ fn mv(
     gw: ?*const GpuWeights,
 ) !void {
     if (sess_opt) |sess| {
-        try sess.run(&gw.?.ctx, gw.?.pipelineFor(mat.type_), vec, out);
+        const gw_ = gw.?;
+        try sess.run(&gw_.ctx, gw_.pipelineFor(mat.type_),
+            &gw_.shared_vec.?, &gw_.shared_out.?, vec, out);
     } else {
         math.quantMatvecPar(out, mat.data, mat.type_, vec, out.len, vec.len, scratch, pool);
     }

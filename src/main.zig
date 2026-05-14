@@ -338,6 +338,8 @@ fn cmdGenerate(
         // Optional GPU offload: upload attention + dense-FFN matrices to VRAM.
         var gpu_weights: ?g4_gpu.GpuWeights = null;
         if (opts.gpu) {
+            // Prefer killing llmtoy over system services/Claude if OOM fires.
+            setOomAdj(500);
             std.debug.print("uploading weights to GPU VRAM...\n", .{});
             const t_gpu0 = clk.now(io);
             gpu_weights = g4_gpu.GpuWeights.init(&weights, g4cfg, gpa) catch |e| blk: {
@@ -423,6 +425,18 @@ fn cmdGenerate(
     }
     try out.print("\n", .{});
     try out.flush();
+}
+
+// Write `adj` to /proc/self/oom_score_adj so llmtoy is the preferred OOM
+// victim rather than system services or the Claude session. Silently ignores
+// failures (non-root processes may not be allowed to raise the adj).
+fn setOomAdj(adj: i32) void {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/oom_score_adj",
+        .{ .ACCMODE = .WRONLY }, 0) catch return;
+    defer _ = std.os.linux.close(fd);
+    var buf: [12]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{}\n", .{adj}) catch return;
+    _ = std.os.linux.write(fd, s.ptr, s.len);
 }
 
 fn printSetupTiming(start: anytype, end: anytype) void {
