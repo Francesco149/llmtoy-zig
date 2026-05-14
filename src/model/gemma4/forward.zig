@@ -222,23 +222,25 @@ pub fn forwardOne(
         const dn_per_expert  = d * dn_row_bytes;
 
         for (top_idx) |eidx| {
-            const w_score = router_out[eidx];
-
+            const w_score   = router_out[eidx];
             const gate_data = lw.gate_up_exps.data[eidx * gu_per_expert ..];
-            math.quantMatvecPar(eg, gate_data, lw.gate_up_exps.type_,
-                moe_in, cfg.d_expert, d, scratch, pool);
+            const up_data   = gate_data[cfg.d_expert * gu_row_bytes ..];
+            const dn_data   = lw.down_exps.data[eidx * dn_per_expert ..];
 
-            const up_data = gate_data[cfg.d_expert * gu_row_bytes ..];
-            math.quantMatvecPar(eu, up_data, lw.gate_up_exps.type_,
-                moe_in, cfg.d_expert, d, scratch, pool);
-
+            try mv(eg, .{ .data = gate_data, .type_ = lw.gate_up_exps.type_,
+                          .rows = cfg.d_expert, .cols = d },
+                moe_in, scratch, pool,
+                if (gpu) |gw| gw.expertGate(l, eidx) else null, gpu);
+            try mv(eu, .{ .data = up_data, .type_ = lw.gate_up_exps.type_,
+                          .rows = cfg.d_expert, .cols = d },
+                moe_in, scratch, pool,
+                if (gpu) |gw| gw.expertUp(l, eidx) else null, gpu);
             for (eg, eu) |*g, u| g.* = math.gelu(g.*) * u;
+            try mv(ed, .{ .data = dn_data, .type_ = lw.down_exps.type_,
+                          .rows = d, .cols = cfg.d_expert },
+                eg, scratch, pool,
+                if (gpu) |gw| gw.expertDown(l, eidx) else null, gpu);
 
-            const dn_data = lw.down_exps.data[eidx * dn_per_expert ..];
-            math.quantMatvecPar(ed, dn_data, lw.down_exps.type_,
-                eg, d, cfg.d_expert, scratch, pool);
-
-            // Scale by per-expert output scale and router weight.
             const expert_scale = lw.down_exps_scale[eidx] * w_score;
             for (moe_buf, ed) |*m, ev| m.* += expert_scale * ev;
         }

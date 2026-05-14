@@ -1,20 +1,17 @@
 /// GPU-resident weight sessions for Gemma4.
 ///
-/// Uploads per-layer attention and dense-FFN weight matrices to VRAM one
-/// layer at a time: each layer's ≤7 matrices go into a single command buffer
-/// → single vkQueueSubmit → free staging.  Peak HOST_COHERENT staging is
-/// ~22 MiB (one layer) rather than ~1 GiB (all layers at once).
+/// Phase 1: attention + dense FFN — one layer's ≤7 matrices per vkQueueSubmit.
+/// Phase 2: MoE experts — all 128 experts per layer uploaded in batches of 16
+///          (~47 MiB staging peak per batch). Expert sessions stored in flat
+///          arrays [n_layers × n_experts]; null entries fall back to CPU.
 ///
-/// lm_head is uploaded separately and falls back to CPU if the allocation
-/// fails (vocab_size=262144 can make it 400+ MiB of staging).
+/// lm_head is uploaded separately and falls back to CPU on alloc failure.
 ///
-/// MoE expert tensors stay on CPU: too large to pre-upload (~20 GB across
-/// all layers) and accessed sparsely (8 of 128 experts per token).
-///
-/// Matrices whose quant type has no GPU shader (Q5_K, IQ4_NL, …) get a null
-/// session and fall back to the CPU path transparently.
+/// Matrices with no GPU shader (Q5_K, IQ4_NL, …) get null sessions and fall
+/// back to the CPU path transparently.
 
 const std        = @import("std");
+const math       = @import("../../ops/math.zig");
 const vk_mod     = @import("../../gpu/vk.zig");
 const vk         = vk_mod.vk;
 const GgmlType   = @import("../../gguf/types.zig").GgmlType;
@@ -61,9 +58,14 @@ pub const GpuWeights = struct {
     lm_head:    ?MatvecSession,
     // Shared host-coherent I/O buffers sized to the largest matrix across all
     // sessions. Eliminates 420+ individual per-session HOST_COHERENT allocations.
-    shared_vec: ?GpuBuffer,
-    shared_out: ?GpuBuffer,
-    allocator:  std.mem.Allocator,
+    shared_vec:  ?GpuBuffer,
+    shared_out:  ?GpuBuffer,
+    // Flat [n_layers × n_experts] expert session arrays; null = CPU fallback.
+    expert_gate: ?[]?MatvecSession,
+    expert_up:   ?[]?MatvecSession,
+    expert_down: ?[]?MatvecSession,
+    n_experts:   usize,
+    allocator:   std.mem.Allocator,
 
     pub fn init(g4w: *const Gemma4Weights, g4cfg: Gemma4Config, allocator: std.mem.Allocator) !GpuWeights {
         const avail_mb = availableMemoryMB();
@@ -115,6 +117,8 @@ pub const GpuWeights = struct {
             .pl_q5_1 = pl_q5_1, .pl_q5_0 = pl_q5_0,
             .layers = layers, .lm_head = null,
             .shared_vec = null, .shared_out = null,
+            .expert_gate = null, .expert_up = null, .expert_down = null,
+            .n_experts = g4cfg.n_experts,
             .allocator = allocator,
         };
         errdefer gw.deinit();
@@ -166,10 +170,19 @@ pub const GpuWeights = struct {
         std.debug.print("  shared I/O bufs: vec={} KiB out={} KiB\n",
             .{ max_cols * @sizeOf(f32) / 1024, max_rows * @sizeOf(f32) / 1024 });
 
+        // MoE experts intentionally NOT uploaded to VRAM.
+        // Measured: per-expert GPU dispatch (720 vkQueueSubmit/token at 8 experts×3
+        // matmuls×30 layers) costs more than it saves — 1.52 tok/s vs 2.44 tok/s.
+        // expert_gate/up/down stay null → expertGate/Up/Down return null → CPU fallback.
+        // TODO: batched dispatch (all 8 active experts in one command buffer per layer).
+
         return gw;
     }
 
     pub fn deinit(self: *GpuWeights) void {
+        if (self.expert_down) |ed| { for (ed) |*ms| if (ms.*) |*s| s.deinit(); self.allocator.free(ed); }
+        if (self.expert_up)   |eu| { for (eu) |*ms| if (ms.*) |*s| s.deinit(); self.allocator.free(eu); }
+        if (self.expert_gate) |eg| { for (eg) |*ms| if (ms.*) |*s| s.deinit(); self.allocator.free(eg); }
         if (self.shared_out) |*b| b.deinit();
         if (self.shared_vec) |*b| b.deinit();
         if (self.lm_head) |*s| s.deinit();
@@ -182,6 +195,19 @@ pub const GpuWeights = struct {
         self.pl_q8_0.deinit();
         self.pl_f32.deinit();
         self.ctx.deinit();
+    }
+
+    pub fn expertGate(self: *const GpuWeights, l: usize, e: usize) ?MatvecSession {
+        const eg = self.expert_gate orelse return null;
+        return eg[l * self.n_experts + e];
+    }
+    pub fn expertUp(self: *const GpuWeights, l: usize, e: usize) ?MatvecSession {
+        const eu = self.expert_up orelse return null;
+        return eu[l * self.n_experts + e];
+    }
+    pub fn expertDown(self: *const GpuWeights, l: usize, e: usize) ?MatvecSession {
+        const ed = self.expert_down orelse return null;
+        return ed[l * self.n_experts + e];
     }
 
     pub fn pipelineFor(self: *const GpuWeights, t: GgmlType) *const MatvecPipeline {
@@ -255,6 +281,51 @@ fn uploadLayerBatch(ctx: *const GpuCtx, glayer: *GpuLayerWeights, lw: *const Gem
 
     try ctx.submitBatchCopy(cmd);
     for (0..n_stagings) |i| stagings[i].deinit();
+}
+
+// Upload all experts for one layer in batches of EXPERT_BATCH per command buffer.
+// Each batch creates at most EXPERT_BATCH×3 staging buffers (~47 MiB at batch=16).
+const EXPERT_BATCH: usize = 16;
+
+fn uploadExpertsBatch(
+    ctx:      *const GpuCtx,
+    gate_out: []?MatvecSession,
+    up_out:   []?MatvecSession,
+    down_out: []?MatvecSession,
+    lw:       *const Gemma4LayerWeights,
+    d_model:  usize,
+    d_expert: usize,
+) !void {
+    const gu_row  = math.rowBytes(lw.gate_up_exps.type_, d_model);
+    const gu_each = d_expert * gu_row;  // bytes for one expert's gate or up
+    const dn_row  = math.rowBytes(lw.down_exps.type_, d_expert);
+    const dn_each = d_model * dn_row;   // bytes for one expert's down
+
+    var e: usize = 0;
+    while (e < gate_out.len) : (e += EXPERT_BATCH) {
+        const end = @min(e + EXPERT_BATCH, gate_out.len);
+        var stagings: [EXPERT_BATCH * 3]GpuBuffer = undefined;
+        var n_stagings: usize = 0;
+        errdefer for (0..n_stagings) |i| stagings[i].deinit();
+
+        const cmd = try ctx.beginBatchCopy();
+        for (e..end) |eidx| {
+            gate_out[eidx] = try schedUpload(ctx,
+                .{ .data = lw.gate_up_exps.data[eidx * 2 * gu_each..][0..gu_each],
+                   .type_ = lw.gate_up_exps.type_, .rows = d_expert, .cols = d_model },
+                cmd, &stagings, &n_stagings);
+            up_out[eidx] = try schedUpload(ctx,
+                .{ .data = lw.gate_up_exps.data[eidx * 2 * gu_each + gu_each..][0..gu_each],
+                   .type_ = lw.gate_up_exps.type_, .rows = d_expert, .cols = d_model },
+                cmd, &stagings, &n_stagings);
+            down_out[eidx] = try schedUpload(ctx,
+                .{ .data = lw.down_exps.data[eidx * dn_each..][0..dn_each],
+                   .type_ = lw.down_exps.type_, .rows = d_model, .cols = d_expert },
+                cmd, &stagings, &n_stagings);
+        }
+        try ctx.submitBatchCopy(cmd);
+        for (0..n_stagings) |i| stagings[i].deinit();
+    }
 }
 
 // Upload a single matrix in its own command buffer submission.

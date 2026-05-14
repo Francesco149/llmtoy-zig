@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{
         .default_target = .{ .cpu_model = .native },
     });
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
 
     // Compile GLSL compute shaders to SPIR-V via glslc (must be on PATH).
     // The WriteFiles step puts matvec_f32.spv alongside shaders.zig so that
