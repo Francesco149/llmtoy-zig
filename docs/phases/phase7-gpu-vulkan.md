@@ -381,8 +381,39 @@ Two tests verify correctness:
 - *Positive q3*: element 0 has q3=1, scale=1.0 → output = 1.0
 - *Negative q3*: all elements have q3=−4, all scales=1.0, 256 elements → output = −1024.0
 
+## Quantized matvec: Q4_K
+
+Q4_K stores 4 bits per weight in 256-element super-blocks of 144 bytes:
+
+```
+[0..1]    f16  d     – super-scale for sub-block scales
+[2..3]    f16  dmin  – super-scale for sub-block mins
+[4..15]   u8[12] scales – 8 sub-block (scale, min) pairs packed as 6-bit values
+[16..143] u8[128] qs – 4-bit nibbles, 2 per byte (lo=even element, hi=odd)
+```
+
+256 elements are split into 4 chunks of 64; each chunk has 2 sub-blocks of 32.
+For chunk `c`, sub-block `s` (0 or 1): `j = c*2 + s`, read 32 bytes from
+`qs[c*32..(c+1)*32]`.  Each byte gives lo nibble (sub-block s=0) and hi nibble
+(s=1).
+
+**scale_min_k4** matches `get_scale_min_k4` from `ggml-quants.c`:
+```glsl
+// j < 4: direct 6-bit fields
+sc = scales[j] & 0x3F;   mn = scales[j+4] & 0x3F;
+// j >= 4: low 4 bits from scales[j+4], high 2 bits from upper bits of earlier bytes
+sc = (scales[j+4] & 0x0F) | ((scales[j-4] >> 6) << 4);
+mn = (scales[j+4] >> 4)   | ((scales[j  ] >> 6) << 4);
+```
+
+**Dequant**: `val = d*sc * q4 - dmin*mn` per element.
+
+Two tests verify correctness:
+- *Scale test*: d=1.0, dmin=0.0, sub-block 0 sc=1, qs[0..31]=0x11 → lo nibble=1 for
+  32 elements, vec=1.0 → output = 32.0
+- *Min test*: d=0.0, dmin=1.0, sub-block 0 mn=2, qs=0 → output = −64.0
+
 ## Next steps
 
-- Add Q4_K matvec shader (K-quant super-blocks, 256 elements each)
 - Wire `MatvecSession` into the Gemma4 forward pass as an optional `--gpu` backend
 - Benchmark GPU matvec throughput vs the AVX2 CPU path on Gemma4 generation speed
