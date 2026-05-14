@@ -337,9 +337,52 @@ alignment surprises. The SPIR-V size is verified at comptime (`spv.len % 4 == 0`
 common `initFromSpv`. `run` is identical for all formats — the pipeline carries
 the compiled shader and `MatvecSession` carries the pre-uploaded weight bytes.
 
+## Quantized matvec: Q3_K
+
+Q3_K is Gemma4's dominant quantization (138 of 234 tensors). Each 256-element
+super-block packs 3 bits per weight into 110 bytes:
+
+```
+[0..31]    hmask  – 1 high bit per element (256 bits = 32 bytes)
+[32..95]   qs     – 2 low bits per element, 4 packed per byte (512 bits = 64 bytes)
+[96..107]  scales – 16 × 6-bit signed sub-block scales (12-byte GGML packing)
+[108..109] d      – f16 super-block scale
+```
+
+**Dequant**: `val = d * (scale[sc_idx] - 32) * q3`  where `q3 = lo2 - (hi ? 0 : 4)`, range [-4, 3].
+
+**Element ordering** is non-trivial: not a simple sequential scan. For element `e`:
+```
+half  = e >> 7,  iter = (e >> 5) & 3,  group = (e >> 4) & 1,  lane = e & 15
+qs_off = (half << 5) | (group << 4) | lane   ← byte index into qs section
+hm_off = (group << 4) | lane                 ← byte index into hmask section
+shift  = iter << 1                            ← which 2-bit pair in that qs byte
+m_bit  = (half << 2) | iter                  ← which bit in that hmask byte
+sc_idx = (half << 3) | (iter << 1) | group   ← which of 16 scales
+```
+Each qs byte covers 4 different output positions (via shift 0/2/4/6). Each hmask
+byte covers 8 different output positions (via bits 0-7). This interleaving matches
+`dequantQ3K` in `src/quant/dequant.zig` exactly.
+
+**Scale unpacking** (GGML's 6-bit packing into 12 bytes):
+```glsl
+aux[0] = (sc01 & kmask2) | ((tmp        & kmask1) << 4)  // sc[0..3]
+aux[1] = (sc23 & kmask2) | (((tmp >> 2) & kmask1) << 4)  // sc[4..7]
+aux[2] = ((sc01>>4) & kmask2) | (((tmp>>4) & kmask1) << 4) // sc[8..11]
+aux[3] = ((sc23>>4) & kmask2) | (((tmp>>6) & kmask1) << 4) // sc[12..15]
+```
+Each byte in aux is a 6-bit value; `float(byte) - 32.0` gives the signed scale.
+
+**Unaligned reads**: Q3_K blocks are 110 bytes so consecutive blocks are not
+word-aligned. The shader's `u32_at` handles this by reading two uint words and
+combining with shifts when the byte offset is not 4-byte aligned.
+
+Two tests verify correctness:
+- *Positive q3*: element 0 has q3=1, scale=1.0 → output = 1.0
+- *Negative q3*: all elements have q3=−4, all scales=1.0, 256 elements → output = −1024.0
+
 ## Next steps
 
-- Add Q3_K matvec shader (Gemma4's dominant quant: 138 tensors)
 - Add Q4_K matvec shader (K-quant super-blocks, 256 elements each)
 - Wire `MatvecSession` into the Gemma4 forward pass as an optional `--gpu` backend
 - Benchmark GPU matvec throughput vs the AVX2 CPU path on Gemma4 generation speed

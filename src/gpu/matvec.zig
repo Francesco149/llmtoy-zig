@@ -33,6 +33,11 @@ pub const MatvecPipeline = struct {
         return initFromSpv(ctx, &shaders.matvec_q8_0);
     }
 
+    pub fn initQ3K(ctx: *const GpuContext) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_q3_k.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.matvec_q3_k);
+    }
+
     fn initFromSpv(ctx: *const GpuContext, spv: anytype) !MatvecPipeline {
         // align(4) on the const in shaders.zig should guarantee this, but
         // assert the actual runtime address in case @embedFile doesn't honour it.
@@ -256,6 +261,14 @@ pub const MatvecSession = struct {
         return initBytes(ctx, mat_bytes, rows, cols);
     }
 
+    // Upload a Q3_K quantized matrix (raw GGUF bytes) to VRAM.
+    // mat_bytes must be exactly rows * (cols/256) * 110 bytes.
+    pub fn initQ3K(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
+        std.debug.assert(cols % 256 == 0);
+        std.debug.assert(mat_bytes.len == rows * (cols / 256) * 110);
+        return initBytes(ctx, mat_bytes, rows, cols);
+    }
+
     fn initBytes(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
         var staging = try GpuBuffer.initStaging(ctx, mat_bytes.len);
         defer staging.deinit();
@@ -419,4 +432,92 @@ test "gpu matvec Q8_0 correctness" {
     for (0..rows) |i| {
         try std.testing.expectApproxEqAbs(out[i], @as(f32, @floatFromInt(i + 1)), 1e-4);
     }
+}
+
+test "gpu matvec Q3_K positive q3" {
+    // Verifies correct scale unpacking and element ordering for a positive quant value.
+    //
+    // Block (1 row × 256 cols, 110 bytes):
+    //   hmask[0..31] = 0xFF  →  hi_bit = 1 for every element
+    //   qs[0]        = 0x01  →  lo2 = 1 for element 0 (shift=0); lo2=0 for e=32,64,96
+    //   qs[1..63]    = 0x00  →  lo2 = 0 for all other elements
+    //   scales[0..3] = [0x01, 0x00, 0x00, 0x00]
+    //   scales[4..7] = [0x00, 0x00, 0x00, 0x00]
+    //   scales[8..11]= [0xAA, 0xAA, 0xAA, 0xAA]
+    //   → sc[0] = 33, sc[1..15] = 32
+    //   → scale for group 0 (elements 0..15) = d_all*(33-32) = 1.0
+    //   → scale for all other groups = d_all*(32-32) = 0.0
+    //   d = f16(1.0) = [0x00, 0x3C]
+    //
+    // Element 0: hi=1, lo2=1 → q3=1, scale=1.0, vec[0]=1.0  → contributes 1.0
+    // All other elements: q3=0 or scale=0                     → contribute 0.0
+    // Expected output: 1.0
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    var pipeline = try MatvecPipeline.initQ3K(&gpu);
+    defer pipeline.deinit();
+
+    const blk_size = 110;
+    var mat_bytes: [blk_size]u8 = [_]u8{0} ** blk_size;
+    @memset(mat_bytes[0..32], 0xFF);    // hmask: all hi bits set
+    mat_bytes[32] = 0x01;              // qs[0]: lo2=1 at shift=0 for element 0
+    // scales: sc[0]=33, sc[1..15]=32
+    mat_bytes[96] = 0x01; mat_bytes[97] = 0x00; mat_bytes[98] = 0x00; mat_bytes[99] = 0x00;
+    mat_bytes[100] = 0x00; mat_bytes[101] = 0x00; mat_bytes[102] = 0x00; mat_bytes[103] = 0x00;
+    mat_bytes[104] = 0xAA; mat_bytes[105] = 0xAA; mat_bytes[106] = 0xAA; mat_bytes[107] = 0xAA;
+    mat_bytes[108] = 0x00; mat_bytes[109] = 0x3C; // d = f16(1.0)
+
+    var vec: [256]f32 = [_]f32{1.0} ** 256;
+    var out: [1]f32 = .{0.0};
+
+    var session = try MatvecSession.initQ3K(&gpu, &mat_bytes, 1, 256);
+    defer session.deinit();
+    try session.run(&gpu, &pipeline, &vec, &out);
+
+    try std.testing.expectApproxEqAbs(out[0], 1.0, 1e-4);
+}
+
+test "gpu matvec Q3_K negative q3" {
+    // All hi_bits = 0, all lo2 = 0  →  q3 = 0 - 4 = -4 for every element.
+    // All 16 scales = 33  →  each sub-block scale = d_all*(33-32) = 1.0.
+    // vec = all 1.0,  256 elements.
+    // Expected: 1.0 * (-4) * 256 = -1024.0.
+    //
+    // Scale encoding for all sc[i]=33:
+    //   sc01 = sc23 = 0x11111111, tmp = 0xAAAAAAAA
+    //   → scales[0..3]  = [0x11,0x11,0x11,0x11]
+    //   → scales[4..7]  = [0x11,0x11,0x11,0x11]
+    //   → scales[8..11] = [0xAA,0xAA,0xAA,0xAA]
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    var pipeline = try MatvecPipeline.initQ3K(&gpu);
+    defer pipeline.deinit();
+
+    const blk_size = 110;
+    var mat_bytes: [blk_size]u8 = [_]u8{0} ** blk_size;
+    // hmask = 0, qs = 0  →  hi_bit=0, lo2=0  →  q3 = -4 for all elements
+    // scales: all sc[i] = 33
+    mat_bytes[96] = 0x11; mat_bytes[97] = 0x11; mat_bytes[98] = 0x11; mat_bytes[99] = 0x11;
+    mat_bytes[100] = 0x11; mat_bytes[101] = 0x11; mat_bytes[102] = 0x11; mat_bytes[103] = 0x11;
+    mat_bytes[104] = 0xAA; mat_bytes[105] = 0xAA; mat_bytes[106] = 0xAA; mat_bytes[107] = 0xAA;
+    mat_bytes[108] = 0x00; mat_bytes[109] = 0x3C; // d = f16(1.0)
+
+    var vec: [256]f32 = [_]f32{1.0} ** 256;
+    var out: [1]f32 = .{0.0};
+
+    var session = try MatvecSession.initQ3K(&gpu, &mat_bytes, 1, 256);
+    defer session.deinit();
+    try session.run(&gpu, &pipeline, &vec, &out);
+
+    try std.testing.expectApproxEqAbs(out[0], -1024.0, 0.1);
 }
