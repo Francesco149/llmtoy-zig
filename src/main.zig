@@ -374,7 +374,10 @@ fn cmdGenerate(
         while (n_gen < opts.max_tokens) : (n_gen += 1) {
             const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
             gpa.free(last_logits);
-            if (next_tok == vocab.eos_token_id) break;
+            if (next_tok == vocab.eos_token_id) {
+                last_logits = &.{};
+                break;
+            }
             var tok_buf: [64]u8 = undefined;
             const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
             try out.writeAll(tok_buf[0..tok_len]);
@@ -382,7 +385,7 @@ fn cmdGenerate(
             last_logits = try g4_fwd.forwardOne(next_tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr);
             pos += 1;
         }
-        gpa.free(last_logits);
+        if (last_logits.len > 0) gpa.free(last_logits);
         const t_end = clk.now(io);
         printTokenTiming("generation", n_gen, t_gen_start, t_end);
     } else {
@@ -411,7 +414,10 @@ fn cmdGenerate(
         while (n_gen < opts.max_tokens) : (n_gen += 1) {
             const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
             gpa.free(last_logits);
-            if (next_tok == vocab.eos_token_id) break;
+            if (next_tok == vocab.eos_token_id) {
+                last_logits = &.{};
+                break;
+            }
             var tok_buf: [64]u8 = undefined;
             const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
             try out.writeAll(tok_buf[0..tok_len]);
@@ -419,7 +425,7 @@ fn cmdGenerate(
             last_logits = try fwd.forwardOneModel(next_tok, pos, &kv, &weights, cfg, pool, gpa);
             pos += 1;
         }
-        gpa.free(last_logits);
+        if (last_logits.len > 0) gpa.free(last_logits);
         const t_end = clk.now(io);
         printTokenTiming("generation", n_gen, t_gen_start, t_end);
     }
