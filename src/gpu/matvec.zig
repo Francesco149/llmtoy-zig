@@ -5,6 +5,7 @@ const vk = @import("vk.zig").vk;
 const GpuContext = @import("context.zig").GpuContext;
 const GpuBuffer = @import("buffer.zig").GpuBuffer;
 const shaders = @import("gpu_shaders");
+const GgmlType = @import("../gguf/types.zig").GgmlType;
 
 const WORKGROUP_SIZE: u32 = 64;
 
@@ -280,6 +281,19 @@ pub const MatvecSession = struct {
         std.debug.assert(cols % 256 == 0);
         std.debug.assert(mat_bytes.len == rows * (cols / 256) * 144);
         return initBytes(ctx, mat_bytes, rows, cols);
+    }
+
+    // Upload any GPU-supported quant type. Returns null for unsupported types
+    // (caller falls back to CPU). f32 bytes are passed through as-is since the
+    // f32 shader reads float[] directly from the std430 buffer.
+    pub fn initFromRaw(ctx: *const GpuContext, mat_data: []const u8, mat_type: GgmlType, rows: u32, cols: u32) !?MatvecSession {
+        return switch (mat_type) {
+            .f32  => try initBytes(ctx, mat_data, rows, cols),
+            .q8_0 => try initQ8_0(ctx, mat_data, rows, cols),
+            .q3_k => try initQ3K(ctx, mat_data, rows, cols),
+            .q4_k => try initQ4K(ctx, mat_data, rows, cols),
+            else  => null,
+        };
     }
 
     fn initBytes(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {

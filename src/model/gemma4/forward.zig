@@ -20,13 +20,17 @@ const rope_mod  = @import("../../ops/rope.zig");
 const attn_mod  = @import("../../ops/attn.zig");
 const moe_mod   = @import("../../ops/moe.zig");
 const dq        = @import("../../quant/dequant.zig");
+const gpu_w_    = @import("gpu_weights.zig");
 
-pub const Gemma4Config   = cfg_.Gemma4Config;
-pub const Gemma4Weights  = wt_.Gemma4Weights;
-pub const Gemma4KvCache  = kv_.Gemma4KvCache;
+pub const Gemma4Config      = cfg_.Gemma4Config;
+pub const Gemma4Weights     = wt_.Gemma4Weights;
+pub const Gemma4KvCache     = kv_.Gemma4KvCache;
+pub const GpuWeights        = gpu_w_.GpuWeights;
+pub const GpuLayerWeights   = gpu_w_.GpuLayerWeights;
 
 /// Process one token at `pos`, writing new K/V into `kv`.
 /// Returns a caller-owned logit slice.
+/// Pass gpu != null to offload attention + dense-FFN matmuls to the GPU.
 pub fn forwardOne(
     token: u32,
     pos: usize,
@@ -35,6 +39,7 @@ pub fn forwardOne(
     cfg: Gemma4Config,
     pool: *math.ThreadPool,
     allocator: std.mem.Allocator,
+    gpu: ?*const GpuWeights,
 ) ![]f32 {
     const d         = cfg.d_model;
     const n_threads = pool.threads.len;
@@ -98,15 +103,18 @@ pub fn forwardOne(
         const k_cur   = k_buf[0..nkv_l];
         const v_cur   = v_buf[0..nkv_l];
 
+        // GPU layer weights for this layer (null ⇒ CPU fallback for every call).
+        const glw: ?*const GpuLayerWeights = if (gpu) |g| &g.layers[l] else null;
+
         // ── Attention ─────────────────────────────────────────────────────────
 
         math.rmsnorm(xb, x, lw.attn_norm, cfg.eps);
-        math.quantMatvecPar(q,     lw.wq.data, lw.wq.type_, xb, nq_l,  d, scratch, pool);
-        math.quantMatvecPar(k_cur, lw.wk.data, lw.wk.type_, xb, nkv_l, d, scratch, pool);
+        try mv(q[0..nq_l],  lw.wq, xb[0..d], scratch, pool, if (glw) |g| g.wq else null, gpu);
+        try mv(k_cur,       lw.wk, xb[0..d], scratch, pool, if (glw) |g| g.wk else null, gpu);
 
         // V = Wv*x if present, else V = pre-norm K (global layers share K/V projection)
         if (lw.wv) |wv| {
-            math.quantMatvecPar(v_cur, wv.data, wv.type_, xb, nkv_l, d, scratch, pool);
+            try mv(v_cur, wv, xb[0..d], scratch, pool, if (glw) |g| g.wv else null, gpu);
         } else {
             @memcpy(v_cur, k_cur); // copy raw K before K-norm is applied
         }
@@ -175,17 +183,17 @@ pub fn forwardOne(
         }
 
         // Output projection → post-attention norm → first residual.
-        math.quantMatvecPar(attn_buf, lw.wo.data, lw.wo.type_, attn_concat[0..nq_l], d, nq_l, scratch, pool);
+        try mv(attn_buf, lw.wo, attn_concat[0..nq_l], scratch, pool, if (glw) |g| g.wo else null, gpu);
         math.rmsnorm(attn_buf, attn_buf, lw.post_attention_norm, cfg.eps);
         for (x, attn_buf) |*xi, a| xi.* += a;
 
         // ── Dense FFN path ────────────────────────────────────────────────────
 
         math.rmsnorm(xb, x, lw.ffn_norm, cfg.eps);
-        math.quantMatvecPar(gate_buf, lw.w_gate.data, lw.w_gate.type_, xb, cfg.d_ffn, d, scratch, pool);
-        math.quantMatvecPar(up_buf,   lw.w_up.data,   lw.w_up.type_,   xb, cfg.d_ffn, d, scratch, pool);
+        try mv(gate_buf, lw.w_gate, xb[0..d], scratch, pool, if (glw) |g| g.w_gate else null, gpu);
+        try mv(up_buf,   lw.w_up,   xb[0..d], scratch, pool, if (glw) |g| g.w_up   else null, gpu);
         for (gate_buf, up_buf) |*g, u| g.* = math.gelu(g.*) * u;
-        math.quantMatvecPar(ffn_buf, lw.w_down.data, lw.w_down.type_, gate_buf, d, cfg.d_ffn, scratch, pool);
+        try mv(ffn_buf, lw.w_down, gate_buf, scratch, pool, if (glw) |g| g.w_down else null, gpu);
         math.rmsnorm(ffn_buf, ffn_buf, lw.post_ffw_norm_1, cfg.eps);
 
         // ── MoE FFN path ──────────────────────────────────────────────────────
@@ -255,8 +263,8 @@ pub fn forwardOne(
 
     math.rmsnorm(xb, x, w.out_norm, cfg.eps);
     const logits = try allocator.alloc(f32, cfg.vocab_size);
-    math.quantMatvecPar(logits, w.lm_head.data, w.lm_head.type_,
-        xb, cfg.vocab_size, d, scratch, pool);
+    try mv(logits, w.lm_head, xb[0..d], scratch, pool,
+        if (gpu) |g| g.lm_head else null, gpu);
 
     // Soft-capping: tanh(logits / cap) * cap
     if (cfg.logit_softcap != 0.0) {
@@ -269,6 +277,24 @@ pub fn forwardOne(
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// Run one matmul on the GPU (if session != null) or the CPU thread pool.
+// sess_opt is passed by value (cheap handle copy); no deinit is called here.
+fn mv(
+    out: []f32,
+    mat: wt_.RawMatrix,
+    vec: []const f32,
+    scratch: []f32,
+    pool: *math.ThreadPool,
+    sess_opt: ?@import("../../gpu/matvec.zig").MatvecSession,
+    gw: ?*const GpuWeights,
+) !void {
+    if (sess_opt) |sess| {
+        try sess.run(&gw.?.ctx, gw.?.pipelineFor(mat.type_), vec, out);
+    } else {
+        math.quantMatvecPar(out, mat.data, mat.type_, vec, out.len, vec.len, scratch, pool);
+    }
+}
 
 fn embedLookup(out: []f32, mat: wt_.RawMatrix, row: u32, cols: usize, row_buf: []f32) void {
     const row_bytes = math.rowBytes(mat.type_, cols);

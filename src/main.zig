@@ -11,6 +11,7 @@ const tp          = @import("ops/thread_pool.zig");
 const g4_loader   = @import("model/gemma4/loader.zig");
 const g4_fwd      = @import("model/gemma4/forward.zig");
 const g4_kv       = @import("model/gemma4/kv_cache.zig");
+const g4_gpu      = @import("model/gemma4/gpu_weights.zig");
 const gpu_ctx     = @import("gpu/context.zig");
 const gpu_matvec  = @import("gpu/matvec.zig");
 
@@ -27,6 +28,7 @@ comptime {
     _ = @import("model/forward.zig");
     _ = @import("model/sample.zig");
     _ = @import("model/gemma4/forward.zig");
+    _ = @import("model/gemma4/gpu_weights.zig");
     _ = @import("gpu/matvec.zig");
 }
 
@@ -80,11 +82,17 @@ pub fn main(init: std.process.Init) !void {
         var seed:        u64   = 42;
         var threads:     u32   = 0; // 0 = auto (getCpuCount)
         var chat:        bool  = false;
+        var use_gpu:     bool  = false;
         var i: usize = 4;
         while (i < args.len) {
             const flag = args[i];
             if (std.mem.eql(u8, flag, "--chat")) {
                 chat = true;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, flag, "--gpu")) {
+                use_gpu = true;
                 i += 1;
                 continue;
             }
@@ -107,6 +115,7 @@ pub fn main(init: std.process.Init) !void {
             .seed        = seed,
             .threads     = threads,
             .chat        = chat,
+            .gpu         = use_gpu,
         }, io, gpa);
     } else {
         try usagePrint(out);
@@ -120,7 +129,9 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\  llmtoy gpu-info                        list Vulkan device and run a matvec smoke test
         \\  llmtoy info <model.gguf>               print model metadata and tensor summary
         \\  llmtoy tokenize <model.gguf> <text>    BPE-encode text, print IDs and decoded tokens
-        \\  llmtoy generate <model.gguf> <prompt> [--chat] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N]
+        \\  llmtoy generate <model.gguf> <prompt> [--chat] [--gpu] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N]
+        \\
+        \\  --gpu: offload attention + dense-FFN matmuls to the GPU via Vulkan (Gemma4 only)
         \\
     );
 }
@@ -266,6 +277,7 @@ const GenerateOptions = struct {
     seed:        u64  = 42,
     threads:     u32  = 0, // 0 = auto
     chat:        bool = false,
+    gpu:         bool = false,
 };
 
 fn cmdGenerate(
@@ -322,6 +334,25 @@ fn cmdGenerate(
         );
         var weights = try g4_loader.loadWeights(&reader, g4cfg, gpa);
         defer weights.deinit();
+
+        // Optional GPU offload: upload attention + dense-FFN matrices to VRAM.
+        var gpu_weights: ?g4_gpu.GpuWeights = null;
+        if (opts.gpu) {
+            std.debug.print("uploading weights to GPU VRAM...\n", .{});
+            const t_gpu0 = clk.now(io);
+            gpu_weights = g4_gpu.GpuWeights.init(&weights, g4cfg, gpa) catch |e| blk: {
+                std.debug.print("GPU init failed ({}), using CPU\n", .{e});
+                break :blk null;
+            };
+            if (gpu_weights != null) {
+                const t_gpu1 = clk.now(io);
+                const ms = @divTrunc(t_gpu0.durationTo(t_gpu1).nanoseconds, std.time.ns_per_ms);
+                std.debug.print("GPU upload done in {} ms\n", .{ms});
+            }
+        }
+        defer if (gpu_weights) |*gw| gw.deinit();
+        const gpu_ptr: ?*const g4_gpu.GpuWeights = if (gpu_weights != null) &gpu_weights.? else null;
+
         const max_seq: usize = @min(g4cfg.max_seq_len, 4096);
         var kv = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
         defer kv.deinit();
@@ -331,7 +362,7 @@ fn cmdGenerate(
         var last_logits: []f32 = undefined;
         for (prompt_ids, 0..) |tok, pos| {
             if (pos > 0) gpa.free(last_logits);
-            last_logits = try g4_fwd.forwardOne(tok, pos, &kv, &weights, g4cfg, pool, gpa);
+            last_logits = try g4_fwd.forwardOne(tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr);
         }
         const t_prefill = clk.now(io);
         printTokenTiming("prefill", prompt_ids.len, t_prefill_start, t_prefill);
@@ -346,7 +377,7 @@ fn cmdGenerate(
             const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
             try out.writeAll(tok_buf[0..tok_len]);
             try out.flush();
-            last_logits = try g4_fwd.forwardOne(next_tok, pos, &kv, &weights, g4cfg, pool, gpa);
+            last_logits = try g4_fwd.forwardOne(next_tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr);
             pos += 1;
         }
         gpa.free(last_logits);
