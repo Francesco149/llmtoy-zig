@@ -11,6 +11,8 @@ const tp          = @import("ops/thread_pool.zig");
 const g4_loader   = @import("model/gemma4/loader.zig");
 const g4_fwd      = @import("model/gemma4/forward.zig");
 const g4_kv       = @import("model/gemma4/kv_cache.zig");
+const gpu_ctx     = @import("gpu/context.zig");
+const gpu_matvec  = @import("gpu/matvec.zig");
 
 // Pull tests from sub-modules into the test binary.
 comptime {
@@ -25,6 +27,7 @@ comptime {
     _ = @import("model/forward.zig");
     _ = @import("model/sample.zig");
     _ = @import("model/gemma4/forward.zig");
+    _ = @import("gpu/matvec.zig");
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -44,7 +47,9 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, args[1], "info")) {
+    if (std.mem.eql(u8, args[1], "gpu-info")) {
+        try cmdGpuInfo(out, gpa);
+    } else if (std.mem.eql(u8, args[1], "info")) {
         if (args.len < 3) {
             std.debug.print("usage: llmtoy info <model.gguf>\n", .{});
             return error.MissingArg;
@@ -112,11 +117,38 @@ fn usagePrint(out: *std.Io.Writer) !void {
     try out.writeAll(
         \\llmtoy-zig  —  educational LLM inference
         \\
-        \\  llmtoy info <model.gguf>              print model metadata and tensor summary
-        \\  llmtoy tokenize <model.gguf> <text>   BPE-encode text, print IDs and decoded tokens
+        \\  llmtoy gpu-info                        list Vulkan device and run a matvec smoke test
+        \\  llmtoy info <model.gguf>               print model metadata and tensor summary
+        \\  llmtoy tokenize <model.gguf> <text>    BPE-encode text, print IDs and decoded tokens
         \\  llmtoy generate <model.gguf> <prompt> [--chat] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N]
         \\
     );
+}
+
+fn cmdGpuInfo(out: *std.Io.Writer, allocator: std.mem.Allocator) !void {
+    var ctx = gpu_ctx.GpuContext.init() catch |e| {
+        try out.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    defer ctx.deinit();
+
+    const name = ctx.deviceName();
+    try out.print("GPU device: {s}\n", .{std.mem.sliceTo(&name, 0)});
+
+    // Smoke test: 4×4 identity * [1,2,3,4] = [1,2,3,4]
+    var pipeline = gpu_matvec.MatvecPipeline.init(&ctx) catch |e| {
+        try out.print("pipeline init failed: {}\n", .{e});
+        return;
+    };
+    defer pipeline.deinit();
+
+    const mat = [16]f32{ 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+    const vec = [4]f32{ 1, 2, 3, 4 };
+    var result = [4]f32{ 0, 0, 0, 0 };
+    try gpu_matvec.matvecF32(&ctx, &pipeline, &mat, &vec, &result, 4, 4, allocator);
+
+    try out.print("matvec smoke test: [{d:.0}, {d:.0}, {d:.0}, {d:.0}] (expect [1, 2, 3, 4])\n",
+        .{ result[0], result[1], result[2], result[3] });
 }
 
 // ── commands ──────────────────────────────────────────────────────────────────

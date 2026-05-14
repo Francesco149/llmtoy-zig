@@ -54,11 +54,16 @@ Completed steps (Qwen2.5-0.5B Q4_K_M, Ryzen 3600):
 - [ ] Known-good regression fixtures against llama.cpp/transformers
 - [ ] Qwen3.6 MoE support
 
-## Phase 7 — GPU Path
-- Evaluate Vulkan vs ROCm complexity, pick simpler
-- Compute shader for matmul
-- Partial GPU offload (attention on GPU, rest CPU)
-- Benchmark GPU vs CPU-only
+## Phase 7 — GPU Path (in progress)
+- [x] Vulkan infrastructure: instance, device, command pool (`src/gpu/context.zig`)
+- [x] Host-coherent buffer allocation + upload/download (`src/gpu/buffer.zig`)
+- [x] fp32 matvec compute shader compiled from GLSL → SPIR-V at build time
+- [x] `llmtoy gpu-info` command: device name + correctness smoke test
+- [x] GPU matvec unit test in `zig build test`
+- [ ] Device-local buffers with staging for upload/download (faster PCIe)
+- [ ] Quantized matvec shaders (Q8×fp32, Q4_K×fp32) for Gemma4 APEX quant types
+- [ ] Wire GPU matvec into Gemma4 forward pass as optional backend
+- [ ] Benchmark GPU vs CPU on Gemma4 APEX I Mini
 
 ## Phase 8 — Multimodal (stretch)
 - SigLIP vision encoder (Gemma4 integration)

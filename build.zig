@@ -1,12 +1,21 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    // Default to native CPU so AVX2/FMA are available out of the box on our
-    // Ryzen 3600/5900x hardware. Override with -Dtarget=<triple> if needed.
     const target = b.standardTargetOptions(.{
         .default_target = .{ .cpu_model = .native },
     });
     const optimize = b.standardOptimizeOption(.{});
+
+    // Compile GLSL compute shaders to SPIR-V via glslc (must be on PATH).
+    // The WriteFiles step puts matvec_f32.spv alongside shaders.zig so that
+    // @embedFile("matvec_f32.spv") in the generated source resolves correctly.
+    const wf = b.addWriteFiles();
+    const matvec_spv = compileShader(b, "src/gpu/shaders/matvec_f32.glsl");
+    _ = wf.addCopyFile(matvec_spv, "matvec_f32.spv");
+    const shaders_src = wf.add("shaders.zig",
+        \\pub const matvec_f32: []const u8 = @embedFile("matvec_f32.spv");
+    );
+    const shaders_mod = b.createModule(.{ .root_source_file = shaders_src });
 
     const exe = b.addExecutable(.{
         .name = "llmtoy",
@@ -16,12 +25,12 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    addGpuSupport(b, exe, shaders_mod);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-
     const run_step = b.step("run", "Run llmtoy");
     run_step.dependOn(&run_cmd.step);
 
@@ -32,7 +41,34 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    addGpuSupport(b, tests, shaders_mod);
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);
+}
+
+fn compileShader(b: *std.Build, src: []const u8) std.Build.LazyPath {
+    const run = b.addSystemCommand(&.{
+        "glslc",
+        "--target-env=vulkan1.1",
+        "-fshader-stage=compute",
+    });
+    run.addFileArg(b.path(src));
+    run.addArg("-o");
+    const name = std.fs.path.stem(std.fs.path.basename(src));
+    return run.addOutputFileArg(b.fmt("{s}.spv", .{name}));
+}
+
+fn addGpuSupport(b: *std.Build, artifact: *std.Build.Step.Compile, shaders_mod: *std.Build.Module) void {
+    const m = artifact.root_module;
+    m.addImport("gpu_shaders", shaders_mod);
+    m.linkSystemLibrary("vulkan", .{});
+    m.link_libc = true;
+    // LIBRARY_PATH set by the nix shell hook; helps the linker find libvulkan.so
+    if (b.graph.environ_map.get("LIBRARY_PATH")) |lib_path| {
+        var it = std.mem.splitScalar(u8, lib_path, ':');
+        while (it.next()) |p| {
+            if (p.len > 0) m.addLibraryPath(.{ .cwd_relative = p });
+        }
+    }
 }

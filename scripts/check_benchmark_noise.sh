@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-lines="${1:-25}"
+# Stray inference/profile processes
+stray=$(pgrep -af 'llama-cli|llmtoy generate|regression_compare.py|profile_gemma4.sh|perf (record|stat)' 2>/dev/null || true)
+if [[ -n "$stray" ]]; then
+    echo "STRAY (stop before benchmarking):"
+    echo "$stray"
+else
+    echo "Stray processes: none"
+fi
 
-echo "== Top CPU processes =="
-ps -eo pid,comm,pcpu,pmem,args --sort=-pcpu | head -n "$lines"
+# CPU load vs core count
+read -r load1 load5 _ < /proc/loadavg
+ncpu=$(nproc)
+echo "CPU load (1m/5m): $load1 / $load5  ($ncpu cores)"
 
-echo
-echo "== Inference/profile processes =="
-pgrep -af 'llama-cli|llmtoy generate|regression_compare.py|profile_gemma4.sh|perf (record|stat)' || true
-
-echo
-echo "Before recording benchmark numbers, stop or wait for unrelated high-CPU"
-echo "processes. Idle llama-server processes are usually fine for CPU timing, but"
-echo "large resident models can still affect memory pressure."
+# Memory
+free -h | awk 'NR==2 {printf "Memory: %s total, %s avail\n", $2, $7}'
