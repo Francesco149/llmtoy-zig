@@ -55,6 +55,7 @@ pub const GpuWeights = struct {
     pl_q8_0:    MatvecPipeline,
     pl_q3_k:    MatvecPipeline,
     pl_q4_k:    MatvecPipeline,
+    pl_q5_1:    MatvecPipeline,
     layers:     []GpuLayerWeights,
     lm_head:    ?MatvecSession,
     // Shared host-coherent I/O buffers sized to the largest matrix across all
@@ -91,6 +92,10 @@ pub const GpuWeights = struct {
         errdefer pl_q4_k.deinit();
         std.debug.print("  init: pl_q4_k ok (VRAM={} MiB GTT={} MiB sys={} MiB)\n",
             .{ vramUsedMB(), gttUsedMB(), availableMemoryMB() });
+        var pl_q5_1 = try MatvecPipeline.initQ5_1(&ctx);
+        errdefer pl_q5_1.deinit();
+        std.debug.print("  init: pl_q5_1 ok (VRAM={} MiB GTT={} MiB sys={} MiB)\n",
+            .{ vramUsedMB(), gttUsedMB(), availableMemoryMB() });
 
         const layers = try allocator.alloc(GpuLayerWeights, g4cfg.n_layers);
         errdefer allocator.free(layers);
@@ -101,7 +106,7 @@ pub const GpuWeights = struct {
 
         var gw = GpuWeights{
             .ctx = ctx, .pl_f32 = pl_f32, .pl_q8_0 = pl_q8_0,
-            .pl_q3_k = pl_q3_k, .pl_q4_k = pl_q4_k,
+            .pl_q3_k = pl_q3_k, .pl_q4_k = pl_q4_k, .pl_q5_1 = pl_q5_1,
             .layers = layers, .lm_head = null,
             .shared_vec = null, .shared_out = null,
             .allocator = allocator,
@@ -164,6 +169,7 @@ pub const GpuWeights = struct {
         if (self.lm_head) |*s| s.deinit();
         for (self.layers) |*l| l.deinitAll();
         self.allocator.free(self.layers);
+        self.pl_q5_1.deinit();
         self.pl_q4_k.deinit();
         self.pl_q3_k.deinit();
         self.pl_q8_0.deinit();
@@ -177,6 +183,7 @@ pub const GpuWeights = struct {
             .q8_0 => &self.pl_q8_0,
             .q3_k => &self.pl_q3_k,
             .q4_k => &self.pl_q4_k,
+            .q5_1 => &self.pl_q5_1,
             else  => unreachable,
         };
     }
@@ -186,7 +193,7 @@ pub const GpuWeights = struct {
 
 fn isGpuSupported(t: GgmlType) bool {
     return switch (t) {
-        .f32, .q8_0, .q3_k, .q4_k => true,
+        .f32, .q8_0, .q3_k, .q4_k, .q5_1 => true,
         else => false,
     };
 }

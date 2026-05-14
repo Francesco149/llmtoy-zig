@@ -44,6 +44,11 @@ pub const MatvecPipeline = struct {
         return initFromSpv(ctx, &shaders.matvec_q4_k);
     }
 
+    pub fn initQ5_1(ctx: *const GpuContext) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_q5_1.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.matvec_q5_1);
+    }
+
     fn initFromSpv(ctx: *const GpuContext, spv: anytype) !MatvecPipeline {
         // align(4) on the const in shaders.zig should guarantee this, but
         // assert the actual runtime address in case @embedFile doesn't honour it.
@@ -282,6 +287,13 @@ pub const MatvecSession = struct {
         return initBytes(ctx, mat_bytes, rows, cols);
     }
 
+    // Upload a Q5_1 quantized matrix (raw GGUF bytes) to VRAM.
+    pub fn initQ5_1(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
+        std.debug.assert(cols % 32 == 0);
+        std.debug.assert(mat_bytes.len == rows * (cols / 32) * 24);
+        return initBytes(ctx, mat_bytes, rows, cols);
+    }
+
     // Upload any GPU-supported quant type. Returns null for unsupported types.
     pub fn initFromRaw(ctx: *const GpuContext, mat_data: []const u8, mat_type: GgmlType, rows: u32, cols: u32) !?MatvecSession {
         return switch (mat_type) {
@@ -289,6 +301,7 @@ pub const MatvecSession = struct {
             .q8_0 => try initQ8_0(ctx, mat_data, rows, cols),
             .q3_k => try initQ3K(ctx, mat_data, rows, cols),
             .q4_k => try initQ4K(ctx, mat_data, rows, cols),
+            .q5_1 => try initQ5_1(ctx, mat_data, rows, cols),
             else  => null,
         };
     }
@@ -621,4 +634,93 @@ test "gpu matvec Q4_K min" {
     try session.runOwned(&gpu, &pipeline, &vec, &out);
 
     try std.testing.expectApproxEqAbs(out[0], -64.0, 1e-4);
+}
+
+test "gpu matvec Q5_1 scale" {
+    // 1 row × 32 cols (one 24-byte block).
+    // d=1.0, m=0.0, qh=0 (no 5th bits set).
+    // qs[0]=0x01 → element 0: lo nibble=1, element 1: hi nibble=0; rest=0.
+    // vec = all 1.0.
+    // Expected: 1.0 * 1 + 0.0 = 1.0 (only element 0 contributes).
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    var pipeline = try MatvecPipeline.initQ5_1(&gpu);
+    defer pipeline.deinit();
+
+    var mat_bytes: [24]u8 = [_]u8{0} ** 24;
+    mat_bytes[0] = 0x00; mat_bytes[1] = 0x3C; // d = f16(1.0)
+    // m at [2..3] = 0.0 (already zero)
+    // qh at [4..7] = 0 (already zero) — no 5th bits
+    mat_bytes[8] = 0x01; // qs[0]: lo nibble=1 for element 0
+
+    var vec: [32]f32 = [_]f32{1.0} ** 32;
+    var out: [1]f32 = .{0.0};
+
+    var session = try MatvecSession.initQ5_1(&gpu, &mat_bytes, 1, 32);
+    defer session.deinit();
+    try session.runOwned(&gpu, &pipeline, &vec, &out);
+
+    try std.testing.expectApproxEqAbs(out[0], 1.0, 1e-4);
+}
+
+test "gpu matvec Q5_1 addend" {
+    // d=0.0, m=1.0, qh=0, qs all zero.
+    // vec = all 1.0.
+    // Every element: x = 0.0 * 0 + 1.0 = 1.0 → sum = 32.0.
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    var pipeline = try MatvecPipeline.initQ5_1(&gpu);
+    defer pipeline.deinit();
+
+    var mat_bytes: [24]u8 = [_]u8{0} ** 24;
+    // d at [0..1] = 0.0 (already zero)
+    mat_bytes[2] = 0x00; mat_bytes[3] = 0x3C; // m = f16(1.0)
+
+    var vec: [32]f32 = [_]f32{1.0} ** 32;
+    var out: [1]f32 = .{0.0};
+
+    var session = try MatvecSession.initQ5_1(&gpu, &mat_bytes, 1, 32);
+    defer session.deinit();
+    try session.runOwned(&gpu, &pipeline, &vec, &out);
+
+    try std.testing.expectApproxEqAbs(out[0], 32.0, 1e-4);
+}
+
+test "gpu matvec Q5_1 fifth bit" {
+    // Verify 5th bit: qh=0x00000001 → element 0 gets q5 = 0 | 16 = 16.
+    // d=1.0, m=0.0, qs all zero, vec = all 1.0.
+    // Expected: 1.0 * 16 + 0.0 = 16.0.
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    var pipeline = try MatvecPipeline.initQ5_1(&gpu);
+    defer pipeline.deinit();
+
+    var mat_bytes: [24]u8 = [_]u8{0} ** 24;
+    mat_bytes[0] = 0x00; mat_bytes[1] = 0x3C; // d = f16(1.0)
+    // m=0, qs=0 — only element 0 gets a 5th bit via qh
+    mat_bytes[4] = 0x01; // qh low byte: bit 0 set → 5th bit of element 0
+
+    var vec: [32]f32 = [_]f32{1.0} ** 32;
+    var out: [1]f32 = .{0.0};
+
+    var session = try MatvecSession.initQ5_1(&gpu, &mat_bytes, 1, 32);
+    defer session.deinit();
+    try session.runOwned(&gpu, &pipeline, &vec, &out);
+
+    try std.testing.expectApproxEqAbs(out[0], 16.0, 1e-4);
 }
