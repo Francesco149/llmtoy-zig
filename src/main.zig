@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "gpu-info")) {
-        try cmdGpuInfo(out, gpa);
+        try cmdGpuInfo(out);
     } else if (std.mem.eql(u8, args[1], "info")) {
         if (args.len < 3) {
             std.debug.print("usage: llmtoy info <model.gguf>\n", .{});
@@ -125,7 +125,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
     );
 }
 
-fn cmdGpuInfo(out: *std.Io.Writer, allocator: std.mem.Allocator) !void {
+fn cmdGpuInfo(out: *std.Io.Writer) !void {
     var ctx = gpu_ctx.GpuContext.init() catch |e| {
         try out.print("gpu init failed: {}\n", .{e});
         return;
@@ -145,7 +145,7 @@ fn cmdGpuInfo(out: *std.Io.Writer, allocator: std.mem.Allocator) !void {
     const mat = [16]f32{ 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
     const vec = [4]f32{ 1, 2, 3, 4 };
     var result = [4]f32{ 0, 0, 0, 0 };
-    try gpu_matvec.matvecF32(&ctx, &pipeline, &mat, &vec, &result, 4, 4, allocator);
+    try gpu_matvec.matvecF32(&ctx, &pipeline, &mat, &vec, &result, 4, 4);
 
     try out.print("matvec smoke test: [{d:.0}, {d:.0}, {d:.0}, {d:.0}] (expect [1, 2, 3, 4])\n",
         .{ result[0], result[1], result[2], result[3] });

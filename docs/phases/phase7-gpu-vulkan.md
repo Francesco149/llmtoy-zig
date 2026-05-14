@@ -73,18 +73,32 @@ VK_MEMORY_PROPERTY_HOST_COHERENT_BIT   Writes are immediately visible (no flush)
 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT    On-chip GPU memory (fastest for compute)
 ```
 
-For the first pass, all buffers use host-visible + host-coherent memory. This
-means:
-- No staging buffers needed — CPU writes directly into GPU-accessible memory
-- Simpler code: `vkMapMemory` → `memcpy` → `vkUnmapMemory`
-- Slower than device-local memory, because the GPU must access data over PCIe
+Two memory regimes matter for LLM inference:
 
-The simplicity is intentional. Once the compute path is correct, moving to
-device-local memory with staging buffers is a self-contained optimization
-(see the roadmap for future steps).
+**Host-coherent** (`HOST_VISIBLE | HOST_COHERENT`): the CPU can map and write
+directly. No explicit flush needed — the GPU sees the write immediately. Used
+for per-token activations (the vector, the output) where we need a new value
+every token anyway. Limited by PCIe bandwidth (≈ 64 GB/s for PCIe 4.0 x16).
 
-`GpuBuffer` in `src/gpu/buffer.zig` wraps the allocate + bind + map/unmap
-pattern.
+**Device-local** (`DEVICE_LOCAL`): on-chip GPU VRAM. Cannot be mapped by the
+CPU. Accessed at full GPU memory bandwidth (≈ 432 GB/s on RX 7800 XT). Used
+for weight matrices that are uploaded once at model-load time and read thousands
+of times — one read per token per layer.
+
+To get data into a device-local buffer, we use a **staging buffer**: a
+temporary host-coherent buffer, copy the data in, then call `vkCmdCopyBuffer`
+to transfer GPU-side, then free the staging buffer.
+
+`GpuBuffer` in `src/gpu/buffer.zig` has three constructors:
+
+```zig
+GpuBuffer.initHostCoherent(ctx, size, usage)  // for activations, outputs
+GpuBuffer.initDeviceLocal(ctx, size, usage)   // for weight matrices
+GpuBuffer.initStaging(ctx, size)              // temporary upload helper
+```
+
+`GpuContext.copyBuffer` does the device-side transfer via a one-shot command
+buffer.
 
 ## Compute shaders and SPIR-V
 
@@ -224,13 +238,23 @@ vk.vkCreateComputePipelines(dev, null, 1, &ci, null, &pipeline)
 ### SPIR-V alignment
 
 `VkShaderModuleCreateInfo.pCode` must point to 4-byte aligned memory.
-`@embedFile` returns `[]const u8` with alignment 1. The fix: allocate `[]u32`
-(naturally 4-byte aligned) and copy the bytes in:
+`@embedFile` returns a byte array with alignment 1 by default. The fix: declare
+the embedded constant with an explicit `align(4)` annotation in `shaders.zig`:
 
 ```zig
-const spv_words = try allocator.alloc(u32, spv_bytes.len / 4);
-@memcpy(std.mem.sliceAsBytes(spv_words), spv_bytes);
-shader_ci.pCode = spv_words.ptr;
+pub const matvec_f32 align(4) = @embedFile("matvec_f32.spv").*;
+```
+
+The `.*` dereferences the file slice into an array value; `align(4)` tells Zig
+to place it at a 4-byte-aligned address. Taking `&shaders.matvec_f32` then
+satisfies `pCode`'s alignment requirement without any allocation or copy:
+
+```zig
+const spv = &shaders.matvec_f32;
+const shader_ci = vk.VkShaderModuleCreateInfo{
+    .codeSize = shaders.matvec_f32.len,
+    .pCode = @ptrCast(spv),
+};
 ```
 
 ### Build system integration
@@ -243,12 +267,33 @@ imported as `"gpu_shaders"`.
 The Vulkan library is found via the nix shell's `LIBRARY_PATH` env var (set by
 the shell hook in `flake.nix`). Vulkan headers are found via `CPATH`.
 
+## Weight-resident sessions
+
+For inference, the same weight matrix is multiplied by a different vector every
+token. Allocating and uploading a staging buffer per token would waste PCIe
+bandwidth. `MatvecSession` pre-uploads the matrix at construction time and keeps
+it resident in VRAM:
+
+```zig
+// at model load:
+var session = try MatvecSession.init(ctx, weight_matrix, rows, cols);
+defer session.deinit();
+
+// per token:
+try session.run(ctx, pipeline, activation_vec, output_vec);
+```
+
+Under the hood, `init` creates a staging buffer, uploads the matrix, calls
+`copyBuffer` to transfer it to device-local VRAM, then frees the staging buffer.
+The resulting `mat_buf` stays in VRAM for the lifetime of the session. `vec_buf`
+and `out_buf` are host-coherent because they change every token regardless.
+
 ## What this achieves
 
 After Phase 7, `llmtoy gpu-info` prints the GPU device name and verifies that
-a 4×4 identity matvec produces the correct result. The infrastructure is in
-place for the next step: offloading the Gemma4 forward pass matmul operations
-to the GPU.
+a 4×4 identity matvec produces the correct result, using a device-local weight
+matrix uploaded via a staging buffer. The infrastructure is in place for
+offloading the Gemma4 forward pass matmul operations to the GPU.
 
 ## Smoke test
 
@@ -267,9 +312,7 @@ that skips gracefully if no Vulkan device is available.
 
 ## Next steps
 
-- Move buffers to `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT` with staging buffers
-  for upload/download (reduces PCIe round-trips for large matrices)
-- Add quantized matvec shaders (Q8×fp32, Q4_K×fp32) matching the GGUF types
-  used by Gemma4 APEX I Mini
-- Wire the GPU matvec into the Gemma4 forward pass as an optional backend
-- Benchmark GPU matvec throughput vs the AVX2 CPU path
+- Add quantized matvec shaders (Q8×fp32, Q4_K×fp32, Q3_K×fp32) matching the
+  GGUF quant types used by Gemma4 APEX I Mini
+- Wire `MatvecSession` into the Gemma4 forward pass as an optional `--gpu` backend
+- Benchmark GPU matvec throughput vs the AVX2 CPU path on Gemma4 generation speed

@@ -2,15 +2,41 @@ const std = @import("std");
 const vk = @import("vk.zig").vk;
 const GpuContext = @import("context.zig").GpuContext;
 
-// A single Vulkan buffer backed by host-coherent device memory.
-// Simple for the first pass — no staging, no device-local optimization.
 pub const GpuBuffer = struct {
     handle: vk.VkBuffer,
     memory: vk.VkDeviceMemory,
     size: vk.VkDeviceSize,
     device: vk.VkDevice,
 
-    pub fn init(ctx: *const GpuContext, size: usize, usage: vk.VkBufferUsageFlags) !GpuBuffer {
+    // Host-coherent: CPU writes are immediately visible to the GPU.
+    // Used for per-token activations and for staging uploads/downloads.
+    // Simple but limited by PCIe bandwidth (≈ 64 GB/s peak for PCIe 4.0 x16).
+    pub fn initHostCoherent(ctx: *const GpuContext, size: usize, usage: vk.VkBufferUsageFlags) !GpuBuffer {
+        const props: vk.VkMemoryPropertyFlags = @intCast(
+            vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        return initMem(ctx, size, usage, props);
+    }
+
+    // Device-local: lives in GPU VRAM; fastest for compute (RX 7800 XT ≈ 432 GB/s).
+    // Cannot be mapped by the CPU. Requires a staging buffer for uploads/downloads.
+    // Use for weight matrices that are uploaded once and read many times per token.
+    pub fn initDeviceLocal(ctx: *const GpuContext, size: usize, usage: vk.VkBufferUsageFlags) !GpuBuffer {
+        const props: vk.VkMemoryPropertyFlags = @intCast(vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        return initMem(ctx, size,
+            usage | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            props);
+    }
+
+    // Staging buffer: host-coherent, used only for transfer source/dest.
+    pub fn initStaging(ctx: *const GpuContext, size: usize) !GpuBuffer {
+        const props: vk.VkMemoryPropertyFlags = @intCast(
+            vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        const usage: vk.VkBufferUsageFlags = @intCast(
+            vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        return initMem(ctx, size, usage, props);
+    }
+
+    fn initMem(ctx: *const GpuContext, size: usize, usage: vk.VkBufferUsageFlags, props: vk.VkMemoryPropertyFlags) !GpuBuffer {
         const buf_ci = vk.VkBufferCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .pNext = null,
@@ -28,11 +54,7 @@ pub const GpuBuffer = struct {
 
         var req: vk.VkMemoryRequirements = undefined;
         vk.vkGetBufferMemoryRequirements(ctx.device, buf, &req);
-
-        // Host-coherent so CPU writes are immediately visible to GPU (no explicit flush)
-        const host_props = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        const mem_type = try ctx.findMemoryType(req.memoryTypeBits, @intCast(host_props));
+        const mem_type = try ctx.findMemoryType(req.memoryTypeBits, props);
 
         const alloc_ci = vk.VkMemoryAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -56,6 +78,7 @@ pub const GpuBuffer = struct {
         vk.vkFreeMemory(self.device, self.memory, null);
     }
 
+    // Direct CPU→GPU write. Only valid for host-coherent buffers.
     pub fn upload(self: *const GpuBuffer, data: []const u8) !void {
         std.debug.assert(data.len <= self.size);
         var ptr: ?*anyopaque = null;
@@ -66,6 +89,7 @@ pub const GpuBuffer = struct {
         @memcpy(dst[0..data.len], data);
     }
 
+    // Direct GPU→CPU read. Only valid for host-coherent buffers.
     pub fn download(self: *const GpuBuffer, dest: []u8) !void {
         std.debug.assert(dest.len <= self.size);
         var ptr: ?*anyopaque = null;

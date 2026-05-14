@@ -12,8 +12,11 @@ pub fn build(b: *std.Build) void {
     const wf = b.addWriteFiles();
     const matvec_spv = compileShader(b, "src/gpu/shaders/matvec_f32.glsl");
     _ = wf.addCopyFile(matvec_spv, "matvec_f32.spv");
+    // align(4): VkShaderModuleCreateInfo.pCode requires 4-byte aligned SPIR-V data.
+    // Declaring the embedded file with align(4) makes &matvec_f32 satisfy that
+    // requirement without a runtime allocation or copy.
     const shaders_src = wf.add("shaders.zig",
-        \\pub const matvec_f32: []const u8 = @embedFile("matvec_f32.spv");
+        \\pub const matvec_f32 align(4) = @embedFile("matvec_f32.spv").*;
     );
     const shaders_mod = b.createModule(.{ .root_source_file = shaders_src });
 
