@@ -86,6 +86,14 @@ pub const GpuWeights = struct {
     expert_in_slice:    ?[]f32,
     expert_scales_slice: ?[]f32,
     moe_gpu_slice:      ?[]f32,
+    // Per-projection output buffers for batched dispatch.
+    // QKV: all three read the same input → one upload, three parallel dispatches.
+    // gate+up: both read the same FFN-norm input → same pattern.
+    q_out_buf:    ?GpuBuffer,
+    k_out_buf:    ?GpuBuffer,
+    v_out_buf:    ?GpuBuffer,
+    gate_out_buf: ?GpuBuffer,
+    up_out_buf:   ?GpuBuffer,
     allocator:   std.mem.Allocator,
 
     pub fn init(g4w: *const Gemma4Weights, g4cfg: Gemma4Config, allocator: std.mem.Allocator) !GpuWeights {
@@ -150,6 +158,8 @@ pub const GpuWeights = struct {
             .expert_in_buf = null, .expert_mid_bufs = null,
             .expert_all_out_buf = null, .expert_scales_buf = null, .moe_gpu_buf = null,
             .expert_in_slice = null, .expert_scales_slice = null, .moe_gpu_slice = null,
+            .q_out_buf = null, .k_out_buf = null, .v_out_buf = null,
+            .gate_out_buf = null, .up_out_buf = null,
             .allocator = allocator,
         };
         errdefer gw.deinit();
@@ -200,6 +210,28 @@ pub const GpuWeights = struct {
             max_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         std.debug.print("  shared I/O bufs: vec={} KiB out={} KiB\n",
             .{ max_cols * @sizeOf(f32) / 1024, max_rows * @sizeOf(f32) / 1024 });
+
+        // Per-projection output buffers for batched QKV and gate+up dispatch.
+        // Sized per-projection so all three (or two) can be in-flight simultaneously.
+        var max_q_rows: u32 = 1; var max_k_rows: u32 = 1; var max_v_rows: u32 = 1;
+        var max_gate_rows: u32 = 1; var max_up_rows: u32 = 1;
+        for (gw.layers) |l| {
+            if (l.wq)     |s| if (s.rows > max_q_rows)    { max_q_rows    = s.rows; };
+            if (l.wk)     |s| if (s.rows > max_k_rows)    { max_k_rows    = s.rows; };
+            if (l.wv)     |s| if (s.rows > max_v_rows)    { max_v_rows    = s.rows; };
+            if (l.w_gate) |s| if (s.rows > max_gate_rows) { max_gate_rows = s.rows; };
+            if (l.w_up)   |s| if (s.rows > max_up_rows)   { max_up_rows   = s.rows; };
+        }
+        gw.q_out_buf    = try GpuBuffer.initHostCoherent(&gw.ctx, max_q_rows    * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.k_out_buf    = try GpuBuffer.initHostCoherent(&gw.ctx, max_k_rows    * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.v_out_buf    = try GpuBuffer.initHostCoherent(&gw.ctx, max_v_rows    * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.gate_out_buf = try GpuBuffer.initHostCoherent(&gw.ctx, max_gate_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.up_out_buf   = try GpuBuffer.initHostCoherent(&gw.ctx, max_up_rows   * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std.debug.print("  batch output bufs: q={} KiB k={} KiB v={} KiB gate={} KiB up={} KiB\n", .{
+            max_q_rows    * @sizeOf(f32) / 1024, max_k_rows    * @sizeOf(f32) / 1024,
+            max_v_rows    * @sizeOf(f32) / 1024, max_gate_rows * @sizeOf(f32) / 1024,
+            max_up_rows   * @sizeOf(f32) / 1024,
+        });
 
         // Upload all MoE experts to VRAM (128 experts × 30 layers ≈ 9.6 GiB).
         // Batched by 16 experts per command buffer (~47 MiB staging peak per batch).
@@ -275,6 +307,11 @@ pub const GpuWeights = struct {
         if (self.expert_down) |ed| { for (ed) |*ms| if (ms.*) |*s| s.deinit(); self.allocator.free(ed); }
         if (self.expert_up)   |eu| { for (eu) |*ms| if (ms.*) |*s| s.deinit(); self.allocator.free(eu); }
         if (self.expert_gate) |eg| { for (eg) |*ms| if (ms.*) |*s| s.deinit(); self.allocator.free(eg); }
+        if (self.up_out_buf)   |*b| b.deinit();
+        if (self.gate_out_buf) |*b| b.deinit();
+        if (self.v_out_buf)    |*b| b.deinit();
+        if (self.k_out_buf)    |*b| b.deinit();
+        if (self.q_out_buf)    |*b| b.deinit();
         if (self.shared_out) |*b| b.deinit();
         if (self.shared_vec) |*b| b.deinit();
         if (self.lm_head) |*s| s.deinit();
@@ -289,6 +326,87 @@ pub const GpuWeights = struct {
         self.pl_q8_0.deinit();
         self.pl_f32.deinit();
         self.ctx.deinit();
+    }
+
+    // Dispatch wq, wk, (optionally wv) in a single command buffer.
+    // All three read the same xb → upload once, 2–3 parallel dispatches, 1 submit.
+    // Pipelines are passed by the caller so gpu_weights.zig doesn't need raw types.
+    // Returns error.NotOnGpu if any needed session is missing.
+    pub fn runLayerQKV(
+        self: *const GpuWeights,
+        layer: usize,
+        wq_pl: *const MatvecPipeline,
+        wk_pl: *const MatvecPipeline,
+        wv_pl: ?*const MatvecPipeline,
+        xb: []const f32,
+        q_out: []f32,
+        k_out: []f32,
+        v_out: []f32,
+    ) !void {
+        const lw    = &self.layers[layer];
+        const wq    = lw.wq orelse return error.NotOnGpu;
+        const wk    = lw.wk orelse return error.NotOnGpu;
+        const q_buf = &(self.q_out_buf orelse return error.NotOnGpu);
+        const k_buf = &(self.k_out_buf orelse return error.NotOnGpu);
+
+        try self.shared_vec.?.upload(std.mem.sliceAsBytes(xb));
+
+        const cmd = try self.ctx.beginBatch();
+        var q_dset: vk.VkDescriptorSet = null;
+        var k_dset: vk.VkDescriptorSet = null;
+        var v_dset: ?vk.VkDescriptorSet = null;
+
+        q_dset = try wq.recordMv(cmd, wq_pl, &self.shared_vec.?, q_buf);
+        k_dset = try wk.recordMv(cmd, wk_pl, &self.shared_vec.?, k_buf);
+        if (wv_pl) |vpl| {
+            const wv    = lw.wv orelse return error.NotOnGpu;
+            const v_buf = &(self.v_out_buf orelse return error.NotOnGpu);
+            v_dset = try wv.recordMv(cmd, vpl, &self.shared_vec.?, v_buf);
+        }
+
+        try self.ctx.submitBatch(cmd);
+
+        _ = vk.vkFreeDescriptorSets(self.ctx.device, wq_pl.desc_pool, 1, &q_dset);
+        _ = vk.vkFreeDescriptorSets(self.ctx.device, wk_pl.desc_pool, 1, &k_dset);
+        if (v_dset) |*ds| _ = vk.vkFreeDescriptorSets(self.ctx.device, wv_pl.?.desc_pool, 1, ds);
+
+        try q_buf.download(std.mem.sliceAsBytes(q_out));
+        try k_buf.download(std.mem.sliceAsBytes(k_out));
+        if (v_dset != null) try self.v_out_buf.?.download(std.mem.sliceAsBytes(v_out));
+    }
+
+    // Dispatch w_gate and w_up in one command buffer (both read the same FFN-norm xb).
+    pub fn runLayerGateUp(
+        self: *const GpuWeights,
+        layer: usize,
+        gate_pl: *const MatvecPipeline,
+        up_pl:   *const MatvecPipeline,
+        xb: []const f32,
+        gate_out: []f32,
+        up_out:   []f32,
+    ) !void {
+        const lw      = &self.layers[layer];
+        const w_gate  = lw.w_gate orelse return error.NotOnGpu;
+        const w_up    = lw.w_up   orelse return error.NotOnGpu;
+        const gate_buf = &(self.gate_out_buf orelse return error.NotOnGpu);
+        const up_buf   = &(self.up_out_buf   orelse return error.NotOnGpu);
+
+        try self.shared_vec.?.upload(std.mem.sliceAsBytes(xb));
+
+        const cmd = try self.ctx.beginBatch();
+        var gate_dset: vk.VkDescriptorSet = null;
+        var up_dset:   vk.VkDescriptorSet = null;
+
+        gate_dset = try w_gate.recordMv(cmd, gate_pl, &self.shared_vec.?, gate_buf);
+        up_dset   = try w_up.recordMv(cmd, up_pl,   &self.shared_vec.?, up_buf);
+
+        try self.ctx.submitBatch(cmd);
+
+        _ = vk.vkFreeDescriptorSets(self.ctx.device, gate_pl.desc_pool, 1, &gate_dset);
+        _ = vk.vkFreeDescriptorSets(self.ctx.device, up_pl.desc_pool,   1, &up_dset);
+
+        try gate_buf.download(std.mem.sliceAsBytes(gate_out));
+        try up_buf.download(std.mem.sliceAsBytes(up_out));
     }
 
     pub fn expertGate(self: *const GpuWeights, l: usize, e: usize) ?MatvecSession {

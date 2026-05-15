@@ -117,6 +117,50 @@ CPU then does a single 11 KiB copy instead of 8 × 11 KiB scattered reads + mul.
 8 × 11 KiB HOST_COHERENT memory; consolidating to 1 × 11 KiB removed the
 pressure. Profile script now supports `GPU=1 ./scripts/profile_gemma4.sh stat`.
 
+## Phase 7e baseline — after GPU accumulation (perf stat)
+
+Prompt: "Briefly explain the full forward pass of a MoE model." (16 tokens, ReleaseFast)
+2.79 tok/s prefill, 2.72 tok/s decode.
+
+| Metric | value |
+|--------|-------|
+| Wall time (inference) | ~16s (+6s GPU setup) |
+| CPUs utilized | 3.4 |
+| Instructions | 571B |
+| Cycles | 288B |
+| IPC | 2.0 |
+| L1-dcache miss | 4.0% |
+| Branch miss | 3.8% |
+| Context switches | 182K |
+
+Per layer the GPU currently does 7 separate vkQueueWaitIdle calls:
+wq → wk → wv → wo → w_gate → w_up → w_down, plus 1 for the expert batch.
+Attention (RoPE, softmax, KV-cache gather) and RMSNorms still run on CPU.
+
+Next: batch QKV into one submit, batch gate+up, then progressively move
+norms/residual/RoPE/attention to GPU for truly minimal roundtrips.
+
+## Phase 7f — Batched QKV and gate+up dispatch
+
+wq+wk+wv batched into one command buffer (3→1 submit); w_gate+w_up likewise
+(2→1). Each batch: upload xb once to shared_vec, dispatch N matmuls in
+parallel reading the same input, download N separate outputs. Added
+MatvecSession.recordMv() and GpuWeights.runLayerQKV/runLayerGateUp().
+
+Submit count per layer: **8 → 5** (wq+wk+wv=1, wo=1, gate+up=1, w_down=1, experts=1).
+
+| Mode | tok/s prefill | tok/s decode |
+|------|--------------|--------------|
+| Before (Phase 7e) | 2.79 | 2.72 |
+| After batching | **3.23** | **3.11** |
+| Speedup vs CPU | +42% | +57% |
+
+Removing 3 submit cycles saves more than just submit overhead — each
+eliminated round-trip also removes an upload and a download of xb/output.
+
+Next: fused dense FFN gate-gelu-up (Q4_K) to remove CPU gelu + w_down into
+same batch; then RMSNorm/residual/RoPE shaders to collapse to ≤2 submits/layer.
+
 ## Notes
 
 - All benchmarks use `zig build` (defaults to ReleaseFast since phase 7d)

@@ -449,6 +449,18 @@ pub const MatvecSession = struct {
         self.mat_buf.deinit();
     }
 
+    // Record one dispatch into an open command buffer without submitting.
+    // Returns the allocated descriptor set; caller must free it after submit.
+    pub fn recordMv(
+        self: *const MatvecSession,
+        cmd: vk.VkCommandBuffer,
+        pipeline: *const MatvecPipeline,
+        vec_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        return pipeline.record(cmd, &self.mat_buf, vec_buf, out_buf, self.rows, self.cols);
+    }
+
     // Run matvec using caller-provided host-coherent buffers.
     // vec_buf must be at least cols*4 bytes; out_buf at least rows*4 bytes.
     // GpuWeights shares one max-sized pair across all sessions.

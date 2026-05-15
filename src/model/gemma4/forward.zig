@@ -27,6 +27,7 @@ pub const Gemma4Weights     = wt_.Gemma4Weights;
 pub const Gemma4KvCache     = kv_.Gemma4KvCache;
 pub const GpuWeights        = gpu_w_.GpuWeights;
 pub const GpuLayerWeights   = gpu_w_.GpuLayerWeights;
+const MatvecPipeline        = @import("../../gpu/matvec.zig").MatvecPipeline;
 
 /// Process one token at `pos`, writing new K/V into `kv`.
 /// Returns a caller-owned logit slice.
@@ -109,14 +110,26 @@ pub fn forwardOne(
         // ── Attention ─────────────────────────────────────────────────────────
 
         math.rmsnorm(xb, x, lw.attn_norm, cfg.eps);
-        try mv(q[0..nq_l],  lw.wq, xb[0..d], scratch, pool, if (glw) |g| g.wq else null, gpu);
-        try mv(k_cur,       lw.wk, xb[0..d], scratch, pool, if (glw) |g| g.wk else null, gpu);
 
-        // V = Wv*x if present, else V = pre-norm K (global layers share K/V projection)
-        if (lw.wv) |wv| {
-            try mv(v_cur, wv, xb[0..d], scratch, pool, if (glw) |g| g.wv else null, gpu);
+        // Batch wq+wk+(wv) into one submit when all are on GPU.
+        const can_batch_qkv = gpu != null and glw != null and
+            glw.?.wq != null and glw.?.wk != null;
+        if (can_batch_qkv) {
+            const g = gpu.?;
+            const wv_pl: ?*const MatvecPipeline = if (lw.wv != null and glw.?.wv != null)
+                g.pipelineFor(lw.wv.?.type_) else null;
+            try g.runLayerQKV(l,
+                g.pipelineFor(lw.wq.type_), g.pipelineFor(lw.wk.type_), wv_pl,
+                xb[0..d], q[0..nq_l], k_cur, v_cur);
+            if (lw.wv == null) @memcpy(v_cur, k_cur);
         } else {
-            @memcpy(v_cur, k_cur); // copy raw K before K-norm is applied
+            try mv(q[0..nq_l], lw.wq, xb[0..d], scratch, pool, if (glw) |g| g.wq else null, gpu);
+            try mv(k_cur,      lw.wk, xb[0..d], scratch, pool, if (glw) |g| g.wk else null, gpu);
+            if (lw.wv) |wv| {
+                try mv(v_cur, wv, xb[0..d], scratch, pool, if (glw) |g| g.wv else null, gpu);
+            } else {
+                @memcpy(v_cur, k_cur);
+            }
         }
 
         // Per-head Q and K norms (weighted RMSNorm).
@@ -190,8 +203,19 @@ pub fn forwardOne(
         // ── Dense FFN path ────────────────────────────────────────────────────
 
         math.rmsnorm(xb, x, lw.ffn_norm, cfg.eps);
-        try mv(gate_buf, lw.w_gate, xb[0..d], scratch, pool, if (glw) |g| g.w_gate else null, gpu);
-        try mv(up_buf,   lw.w_up,   xb[0..d], scratch, pool, if (glw) |g| g.w_up   else null, gpu);
+
+        // Batch w_gate+w_up into one submit when both are on GPU.
+        const can_batch_ffn = gpu != null and glw != null and
+            glw.?.w_gate != null and glw.?.w_up != null;
+        if (can_batch_ffn) {
+            const g = gpu.?;
+            try g.runLayerGateUp(l,
+                g.pipelineFor(lw.w_gate.type_), g.pipelineFor(lw.w_up.type_),
+                xb[0..d], gate_buf, up_buf);
+        } else {
+            try mv(gate_buf, lw.w_gate, xb[0..d], scratch, pool, if (glw) |g| g.w_gate else null, gpu);
+            try mv(up_buf,   lw.w_up,   xb[0..d], scratch, pool, if (glw) |g| g.w_up   else null, gpu);
+        }
         for (gate_buf, up_buf) |*g, u| g.* = math.gelu(g.*) * u;
         try mv(ffn_buf, lw.w_down, gate_buf, scratch, pool, if (glw) |g| g.w_down else null, gpu);
         math.rmsnorm(ffn_buf, ffn_buf, lw.post_ffw_norm_1, cfg.eps);
