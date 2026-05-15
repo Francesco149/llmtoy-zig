@@ -32,6 +32,9 @@ const MatvecPipeline        = @import("../../gpu/matvec.zig").MatvecPipeline;
 /// Process one token at `pos`, writing new K/V into `kv`.
 /// Returns a caller-owned logit slice.
 /// Pass gpu != null to offload attention + dense-FFN matmuls to the GPU.
+/// layer_taps: if non-null, slice of length n_layers; after each layer l, x is
+///   copied into layer_taps[l] for comparison. Caller must pre-allocate each slice.
+/// gpu_layer_range: if non-null, GPU is used only for layers [r[0]..=r[1]].
 pub fn forwardOne(
     token: u32,
     pos: usize,
@@ -41,6 +44,8 @@ pub fn forwardOne(
     pool: *math.ThreadPool,
     allocator: std.mem.Allocator,
     gpu: ?*const GpuWeights,
+    layer_taps: ?[][]f32,
+    gpu_layer_range: ?[2]usize,
 ) ![]f32 {
     const d         = cfg.d_model;
     const n_threads = pool.threads.len;
@@ -105,7 +110,8 @@ pub fn forwardOne(
         const v_cur   = v_buf[0..nkv_l];
 
         // GPU layer weights for this layer (null ⇒ CPU fallback for every call).
-        const glw: ?*const GpuLayerWeights = if (gpu) |g| &g.layers[l] else null;
+        const gpu_here = if (gpu_layer_range) |r| (l >= r[0] and l <= r[1]) else true;
+        const glw: ?*const GpuLayerWeights = if (gpu != null and gpu_here) &gpu.?.layers[l] else null;
 
         // ── Attention ─────────────────────────────────────────────────────────
 
@@ -242,8 +248,8 @@ pub fn forwardOne(
 
         // Batched GPU path: 2 submits per layer (n gate+up dispatches, then n down).
         // Falls back to per-expert CPU path if experts aren't on GPU.
-        const expert_gpu_ok = if (gpu) |g|
-            g.runExpertBatch(l, top_idx,
+        const expert_gpu_ok = if (gpu != null and gpu_here)
+            gpu.?.runExpertBatch(l, top_idx,
                 lw.gate_up_exps.type_, lw.down_exps.type_,
                 lw.down_exps_scale, moe_in, router_out, moe_buf)
         else
@@ -288,6 +294,7 @@ pub fn forwardOne(
             for (x) |*xi| xi.* *= lw.layer_output_scale;
         }
 
+        if (layer_taps) |taps| @memcpy(taps[l], x);
     }
 
     // ── Final logits ─────────────────────────────────────────────────────────

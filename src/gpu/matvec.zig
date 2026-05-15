@@ -1229,3 +1229,111 @@ test "gpu matvec Q5_0 fifth bit" {
 
     try std.testing.expectApproxEqAbs(out[0], -496.0, 0.1);
 }
+
+test "gpu fused gate-up Q3_K correctness" {
+    // 1 row × 256 cols. Element 0 contributes q3=1 with scale 1.0:
+    //   hmask=0xFF (hi_bit=1), qs[0]=0x01 (lo2=1) → q3=(1|4)-4=1
+    //   sc[0]=33 → group-0 scale = d*(33-32) = 1.0; all other scales = 0.0
+    //   d = f16(1.0)
+    // gate_row · vec = 1.0,  up_row · vec = 1.0
+    // Expected: gelu(1.0) * 1.0 ≈ 0.841
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    var pl = FusedGateUpPipeline.init(&gpu) catch |e| {
+        std.debug.print("fused pipeline init failed: {}\n", .{e});
+        return;
+    };
+    defer pl.deinit();
+
+    const blk_size = 110;
+    var mat_bytes: [blk_size]u8 = [_]u8{0} ** blk_size;
+    @memset(mat_bytes[0..32], 0xFF);
+    mat_bytes[32] = 0x01;
+    mat_bytes[96] = 0x01; mat_bytes[97] = 0x00; mat_bytes[98] = 0x00; mat_bytes[99] = 0x00;
+    mat_bytes[100] = 0x00; mat_bytes[101] = 0x00; mat_bytes[102] = 0x00; mat_bytes[103] = 0x00;
+    mat_bytes[104] = 0xAA; mat_bytes[105] = 0xAA; mat_bytes[106] = 0xAA; mat_bytes[107] = 0xAA;
+    mat_bytes[108] = 0x00; mat_bytes[109] = 0x3C; // d = f16(1.0)
+
+    const usage = vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    var gate_buf = try GpuBuffer.initHostCoherent(&gpu, blk_size, usage);
+    defer gate_buf.deinit();
+    var up_buf = try GpuBuffer.initHostCoherent(&gpu, blk_size, usage);
+    defer up_buf.deinit();
+    var vec_buf = try GpuBuffer.initHostCoherent(&gpu, 256 * @sizeOf(f32), usage);
+    defer vec_buf.deinit();
+    var out_buf = try GpuBuffer.initHostCoherent(&gpu, 1 * @sizeOf(f32), usage);
+    defer out_buf.deinit();
+
+    try gate_buf.upload(&mat_bytes);
+    try up_buf.upload(&mat_bytes);
+    var vec: [256]f32 = [_]f32{1.0} ** 256;
+    try vec_buf.upload(std.mem.sliceAsBytes(&vec));
+    const zero = [1]f32{0.0};
+    try out_buf.upload(std.mem.sliceAsBytes(&zero));
+
+    const cmd = try gpu.beginBatch();
+    var dset = try pl.record(cmd, &gate_buf, &up_buf, &vec_buf, &out_buf, 1, 256);
+    try gpu.submitBatch(cmd);
+    _ = vk.vkFreeDescriptorSets(gpu.device, pl.desc_pool, 1, &dset);
+
+    var result: [1]f32 = .{0.0};
+    try out_buf.download(std.mem.sliceAsBytes(&result));
+
+    // gelu(1.0) * 1.0 ≈ 0.8413
+    try std.testing.expectApproxEqAbs(result[0], 0.841, 0.01);
+}
+
+test "gpu expert accum correctness" {
+    // n=2 experts, d_model=4.
+    // inputs = [[1,2,3,4],[5,6,7,8]], scales = [2.0, 3.0].
+    // output[i] = 0 + 2*inputs[0][i] + 3*inputs[1][i]
+    //           = [17, 22, 27, 32]
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    var pl = AccumPipeline.init(&gpu) catch |e| {
+        std.debug.print("accum pipeline init failed: {}\n", .{e});
+        return;
+    };
+    defer pl.deinit();
+
+    const d_model: u32 = 4;
+    const n: u32 = 2;
+    const inputs = [8]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+    const scales = [2]f32{ 2.0, 3.0 };
+
+    const usage = vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    var in_buf  = try GpuBuffer.initHostCoherent(&gpu, inputs.len * @sizeOf(f32), usage);
+    defer in_buf.deinit();
+    var sc_buf  = try GpuBuffer.initHostCoherent(&gpu, scales.len * @sizeOf(f32), usage);
+    defer sc_buf.deinit();
+    var out_buf = try GpuBuffer.initHostCoherent(&gpu, d_model * @sizeOf(f32), usage);
+    defer out_buf.deinit();
+
+    try in_buf.upload(std.mem.sliceAsBytes(&inputs));
+    try sc_buf.upload(std.mem.sliceAsBytes(&scales));
+    const zeros = [4]f32{ 0.0, 0.0, 0.0, 0.0 };
+    try out_buf.upload(std.mem.sliceAsBytes(&zeros));
+
+    const cmd = try gpu.beginBatch();
+    var dset = try pl.record(cmd, &in_buf, &sc_buf, &out_buf, d_model, n);
+    try gpu.submitBatch(cmd);
+    _ = vk.vkFreeDescriptorSets(gpu.device, pl.desc_pool, 1, &dset);
+
+    var result: [4]f32 = .{ 0.0, 0.0, 0.0, 0.0 };
+    try out_buf.download(std.mem.sliceAsBytes(&result));
+
+    const expected = [4]f32{ 17.0, 22.0, 27.0, 32.0 };
+    for (0..d_model) |i| {
+        try std.testing.expectApproxEqAbs(result[i], expected[i], 0.1);
+    }
+}

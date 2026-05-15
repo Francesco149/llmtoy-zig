@@ -75,15 +75,16 @@ pub fn main(init: std.process.Init) !void {
         const prompt     = args[3];
 
         // Parse optional flags.
-        var max_tokens:  u32         = 256;
-        var temperature: f32         = 0.8;
-        var top_p:       f32         = 0.9;
-        var top_k:       u32         = 40;
-        var seed:        u64         = 42;
-        var threads:     u32         = 0; // 0 = auto (getCpuCount)
-        var chat:        bool        = false;
-        var use_gpu:     bool        = false;
-        var stop_token:  ?[]const u8 = null;
+        var max_tokens:      u32         = 256;
+        var temperature:     f32         = 0.8;
+        var top_p:           f32         = 0.9;
+        var top_k:           u32         = 40;
+        var seed:            u64         = 42;
+        var threads:         u32         = 0; // 0 = auto (getCpuCount)
+        var chat:            bool        = false;
+        var use_gpu:         bool        = false;
+        var stop_token:      ?[]const u8 = null;
+        var gpu_layer_range: ?[2]usize   = null;
         var i: usize = 4;
         while (i < args.len) {
             const flag = args[i];
@@ -106,19 +107,53 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, flag, "--seed"))        seed        = try std.fmt.parseInt(u64, val, 10);
             if (std.mem.eql(u8, flag, "--threads"))     threads     = try std.fmt.parseInt(u32, val, 10);
             if (std.mem.eql(u8, flag, "--stop-token"))  stop_token  = val;
+            if (std.mem.eql(u8, flag, "--gpu-layers"))  gpu_layer_range = try parseLayerRange(val);
             i += 2;
         }
 
         try cmdGenerate(out, model_path, prompt, .{
-            .max_tokens  = max_tokens,
-            .temperature = temperature,
-            .top_p       = top_p,
-            .top_k       = top_k,
-            .seed        = seed,
-            .threads     = threads,
-            .chat        = chat,
-            .gpu         = use_gpu,
-            .stop_token  = stop_token,
+            .max_tokens      = max_tokens,
+            .temperature     = temperature,
+            .top_p           = top_p,
+            .top_k           = top_k,
+            .seed            = seed,
+            .threads         = threads,
+            .chat            = chat,
+            .gpu             = use_gpu,
+            .stop_token      = stop_token,
+            .gpu_layer_range = gpu_layer_range,
+        }, io, gpa);
+    } else if (std.mem.eql(u8, args[1], "compare")) {
+        if (args.len < 4) {
+            std.debug.print(
+                "usage: llmtoy compare <model.gguf> <prompt> [--chat] [--threads N] [--gpu-layers L0:L1]\n",
+                .{},
+            );
+            return error.MissingArg;
+        }
+        const model_path = args[2];
+        const prompt     = args[3];
+        var threads: u32 = 0;
+        var chat:    bool = false;
+        var gpu_layer_range: ?[2]usize = null;
+        var i: usize = 4;
+        while (i < args.len) {
+            const flag = args[i];
+            if (std.mem.eql(u8, flag, "--chat")) {
+                chat = true;
+                i += 1;
+                continue;
+            }
+            if (i + 1 >= args.len) break;
+            const val = args[i + 1];
+            if (std.mem.eql(u8, flag, "--threads"))    threads         = try std.fmt.parseInt(u32, val, 10);
+            if (std.mem.eql(u8, flag, "--gpu-layers")) gpu_layer_range = try parseLayerRange(val);
+            i += 2;
+        }
+        try cmdCompare(out, model_path, prompt, .{
+            .threads         = threads,
+            .chat            = chat,
+            .gpu_layer_range = gpu_layer_range,
         }, io, gpa);
     } else {
         try usagePrint(out);
@@ -132,10 +167,13 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\  llmtoy gpu-info                        list Vulkan device and run a matvec smoke test
         \\  llmtoy info <model.gguf>               print model metadata and tensor summary
         \\  llmtoy tokenize <model.gguf> <text>    BPE-encode text, print IDs and decoded tokens
-        \\  llmtoy generate <model.gguf> <prompt> [--chat] [--gpu] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N] [--stop-token TOKEN]
+        \\  llmtoy generate <model.gguf> <prompt> [--chat] [--gpu] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N] [--stop-token TOKEN] [--gpu-layers L0:L1]
+        \\  llmtoy compare  <model.gguf> <prompt> [--chat] [--threads N] [--gpu-layers L0:L1]
         \\
         \\  --gpu:        offload attention + dense-FFN matmuls to the GPU via Vulkan (Gemma4 only)
         \\  --stop-token: stop generation when this token is sampled (default: auto-detect from vocab)
+        \\  --gpu-layers: restrict GPU to layers L0..L1 inclusive (e.g. 0:14); others use CPU
+        \\  compare:      run one CPU and one GPU forward pass, print per-layer residual divergence
         \\
     );
 }
@@ -274,16 +312,18 @@ fn cmdTokenize(out: *std.Io.Writer, path: []const u8, text: []const u8, io: std.
 }
 
 const GenerateOptions = struct {
-    max_tokens:  u32  = 256,
-    temperature: f32  = 0.8,
-    top_p:       f32  = 0.9,
-    top_k:       u32  = 40,
-    seed:        u64  = 42,
-    threads:     u32  = 0, // 0 = auto
-    chat:        bool = false,
-    gpu:         bool = false,
+    max_tokens:      u32         = 256,
+    temperature:     f32         = 0.8,
+    top_p:           f32         = 0.9,
+    top_k:           u32         = 40,
+    seed:            u64         = 42,
+    threads:         u32         = 0, // 0 = auto
+    chat:            bool        = false,
+    gpu:             bool        = false,
     // Override the auto-detected EOT token. null = use vocab.eot_token_id.
-    stop_token:  ?[]const u8 = null,
+    stop_token:      ?[]const u8 = null,
+    // Restrict GPU to layers [start..=end] inclusive; null = all layers.
+    gpu_layer_range: ?[2]usize   = null,
 };
 
 fn cmdGenerate(
@@ -382,7 +422,7 @@ fn cmdGenerate(
         var last_logits: []f32 = undefined;
         for (prompt_ids, 0..) |tok, pos| {
             if (pos > 0) gpa.free(last_logits);
-            last_logits = try g4_fwd.forwardOne(tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr);
+            last_logits = try g4_fwd.forwardOne(tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr, null, opts.gpu_layer_range);
         }
         const t_prefill = clk.now(io);
         printTokenTiming("prefill", prompt_ids.len, t_prefill_start, t_prefill);
@@ -398,7 +438,7 @@ fn cmdGenerate(
             const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
             try out.writeAll(tok_buf[0..tok_len]);
             try out.flush();
-            last_logits = try g4_fwd.forwardOne(next_tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr);
+            last_logits = try g4_fwd.forwardOne(next_tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr, null, opts.gpu_layer_range);
             pos += 1;
         }
         if (last_logits.len > 0) gpa.free(last_logits);
@@ -470,4 +510,193 @@ fn printTokenTiming(label: []const u8, tokens: anytype, start: anytype, end: any
     const seconds = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
     const tps = if (seconds > 0.0) @as(f64, @floatFromInt(tokens)) / seconds else 0.0;
     std.debug.print("  {s}: {} tokens in {} ms ({d:.2} tok/s)\n", .{ label, tokens, ms, tps });
+}
+
+// Parse "L0:L1" into a [2]usize layer range.
+fn parseLayerRange(s: []const u8) !?[2]usize {
+    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return error.BadLayerRange;
+    const lo = try std.fmt.parseInt(usize, s[0..colon], 10);
+    const hi = try std.fmt.parseInt(usize, s[colon + 1 ..], 10);
+    if (lo > hi) return error.BadLayerRange;
+    return .{ lo, hi };
+}
+
+// ── compare command ───────────────────────────────────────────────────────────
+
+const CompareOptions = struct {
+    threads:         u32        = 0,
+    chat:            bool       = false,
+    gpu_layer_range: ?[2]usize  = null,
+};
+
+/// Run one forward pass on CPU and one on GPU for the first prompt token,
+/// then print per-layer residual divergence and final top-5 logit comparison.
+fn cmdCompare(
+    out: *std.Io.Writer,
+    path: []const u8,
+    prompt: []const u8,
+    opts: CompareOptions,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+) !void {
+    std.debug.print("loading {s}...\n", .{path});
+
+    var reader = try gguf_reader.GgufReader.open(path, io, gpa);
+    defer reader.deinit();
+
+    if (!g4_loader.isGemma4(&reader)) {
+        std.debug.print("compare requires a Gemma4 model (GPU path is Gemma4-only)\n", .{});
+        return error.NotGemma4;
+    }
+
+    var vocab = try vocab_mod.fromGguf(&reader, gpa);
+    defer vocab.deinit();
+
+    const rendered_prompt = if (opts.chat) blk: {
+        const messages = [_]chat_tmpl.Message{.{ .role = .user, .content = prompt }};
+        break :blk try chat_tmpl.apply(gpa, &vocab, &messages, true);
+    } else null;
+    defer if (rendered_prompt) |p| gpa.free(p);
+    const prompt_text = rendered_prompt orelse prompt;
+
+    const prompt_ids = try bpe.encode(prompt_text, &vocab, gpa);
+    defer gpa.free(prompt_ids);
+    if (prompt_ids.len == 0) return error.EmptyPrompt;
+
+    const g4cfg = try g4_loader.configFromGguf(&reader, gpa);
+    std.debug.print("  [Gemma4] layers={} d_model={} experts={}/{}\n",
+        .{ g4cfg.n_layers, g4cfg.d_model, g4cfg.n_experts, g4cfg.n_experts_used });
+
+    var weights = try g4_loader.loadWeights(&reader, g4cfg, gpa);
+    defer weights.deinit();
+
+    const n_threads: usize = if (opts.threads > 0) opts.threads else std.Thread.getCpuCount() catch 1;
+    const pool = try tp.ThreadPool.init(gpa, n_threads, io);
+    defer pool.deinit(gpa);
+
+    setOomAdj(500);
+    std.debug.print("uploading weights to GPU VRAM...\n", .{});
+    var gpu_weights = g4_gpu.GpuWeights.init(&weights, g4cfg, gpa) catch |e| {
+        std.debug.print("GPU init failed ({}), cannot compare without GPU\n", .{e});
+        return e;
+    };
+    defer gpu_weights.deinit();
+    const gpu_ptr = &gpu_weights;
+
+    const d  = g4cfg.d_model;
+    const nl = g4cfg.n_layers;
+
+    // Allocate flat backing storage for taps; slice into per-layer views.
+    const cpu_flat = try gpa.alloc(f32, nl * d);
+    defer gpa.free(cpu_flat);
+    const gpu_flat = try gpa.alloc(f32, nl * d);
+    defer gpa.free(gpu_flat);
+    const cpu_taps = try gpa.alloc([]f32, nl);
+    defer gpa.free(cpu_taps);
+    const gpu_taps = try gpa.alloc([]f32, nl);
+    defer gpa.free(gpu_taps);
+    for (0..nl) |l| {
+        cpu_taps[l] = cpu_flat[l * d ..][0..d];
+        gpu_taps[l] = gpu_flat[l * d ..][0..d];
+    }
+
+    const cmp_token = prompt_ids[0];
+    const max_seq: usize = @min(g4cfg.max_seq_len, 4096);
+
+    std.debug.print("running CPU forward pass (token={})...\n", .{cmp_token});
+    var kv_cpu = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
+    defer kv_cpu.deinit();
+    const cpu_logits = try g4_fwd.forwardOne(
+        cmp_token, 0, &kv_cpu, &weights, g4cfg, pool, gpa, null, cpu_taps, null);
+    defer gpa.free(cpu_logits);
+
+    std.debug.print("running GPU forward pass...\n", .{});
+    var kv_gpu = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
+    defer kv_gpu.deinit();
+    const gpu_logits = try g4_fwd.forwardOne(
+        cmp_token, 0, &kv_gpu, &weights, g4cfg, pool, gpa, gpu_ptr, gpu_taps, opts.gpu_layer_range);
+    defer gpa.free(gpu_logits);
+
+    // ── per-layer residual comparison ─────────────────────────────────────────
+
+    try out.print("per-layer residual comparison  (token={}, pos=0", .{cmp_token});
+    if (opts.gpu_layer_range) |r| try out.print(", gpu_layers={}:{}", .{ r[0], r[1] });
+    try out.print("):\n", .{});
+
+    var first_fail: ?usize = null;
+    for (0..nl) |l| {
+        const cx = cpu_taps[l];
+        const gx = gpu_taps[l];
+
+        var max_abs: f32 = 0.0;
+        var max_ref: f32 = 0.0;
+        var cpu_am: usize = 0;
+        var gpu_am: usize = 0;
+        var cpu_am_v: f32 = -std.math.inf(f32);
+        var gpu_am_v: f32 = -std.math.inf(f32);
+
+        for (cx, gx, 0..) |c, g, i| {
+            const d_ = @abs(c - g);
+            if (d_ > max_abs) max_abs = d_;
+            if (@abs(c) > max_ref) max_ref = @abs(c);
+            if (c > cpu_am_v) { cpu_am_v = c; cpu_am = i; }
+            if (g > gpu_am_v) { gpu_am_v = g; gpu_am = i; }
+        }
+
+        const rel = max_abs / (max_ref + 1e-6);
+        const ok = (cpu_am == gpu_am);
+        if (!ok and first_fail == null) first_fail = l;
+
+        try out.print("layer {:>3}  max|D|={d:.5}  rel={d:.3}%  argmax={s}\n",
+            .{ l, max_abs, rel * 100.0, if (ok) "ok" else "FAIL" });
+    }
+
+    if (first_fail) |l| {
+        try out.print("\nfirst argmax mismatch at layer {}\n", .{l});
+    } else {
+        try out.print("\nall layer argmaxes match\n", .{});
+    }
+
+    // ── top-5 final logit comparison ──────────────────────────────────────────
+
+    const V = struct { id: usize, val: f32 };
+    const top_n: usize = @min(5, cpu_logits.len);
+    var cpu_top = [_]V{.{ .id = 0, .val = -std.math.inf(f32) }} ** 5;
+    var gpu_top = [_]V{.{ .id = 0, .val = -std.math.inf(f32) }} ** 5;
+
+    for (0..top_n) |k| {
+        var best_id: usize = 0;
+        var best_val: f32 = -std.math.inf(f32);
+        for (cpu_logits, 0..) |v, i| {
+            var dup = false;
+            for (cpu_top[0..k]) |p| { if (p.id == i) { dup = true; break; } }
+            if (!dup and v > best_val) { best_val = v; best_id = i; }
+        }
+        cpu_top[k] = .{ .id = best_id, .val = best_val };
+    }
+
+    for (0..top_n) |k| {
+        var best_id: usize = 0;
+        var best_val: f32 = -std.math.inf(f32);
+        for (gpu_logits, 0..) |v, i| {
+            var dup = false;
+            for (gpu_top[0..k]) |p| { if (p.id == i) { dup = true; break; } }
+            if (!dup and v > best_val) { best_val = v; best_id = i; }
+        }
+        gpu_top[k] = .{ .id = best_id, .val = best_val };
+    }
+
+    try out.print("\ntop-{} CPU:", .{top_n});
+    for (cpu_top[0..top_n]) |t| try out.print("  {}({d:.3})", .{ t.id, t.val });
+    try out.print("\ntop-{} GPU:", .{top_n});
+    for (gpu_top[0..top_n]) |t| try out.print("  {}({d:.3})", .{ t.id, t.val });
+    try out.print("\n", .{});
+
+    if (cpu_top[0].id == gpu_top[0].id) {
+        try out.print("final argmax: {} (match)\n", .{cpu_top[0].id});
+    } else {
+        try out.print("final argmax: CPU={} GPU={} (MISMATCH)\n",
+            .{ cpu_top[0].id, gpu_top[0].id });
+    }
+    try out.flush();
 }
