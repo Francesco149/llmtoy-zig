@@ -118,16 +118,21 @@ pub fn forwardOne(
         math.rmsnorm(xb, x, lw.attn_norm, cfg.eps);
 
         // Batch wq+wk+(wv) into one submit when all are on GPU.
+        // - wv missing entirely (shared-V layer): batch QK, copy K into V.
+        // - wv present but CPU-only (e.g. Q5_K at L3): take the per-call path so V
+        //   actually runs on CPU instead of being silently skipped.
+        const wv_present = lw.wv != null;
+        const wv_on_gpu  = wv_present and (if (glw) |g| g.wv != null else false);
         const can_batch_qkv = gpu != null and glw != null and
-            glw.?.wq != null and glw.?.wk != null;
+            glw.?.wq != null and glw.?.wk != null and (!wv_present or wv_on_gpu);
         if (can_batch_qkv) {
             const g = gpu.?;
-            const wv_pl: ?*const MatvecPipeline = if (lw.wv != null and glw.?.wv != null)
+            const wv_pl: ?*const MatvecPipeline = if (wv_on_gpu)
                 g.pipelineFor(lw.wv.?.type_) else null;
             try g.runLayerQKV(l,
                 g.pipelineFor(lw.wq.type_), g.pipelineFor(lw.wk.type_), wv_pl,
                 xb[0..d], q[0..nq_l], k_cur, v_cur);
-            if (lw.wv == null) @memcpy(v_cur, k_cur);
+            if (!wv_present) @memcpy(v_cur, k_cur);
         } else {
             try mv(q[0..nq_l], lw.wq, xb[0..d], scratch, pool, if (glw) |g| g.wq else null, gpu);
             try mv(k_cur,      lw.wk, xb[0..d], scratch, pool, if (glw) |g| g.wk else null, gpu);
