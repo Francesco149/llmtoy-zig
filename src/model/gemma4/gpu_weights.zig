@@ -432,6 +432,65 @@ pub const GpuWeights = struct {
         try out_buf.download(std.mem.sliceAsBytes(out));
     }
 
+    // QKV variant of runQ8_1Mv: one upload, one quantize, then 2–3 matvecs all
+    // reading the same Q8_1 acts buffer. Saves 2 PCIe uploads + 2 quantize
+    // dispatches vs three independent runQ8_1Mv calls.
+    //
+    // Caller must have already verified that wq, wk (and wv if not shared) are
+    // all Q4_K and have GPU sessions. `v_out` is null for shared-V layers
+    // (caller will @memcpy k into v).
+    pub fn runLayerQKVQ8_1(
+        self: *const GpuWeights,
+        layer: usize,
+        xb: []const f32,
+        q_out: []f32,
+        k_out: []f32,
+        v_out: ?[]f32,
+    ) !void {
+        const lw   = &self.layers[layer];
+        const wq   = lw.wq orelse return error.NotOnGpu;
+        const wk   = lw.wk orelse return error.NotOnGpu;
+        std.debug.assert(wq.cols % 256 == 0);
+        std.debug.assert(wq.cols == wk.cols);
+
+        const vec_buf  = &self.shared_vec.?;
+        const acts_buf = &self.shared_acts_q8_1.?;
+        const q_buf    = &(self.q_out_buf orelse return error.NotOnGpu);
+        const k_buf    = &(self.k_out_buf orelse return error.NotOnGpu);
+
+        try vec_buf.upload(std.mem.sliceAsBytes(xb));
+
+        const cmd = try self.ctx.beginBatch();
+        const quant_dset = try self.pl_quantize_q8_1.record(cmd, vec_buf, acts_buf, wq.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const q_mv_dset = try self.pl_q4_k_q8_1.record(
+            cmd, &wq.mat_buf, acts_buf, q_buf, wq.rows, wq.cols);
+        const k_mv_dset = try self.pl_q4_k_q8_1.record(
+            cmd, &wk.mat_buf, acts_buf, k_buf, wk.rows, wk.cols);
+
+        var v_mv_dset: ?vk.VkDescriptorSet = null;
+        if (v_out != null) {
+            const wv    = lw.wv orelse return error.NotOnGpu;
+            const v_buf = &(self.v_out_buf orelse return error.NotOnGpu);
+            std.debug.assert(wv.cols == wq.cols);
+            v_mv_dset = try self.pl_q4_k_q8_1.record(
+                cmd, &wv.mat_buf, acts_buf, v_buf, wv.rows, wv.cols);
+        }
+
+        try self.ctx.submitBatch(cmd);
+
+        const dev = self.ctx.device;
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_quantize_q8_1.desc_pool, 1, &quant_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_q4_k_q8_1.desc_pool, 1, &q_mv_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_q4_k_q8_1.desc_pool, 1, &k_mv_dset);
+        if (v_mv_dset) |*ds| _ = vk.vkFreeDescriptorSets(dev, self.pl_q4_k_q8_1.desc_pool, 1, ds);
+
+        try q_buf.download(std.mem.sliceAsBytes(q_out));
+        try k_buf.download(std.mem.sliceAsBytes(k_out));
+        if (v_out) |v| try self.v_out_buf.?.download(std.mem.sliceAsBytes(v));
+    }
+
     // Dispatch w_gate and w_up in one command buffer (both read the same FFN-norm xb).
     pub fn runLayerGateUp(
         self: *const GpuWeights,
