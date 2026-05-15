@@ -118,28 +118,33 @@ pub fn forwardOne(
         math.rmsnorm(xb, x, lw.attn_norm, cfg.eps);
 
         // Three QKV dispatch paths, in priority order:
-        //   1. Q8_1 path:  wq+wk+(wv) are all Q4_K on GPU → quantize xb once
-        //      to device-local Q8_1 then run integer-dot matvecs. Fastest +
-        //      deterministic (matches CPU int math bit-for-bit, modulo float
-        //      reduction order on the per-row scale-out).
-        //   2. f32 batch:  all on GPU but some are non-Q4_K → existing
-        //      shared-vec-upload + parallel f32-activation matvecs.
+        //   1. Q8_1 path:  wq+wk+(wv) are all on GPU with a Q8_1 pipeline
+        //      (currently Q3_K or Q4_K) → quantize xb once to device-local
+        //      Q8_1 then run integer-dot matvecs.
+        //   2. f32 batch:  all on GPU but some lack a Q8_1 pipeline (e.g. wv
+        //      is Q5_K at L3) → existing parallel f32-activation matvecs.
         //   3. Per-call:   some session is missing / CPU-only → independent
         //      mv() calls so each can take its own (GPU or CPU) path.
-        //
-        // Layer 3 typically takes path 2 because wv is Q5_K there.
         const wv_present = lw.wv != null;
         const wv_on_gpu  = wv_present and (if (glw) |g| g.wv != null else false);
-        const wq_q4k_gpu = glw != null and glw.?.wq != null and lw.wq.type_ == .q4_k;
-        const wk_q4k_gpu = glw != null and glw.?.wk != null and lw.wk.type_ == .q4_k;
-        const wv_q4k_gpu = wv_on_gpu and lw.wv.?.type_ == .q4_k;
-        const can_q8_1_qkv = gpu != null and wq_q4k_gpu and wk_q4k_gpu
-            and (!wv_present or wv_q4k_gpu);
+        const wq_q8_1 = gpu != null and glw != null and glw.?.wq != null
+            and gpu.?.q8_1PipelineFor(lw.wq.type_) != null;
+        const wk_q8_1 = gpu != null and glw != null and glw.?.wk != null
+            and gpu.?.q8_1PipelineFor(lw.wk.type_) != null;
+        const wv_q8_1 = wv_on_gpu and gpu.?.q8_1PipelineFor(lw.wv.?.type_) != null;
+        const can_q8_1_qkv = gpu != null and wq_q8_1 and wk_q8_1
+            and (!wv_present or wv_q8_1);
         const can_batch_qkv = !can_q8_1_qkv and gpu != null and glw != null and
             glw.?.wq != null and glw.?.wk != null and (!wv_present or wv_on_gpu);
 
         if (can_q8_1_qkv) {
-            try gpu.?.runLayerQKVQ8_1(l, xb[0..d], q[0..nq_l], k_cur,
+            const g = gpu.?;
+            const wq_q8_pl = g.q8_1PipelineFor(lw.wq.type_).?;
+            const wk_q8_pl = g.q8_1PipelineFor(lw.wk.type_).?;
+            const wv_q8_pl: ?*const MatvecPipeline = if (wv_present)
+                g.q8_1PipelineFor(lw.wv.?.type_) else null;
+            try g.runLayerQKVQ8_1(l, wq_q8_pl, wk_q8_pl, wv_q8_pl,
+                xb[0..d], q[0..nq_l], k_cur,
                 if (wv_present) v_cur else null);
             if (!wv_present) @memcpy(v_cur, k_cur);
         } else if (can_batch_qkv) {

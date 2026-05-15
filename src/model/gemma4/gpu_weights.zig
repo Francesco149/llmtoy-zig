@@ -55,6 +55,7 @@ pub const GpuWeights = struct {
     pl_q8_0:    MatvecPipeline,
     pl_q3_k:    MatvecPipeline,
     pl_q4_k:    MatvecPipeline,
+    pl_q3_k_q8_1:    MatvecPipeline,
     pl_q4_k_q8_1:    MatvecPipeline,
     pl_quantize_q8_1: QuantizeQ8_1Pipeline,
     pl_q5_1:    MatvecPipeline,
@@ -131,6 +132,9 @@ pub const GpuWeights = struct {
         errdefer pl_q4_k.deinit();
         std.debug.print("  init: pl_q4_k ok (VRAM={} MiB GTT={} MiB sys={} MiB)\n",
             .{ vramUsedMB(), gttUsedMB(), availableMemoryMB() });
+        var pl_q3_k_q8_1 = try MatvecPipeline.initQ3KQ8_1(&ctx);
+        errdefer pl_q3_k_q8_1.deinit();
+        std.debug.print("  init: pl_q3_k_q8_1 ok\n", .{});
         var pl_q4_k_q8_1 = try MatvecPipeline.initQ4KQ8_1(&ctx);
         errdefer pl_q4_k_q8_1.deinit();
         std.debug.print("  init: pl_q4_k_q8_1 ok\n", .{});
@@ -162,6 +166,7 @@ pub const GpuWeights = struct {
         var gw = GpuWeights{
             .ctx = ctx, .pl_f32 = pl_f32, .pl_q8_0 = pl_q8_0,
             .pl_q3_k = pl_q3_k, .pl_q4_k = pl_q4_k,
+            .pl_q3_k_q8_1 = pl_q3_k_q8_1,
             .pl_q4_k_q8_1 = pl_q4_k_q8_1,
             .pl_quantize_q8_1 = pl_quantize_q8_1,
             .pl_q5_1 = pl_q5_1, .pl_q5_0 = pl_q5_0,
@@ -345,6 +350,7 @@ pub const GpuWeights = struct {
         self.pl_q5_1.deinit();
         self.pl_quantize_q8_1.deinit();
         self.pl_q4_k_q8_1.deinit();
+        self.pl_q3_k_q8_1.deinit();
         self.pl_q4_k.deinit();
         self.pl_q3_k.deinit();
         self.pl_q8_0.deinit();
@@ -442,6 +448,9 @@ pub const GpuWeights = struct {
     pub fn runLayerQKVQ8_1(
         self: *const GpuWeights,
         layer: usize,
+        wq_pl: *const MatvecPipeline,
+        wk_pl: *const MatvecPipeline,
+        wv_pl: ?*const MatvecPipeline,    // null when wv is shared (callers @memcpy k → v)
         xb: []const f32,
         q_out: []f32,
         k_out: []f32,
@@ -464,17 +473,18 @@ pub const GpuWeights = struct {
         const quant_dset = try self.pl_quantize_q8_1.record(cmd, vec_buf, acts_buf, wq.cols);
         GpuCtx.recordShaderBarrier(cmd);
 
-        const q_mv_dset = try self.pl_q4_k_q8_1.record(
+        const q_mv_dset = try wq_pl.record(
             cmd, &wq.mat_buf, acts_buf, q_buf, wq.rows, wq.cols);
-        const k_mv_dset = try self.pl_q4_k_q8_1.record(
+        const k_mv_dset = try wk_pl.record(
             cmd, &wk.mat_buf, acts_buf, k_buf, wk.rows, wk.cols);
 
         var v_mv_dset: ?vk.VkDescriptorSet = null;
         if (v_out != null) {
             const wv    = lw.wv orelse return error.NotOnGpu;
             const v_buf = &(self.v_out_buf orelse return error.NotOnGpu);
+            const v_pl  = wv_pl orelse return error.NoQ8_1Pipeline;
             std.debug.assert(wv.cols == wq.cols);
-            v_mv_dset = try self.pl_q4_k_q8_1.record(
+            v_mv_dset = try v_pl.record(
                 cmd, &wv.mat_buf, acts_buf, v_buf, wv.rows, wv.cols);
         }
 
@@ -482,13 +492,25 @@ pub const GpuWeights = struct {
 
         const dev = self.ctx.device;
         _ = vk.vkFreeDescriptorSets(dev, self.pl_quantize_q8_1.desc_pool, 1, &quant_dset);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_q4_k_q8_1.desc_pool, 1, &q_mv_dset);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_q4_k_q8_1.desc_pool, 1, &k_mv_dset);
-        if (v_mv_dset) |*ds| _ = vk.vkFreeDescriptorSets(dev, self.pl_q4_k_q8_1.desc_pool, 1, ds);
+        _ = vk.vkFreeDescriptorSets(dev, wq_pl.desc_pool, 1, &q_mv_dset);
+        _ = vk.vkFreeDescriptorSets(dev, wk_pl.desc_pool, 1, &k_mv_dset);
+        if (v_mv_dset) |*ds| _ = vk.vkFreeDescriptorSets(dev, wv_pl.?.desc_pool, 1, ds);
 
         try q_buf.download(std.mem.sliceAsBytes(q_out));
         try k_buf.download(std.mem.sliceAsBytes(k_out));
         if (v_out) |v| try self.v_out_buf.?.download(std.mem.sliceAsBytes(v));
+    }
+
+    // Pipeline for the Q8_1-activation integer-dot path. Returns null when
+    // the weight type has no Q8_1 shader yet (Q5_K, Q5_0, Q5_1, Q8_0, IQ4_NL,
+    // F32 — these would either fall back to the f32-activation path or run
+    // on CPU).
+    pub fn q8_1PipelineFor(self: *const GpuWeights, t: GgmlType) ?*const MatvecPipeline {
+        return switch (t) {
+            .q3_k => &self.pl_q3_k_q8_1,
+            .q4_k => &self.pl_q4_k_q8_1,
+            else  => null,
+        };
     }
 
     // Dispatch w_gate and w_up in one command buffer (both read the same FFN-norm xb).
@@ -538,6 +560,7 @@ pub const GpuWeights = struct {
         return ed[l * self.n_experts + e];
     }
 
+    // Pipeline for the f32-activation path.
     pub fn pipelineFor(self: *const GpuWeights, t: GgmlType) *const MatvecPipeline {
         return switch (t) {
             .f32  => &self.pl_f32,

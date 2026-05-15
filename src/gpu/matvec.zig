@@ -69,6 +69,12 @@ pub const MatvecPipeline = struct {
         return initFromSpv(ctx, &shaders.matvec_q4_k_q8_1, 1);
     }
 
+    // Q3_K weights × Q8_1 activations, subgroup-cooperative (1 workgroup/row).
+    pub fn initQ3KQ8_1(ctx: *const GpuContext) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_q3_k_q8_1.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.matvec_q3_k_q8_1, 1);
+    }
+
     fn initFromSpv(ctx: *const GpuContext, spv: anytype, rows_per_workgroup: u32) !MatvecPipeline {
         // align(4) on the const in shaders.zig should guarantee this, but
         // assert the actual runtime address in case @embedFile doesn't honour it.
@@ -1801,5 +1807,103 @@ test "gpu matvec Q4_K × Q8_1 fuzz small" {
 test "gpu matvec Q4_K × Q8_1 fuzz model-sized" {
     // Closest analogue to a Gemma4 attention matmul: cols = d_model = 2304.
     try fuzzQ4KQ8_1(64, 2304, 13);
+}
+
+// Q3_K × Q8_1 fuzz: same structure as fuzzQ4KQ8_1 but with Q3_K weight bytes.
+// Q3_K's row stride is 110 bytes per 256 cols. The shader expects no padding
+// between blocks, so a row of cols=2304 occupies 9 × 110 = 990 bytes contiguously.
+fn fuzzQ3KQ8_1(rows: usize, cols: usize, seed: u64) !void {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    std.debug.assert(cols % 256 == 0);
+
+    const al = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+
+    const blk_bytes_q3k: usize = 110;
+    const total_mat = rows * (cols / 256) * blk_bytes_q3k;
+    const mat = try al.alloc(u8, total_mat);
+    defer al.free(mat);
+    for (mat) |*b| b.* = r.int(u8);
+    // Stamp every block's f16 super-scale d to a small clamped magnitude so the
+    // CPU dequant doesn't blow up into NaN/Inf. d lives at offset 108..109.
+    const small_d_le: [2]u8 = .{ 0xCD, 0x21 }; // f16 ≈ 0.012
+    const blocks_per_row = cols / 256;
+    for (0..rows) |i| for (0..blocks_per_row) |b| {
+        const off = (i * blocks_per_row + b) * blk_bytes_q3k;
+        mat[off + 108] = small_d_le[0];
+        mat[off + 109] = small_d_le[1];
+    };
+
+    const vec = try al.alloc(f32, cols);
+    defer al.free(vec);
+    for (vec) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+
+    // CPU Q8_1 → dequant → reference activation; CPU f32 ref dot.
+    const q8_1_basic = try al.alloc(u8, (cols / 32) * dq.Q8_1_BLOCK_BYTES);
+    defer al.free(q8_1_basic);
+    dq.quantizeQ8_1(vec, q8_1_basic);
+    const vec_q8_rounded = try al.alloc(f32, cols);
+    defer al.free(vec_q8_rounded);
+    dq.dequantQ8_1(q8_1_basic, vec_q8_rounded);
+
+    const cpu_out = try al.alloc(f32, rows);
+    defer al.free(cpu_out);
+    const row_buf = try al.alloc(f32, cols);
+    defer al.free(row_buf);
+    math_mod.quantMatvec(cpu_out, mat, .q3_k, vec_q8_rounded, rows, cols, row_buf);
+
+    const q8_1_x4 = try al.alloc(u8, q8_1_basic.len);
+    defer al.free(q8_1_x4);
+    dq.packQ8_1_x4(q8_1_basic, q8_1_x4);
+
+    var pipeline = try MatvecPipeline.initQ3KQ8_1(&gpu);
+    defer pipeline.deinit();
+    var session = try MatvecSession.initQ3K(&gpu, mat, @intCast(rows), @intCast(cols));
+    defer session.deinit();
+
+    var acts_buf = try GpuBuffer.initHostCoherent(&gpu, q8_1_x4.len,
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer acts_buf.deinit();
+    try acts_buf.upload(q8_1_x4);
+
+    var out_buf = try GpuBuffer.initHostCoherent(&gpu, rows * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer out_buf.deinit();
+
+    const cmd = try gpu.beginBatch();
+    _ = try pipeline.record(cmd, &session.mat_buf, &acts_buf, &out_buf,
+        @intCast(rows), @intCast(cols));
+    try gpu.submitBatch(cmd);
+
+    const gpu_out = try al.alloc(f32, rows);
+    defer al.free(gpu_out);
+    try out_buf.download(std.mem.sliceAsBytes(gpu_out));
+
+    var max_abs: f32 = 0.0;
+    var max_ref: f32 = 0.0;
+    for (cpu_out, gpu_out) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs) max_abs = d;
+        if (@abs(c) > max_ref) max_ref = @abs(c);
+    }
+    const rel = max_abs / (max_ref + 1e-6);
+    std.debug.print("Q3_K×Q8_1 fuzz rows={} cols={}  max|D|={d:.6}  rel={e:.3}\n",
+        .{ rows, cols, max_abs, rel });
+    try std.testing.expect(rel < 1e-3);
+}
+
+test "gpu matvec Q3_K × Q8_1 fuzz small" {
+    try fuzzQ3KQ8_1(32, 256, 23);
+}
+
+test "gpu matvec Q3_K × Q8_1 fuzz model-sized" {
+    try fuzzQ3KQ8_1(64, 2304, 29);
 }
 
