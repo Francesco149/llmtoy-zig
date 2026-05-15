@@ -433,6 +433,151 @@ pub const MatvecSession = struct {
     }
 };
 
+// ── FusedGateUpPipeline ───────────────────────────────────────────────────────
+
+// Fused gate-gelu-up pipeline for Q3_K experts.
+// Computes output[row] = gelu(gate_mat[row]·vec) * (up_mat[row]·vec)
+// in one dispatch, eliminating the CPU roundtrip between gate/up and down.
+// 4 bindings: 0=gate_mat  1=up_mat  2=vec_in  3=vec_out
+pub const FusedGateUpPipeline = struct {
+    pipeline:   vk.VkPipeline,
+    layout:     vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool:  vk.VkDescriptorPool,
+    device:     vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !FusedGateUpPipeline {
+        comptime std.debug.assert(shaders.matvec_fused_gu_q3k.len % 4 == 0);
+        const dev = ctx.device;
+
+        const bindings = [4]vk.VkDescriptorSetLayoutBinding{
+            mkStorageBuf(0), mkStorageBuf(1), mkStorageBuf(2), mkStorageBuf(3),
+        };
+        const dsl_ci = vk.VkDescriptorSetLayoutCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = null, .flags = 0,
+            .bindingCount = bindings.len, .pBindings = &bindings,
+        };
+        var dset_layout: vk.VkDescriptorSetLayout = null;
+        if (vk.vkCreateDescriptorSetLayout(dev, &dsl_ci, null, &dset_layout) != vk.VK_SUCCESS)
+            return error.VkDescSetLayoutFailed;
+        errdefer vk.vkDestroyDescriptorSetLayout(dev, dset_layout, null);
+
+        const pc_range = vk.VkPushConstantRange{
+            .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = @sizeOf(PushConst),
+        };
+        const layout_ci = vk.VkPipelineLayoutCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = null, .flags = 0,
+            .setLayoutCount = 1, .pSetLayouts = &dset_layout,
+            .pushConstantRangeCount = 1, .pPushConstantRanges = &pc_range,
+        };
+        var layout: vk.VkPipelineLayout = null;
+        if (vk.vkCreatePipelineLayout(dev, &layout_ci, null, &layout) != vk.VK_SUCCESS)
+            return error.VkPipelineLayoutFailed;
+        errdefer vk.vkDestroyPipelineLayout(dev, layout, null);
+
+        const spv = &shaders.matvec_fused_gu_q3k;
+        std.debug.assert(@intFromPtr(spv) % 4 == 0);
+        const shader_ci = vk.VkShaderModuleCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .pNext = null, .flags = 0, .codeSize = spv.len, .pCode = @ptrCast(spv),
+        };
+        var shader_mod: vk.VkShaderModule = null;
+        if (vk.vkCreateShaderModule(dev, &shader_ci, null, &shader_mod) != vk.VK_SUCCESS)
+            return error.VkShaderModuleFailed;
+        defer vk.vkDestroyShaderModule(dev, shader_mod, null);
+
+        const stage = vk.VkPipelineShaderStageCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = null, .flags = 0,
+            .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = shader_mod, .pName = "main", .pSpecializationInfo = null,
+        };
+        const pipeline_ci = vk.VkComputePipelineCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .pNext = null, .flags = 0, .stage = stage, .layout = layout,
+            .basePipelineHandle = null, .basePipelineIndex = -1,
+        };
+        var pipeline: vk.VkPipeline = null;
+        if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
+            return error.VkComputePipelineFailed;
+        errdefer vk.vkDestroyPipeline(dev, pipeline, null);
+
+        // 16 sets: one per active expert per layer (n_experts_used = 8 typical)
+        const pool_size = vk.VkDescriptorPoolSize{
+            .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4 * 16,
+        };
+        const pool_ci = vk.VkDescriptorPoolCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = null,
+            .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+            .maxSets = 16, .poolSizeCount = 1, .pPoolSizes = &pool_size,
+        };
+        var desc_pool: vk.VkDescriptorPool = null;
+        if (vk.vkCreateDescriptorPool(dev, &pool_ci, null, &desc_pool) != vk.VK_SUCCESS)
+            return error.VkDescriptorPoolFailed;
+
+        return .{
+            .pipeline = pipeline, .layout = layout,
+            .dset_layout = dset_layout, .desc_pool = desc_pool, .device = dev,
+        };
+    }
+
+    // Record one fused gate-gelu-up dispatch into an open command buffer.
+    // Returns the descriptor set; caller frees it after the submit completes.
+    pub fn record(
+        self: *const FusedGateUpPipeline,
+        cmd: vk.VkCommandBuffer,
+        gate_buf: *const GpuBuffer,
+        up_buf:   *const GpuBuffer,
+        vec_buf:  *const GpuBuffer,
+        out_buf:  *const GpuBuffer,
+        rows: u32,
+        cols: u32,
+    ) !vk.VkDescriptorSet {
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null, .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [4]vk.VkDescriptorBufferInfo{
+            .{ .buffer = gate_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = up_buf.handle,   .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = vec_buf.handle,  .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = out_buf.handle,  .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [4]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]), mkWrite(dset, 1, &buf_infos[1]),
+            mkWrite(dset, 2, &buf_infos[2]), mkWrite(dset, 3, &buf_infos[3]),
+        };
+        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            self.layout, 0, 1, &dset, 0, null);
+        const pc = PushConst{ .rows = rows, .cols = cols };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            0, @sizeOf(PushConst), &pc);
+        const groups = (rows + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        vk.vkCmdDispatch(cmd, groups, 1, 1);
+
+        return dset;
+    }
+
+    pub fn deinit(self: *FusedGateUpPipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
 // ── convenience functions ─────────────────────────────────────────────────────
 
 // One-shot fp32 matvec: upload matrix to VRAM, run, download result.

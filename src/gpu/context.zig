@@ -177,6 +177,24 @@ pub const GpuContext = struct {
         vk.vkCmdCopyBuffer(cmd, src, dst, 1, &region);
     }
 
+    // Compute → compute pipeline barrier.
+    // Ensures all shader writes before this point are visible to shader reads after it.
+    // Use between fused gate-gelu-up dispatches and the down matmul dispatches.
+    pub fn recordShaderBarrier(cmd: vk.VkCommandBuffer) void {
+        const barrier = vk.VkMemoryBarrier{
+            .sType = vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = null,
+            .srcAccessMask = vk.VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT,
+        };
+        vk.vkCmdPipelineBarrier(
+            cmd,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &barrier, 0, null, 0, null,
+        );
+    }
+
     // End recording, submit all recorded copies, wait for completion, free command buffer.
     pub fn submitBatchCopy(self: *const GpuContext, cmd: vk.VkCommandBuffer) !void {
         _ = vk.vkEndCommandBuffer(cmd);

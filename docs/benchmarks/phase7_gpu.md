@@ -70,7 +70,25 @@ GPU is faster. Persistent mapping (map I/O buffers once at init) eliminated
 720 vkMapMemory/vkUnmapMemory calls per token with no measurable benefit vs
 per-call mapping — the bottleneck is the 60 GPU sync points, not the maps.
 
-Next: fused gate-gelu-up shader → 1 submit/layer → 30 syncs/token.
+### Fused gate-gelu-up shader (1 submit/layer = 30 syncs/token)
+
+Single shader computes `gelu(gate@x) * (up@x)` in one dispatch per expert.
+mid_bufs promoted to device-local VRAM (GPU-only, never CPU-mapped).
+
+| Mode | tok/s prefill | tok/s decode |
+|------|--------------|--------------|
+| Fused (1 submit/layer) | 2.48–2.61 | **2.11** |
+| vs batched (2 submits/layer) | — | 2.10 |
+| vs CPU only | — | 1.98 |
+
+Halving GPU syncs (60→30/token) gave only +0.01 tok/s improvement — submit
+overhead is negligible vs actual compute. The 6% gain over CPU (1.98→2.11)
+comes purely from VRAM bandwidth (432 GB/s vs ~50 GB/s system RAM).
+
+Bug fixed: manual `exp(2t)/(exp(2t)+1)` tanh overflowed to NaN for large
+activations; replaced with GLSL built-in `tanh()`.
+
+Next: profiling to identify actual bottleneck (CPU accumulation? attention path? PCIe?)
 
 ## Notes
 
