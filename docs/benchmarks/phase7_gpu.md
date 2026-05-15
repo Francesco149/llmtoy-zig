@@ -88,7 +88,34 @@ comes purely from VRAM bandwidth (432 GB/s vs ~50 GB/s system RAM).
 Bug fixed: manual `exp(2t)/(exp(2t)+1)` tanh overflowed to NaN for large
 activations; replaced with GLSL built-in `tanh()`.
 
-Next: profiling to identify actual bottleneck (CPU accumulation? attention path? PCIe?)
+### GPU expert accumulation (Phase 3 moved to GPU)
+
+Perf stat comparison (CPU-only vs GPU path, 16 tokens):
+
+| Metric | CPU-only | GPU (fused+accum) |
+|--------|----------|-------------------|
+| CPUs utilized | 7.6 | 3.3 |
+| Instructions | 1063B | 570B |
+| IPC | 1.9 | 1.9 |
+| L1-dcache miss | 5.5% | 3.9% |
+| Context switches | 603K | 180K |
+
+Previously the 8 expert outputs (88 KiB total) were read from HOST_COHERENT
+memory by CPU and accumulated with per-expert scales. Moved this to a new
+`expert_accum.glsl` shader: reads flat device-local `expert_all_out_buf`
+(8 × d_model f32), writes weighted sum to a small HOST_COHERENT `moe_gpu_buf`.
+CPU then does a single 11 KiB copy instead of 8 × 11 KiB scattered reads + mul.
+
+| Mode | tok/s prefill | tok/s decode |
+|------|--------------|--------------|
+| Fused only (CPU accum) | 2.45–2.61 | 2.41 |
+| + GPU accum (this change) | **2.80** | **2.74** |
+| vs CPU only | 2.27 | 1.98 |
+| Speedup vs CPU | +23% | +38% |
+
+13% improvement over the fused-only baseline. The bottleneck was PCIe reads of
+8 × 11 KiB HOST_COHERENT memory; consolidating to 1 × 11 KiB removed the
+pressure. Profile script now supports `GPU=1 ./scripts/profile_gemma4.sh stat`.
 
 ## Notes
 

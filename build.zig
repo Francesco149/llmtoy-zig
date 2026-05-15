@@ -25,6 +25,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(matvec_q5_0_spv, "matvec_q5_0.spv");
     const matvec_fused_gu_q3k_spv = compileShader(b, "src/gpu/shaders/matvec_fused_gu_q3k.glsl");
     _ = wf.addCopyFile(matvec_fused_gu_q3k_spv, "matvec_fused_gu_q3k.spv");
+    const expert_accum_spv = compileShader(b, "src/gpu/shaders/expert_accum.glsl");
+    _ = wf.addCopyFile(expert_accum_spv, "expert_accum.spv");
     // align(4): VkShaderModuleCreateInfo.pCode requires 4-byte aligned SPIR-V data.
     // Declaring the embedded file with align(4) makes &matvec_f32 satisfy that
     // requirement without a runtime allocation or copy.
@@ -36,6 +38,7 @@ pub fn build(b: *std.Build) void {
         \\pub const matvec_q5_1         align(4) = @embedFile("matvec_q5_1.spv").*;
         \\pub const matvec_q5_0         align(4) = @embedFile("matvec_q5_0.spv").*;
         \\pub const matvec_fused_gu_q3k align(4) = @embedFile("matvec_fused_gu_q3k.spv").*;
+        \\pub const expert_accum        align(4) = @embedFile("expert_accum.spv").*;
     );
     const shaders_mod = b.createModule(.{ .root_source_file = shaders_src });
 
