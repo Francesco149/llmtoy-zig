@@ -181,10 +181,19 @@ Shaders added:
 - `matvec_q5_0_q8_1.glsl` — Q5_0 weights × Q8_1 acts
 - `matvec_q5_1_q8_1.glsl` — Q5_1 weights × Q8_1 acts
 
-Coverage today: all 30 attention layers (wq+wk+wv, mixed Q3_K/Q4_K) + all MoE
-expert matmuls (fused Q3_K gate+up AND Q5_0/Q5_1 down). Still on the
-f32-activation path: wo (Q4_K, cols=4096) and dense FFN (Q3_K gate/up + Q5_1
-down).
+Coverage today: **every matmul that has a Q8_1 pipeline now uses it** —
+attention QKV (Q3_K + Q4_K), wo (Q4_K), dense FFN gate+up (Q3_K, batched),
+dense FFN down (Q5_0/Q5_1), MoE fused gate+up (Q3_K), MoE down (Q5_0/Q5_1).
+The only matmul left on the f32-acts path is lm_head (Q5_K or similar —
+no Q5_K shader yet).
+
+Numerics, side-effect of the broader Q8_1 coverage: per-layer `compare`
+rel_err finally collapses. Baseline L13–L28 ranged 1.5–55% with L28 argmax
+FAIL; the full-Q8_1 path keeps L0–L29 below 2.05% (worst L28 at 5.6%) and
+**every layer argmax matches CPU**, including the final argmax. This is the
+bit-determinism property the plan predicted — Q8_1 alone doesn't deliver
+it, but Q8_1 across enough of the path does, because there's less f32
+reduction-order math left to diverge.
 
 | Mode | tok/s prefill | tok/s decode |
 |------|--------------|--------------|
@@ -192,13 +201,14 @@ down).
 | Q8_1 attention only (6 of 30 layers, Q4_K only) | ~3.11 | ~3.08 |
 | Q8_1 attention all 30 layers (Q3_K + Q4_K) | ~3.21 | ~3.15 |
 | Q8_1 attention + Q8_1 fused MoE gate+up | 3.71–3.78 | 3.66–3.68 |
-| Q8_1 attention + full Q8_1 MoE (gate+up + down) | **~3.86** | **~3.66–3.70** |
+| Q8_1 attention + full Q8_1 MoE (gate+up + down) | ~3.86 | ~3.66–3.70 |
+| Full Q8_1 routing (attn + MoE + dense FFN + wo) | **~4.28** | **~4.07** |
 
-Net **~+22% prefill / +20% decode** end-to-end vs Phase 7f baseline. The
-biggest contribution is the Q8_1 fused MoE gate+up (+15%); the down-side
-Q5_0/Q5_1 Q8_1 path adds another +2–4% on top (it's a smaller matmul but
-already had the f32-acts batch-friendly down dispatch eliminating most of
-the f32 overhead).
+Net **~+38% prefill / +33% decode** end-to-end vs Phase 7f baseline. The
+biggest single contribution is the Q8_1 fused MoE gate+up; the dense FFN
+gate+up gives a similar bump because Q3_K (cols=2816, rows=2112) is a
+substantial matmul × 30 layers. Both `wo` and `w_down` see modest gains
+since they're already small.
 
 Numerics: `llmtoy compare` is essentially unchanged vs the pre-Q8_1 baseline
 (per-layer rel_err matches within 0.01%; same pre-existing L28 argmax FAIL).
@@ -220,11 +230,12 @@ setup):
 |------------------------------------------------|-------------------|
 | Pre-Q8_1 (Phase 7f baseline)                   | 32.17 ± 0.71 s    |
 | Q8_1 attention + Q8_1 fused MoE gate+up        | 28.86 ± 0.37 s    |
-| Q8_1 attention + full Q8_1 MoE (gate+up+down)  | **27.57 ± 0.41 s**|
+| Q8_1 attention + full Q8_1 MoE (gate+up+down)  | 27.57 ± 0.41 s    |
+| Full Q8_1 routing (attn + MoE + dense + wo)    | **25.43 ± 0.15 s**|
 
-Compute-only delta (subtracting the ~5.8 s model load): 26.4 s → 21.8 s,
-**+21% throughput** at the full-Q8_1-MoE stage. Single-run tok/s reports
-3.86 prefill / 3.66–3.70 decode — matches the wall-clock drop.
+Compute-only delta (subtracting the ~5.8 s model load): 26.4 s → 19.6 s,
+**+34% throughput**. Single-run tok/s reports 4.28 prefill / 4.07 decode —
+matches the wall-clock drop.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

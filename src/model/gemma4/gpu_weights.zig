@@ -442,14 +442,15 @@ pub const GpuWeights = struct {
     // Q8_1-activation matvec: one f32 → Q8_1 quantize pass, then one matvec.
     // The two dispatches share a command buffer with a compute-compute barrier
     // between them so the matvec sees the freshly-written Q8_1 acts.
-    // Currently only Q4_K weights are wired up (pl_q4_k_q8_1).
+    // Caller supplies the matvec pipeline via q8_1PipelineFor(t).
     pub fn runQ8_1Mv(
         self: *const GpuWeights,
+        pl: *const MatvecPipeline,
         sess: *const MatvecSession,
         xb: []const f32,
         out: []f32,
     ) !void {
-        std.debug.assert(sess.cols % 256 == 0);
+        std.debug.assert(sess.cols % 32 == 0);
         const vec_buf  = &self.shared_vec.?;
         const out_buf  = &self.shared_out.?;
         const acts_buf = &self.shared_acts_q8_1.?;
@@ -460,14 +461,13 @@ pub const GpuWeights = struct {
         const q_dset = try self.pl_quantize_q8_1.record(
             cmd, vec_buf, acts_buf, sess.cols);
         GpuCtx.recordShaderBarrier(cmd);
-        const mv_dset = try self.pl_q4_k_q8_1.record(
+        const mv_dset = try pl.record(
             cmd, &sess.mat_buf, acts_buf, out_buf, sess.rows, sess.cols);
         try self.ctx.submitBatch(cmd);
 
         _ = vk.vkFreeDescriptorSets(self.ctx.device,
             self.pl_quantize_q8_1.desc_pool, 1, &q_dset);
-        _ = vk.vkFreeDescriptorSets(self.ctx.device,
-            self.pl_q4_k_q8_1.desc_pool, 1, &mv_dset);
+        _ = vk.vkFreeDescriptorSets(self.ctx.device, pl.desc_pool, 1, &mv_dset);
 
         try out_buf.download(std.mem.sliceAsBytes(out));
     }
@@ -547,6 +547,51 @@ pub const GpuWeights = struct {
             .q5_1 => &self.pl_q5_1_q8_1,
             else  => null,
         };
+    }
+
+    // Q8_1 dense FFN gate+up: one upload, one quantize, two parallel matvec
+    // dispatches that share shared_acts_q8_1, two downloads. Mirrors
+    // runLayerQKVQ8_1 but with 2 matmuls instead of 3.
+    pub fn runLayerGateUpQ8_1(
+        self: *const GpuWeights,
+        layer: usize,
+        gate_pl: *const MatvecPipeline,
+        up_pl:   *const MatvecPipeline,
+        xb: []const f32,
+        gate_out: []f32,
+        up_out:   []f32,
+    ) !void {
+        const lw     = &self.layers[layer];
+        const w_gate = lw.w_gate orelse return error.NotOnGpu;
+        const w_up   = lw.w_up   orelse return error.NotOnGpu;
+        std.debug.assert(w_gate.cols % 32 == 0);
+        std.debug.assert(w_gate.cols == w_up.cols);
+
+        const vec_buf  = &self.shared_vec.?;
+        const acts_buf = &self.shared_acts_q8_1.?;
+        const gate_buf = &(self.gate_out_buf orelse return error.NotOnGpu);
+        const up_buf   = &(self.up_out_buf   orelse return error.NotOnGpu);
+
+        try vec_buf.upload(std.mem.sliceAsBytes(xb));
+
+        const cmd = try self.ctx.beginBatch();
+        const quant_dset = try self.pl_quantize_q8_1.record(cmd, vec_buf, acts_buf, w_gate.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const gate_dset = try gate_pl.record(
+            cmd, &w_gate.mat_buf, acts_buf, gate_buf, w_gate.rows, w_gate.cols);
+        const up_dset = try up_pl.record(
+            cmd, &w_up.mat_buf, acts_buf, up_buf, w_up.rows, w_up.cols);
+
+        try self.ctx.submitBatch(cmd);
+
+        const dev = self.ctx.device;
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_quantize_q8_1.desc_pool, 1, &quant_dset);
+        _ = vk.vkFreeDescriptorSets(dev, gate_pl.desc_pool, 1, &gate_dset);
+        _ = vk.vkFreeDescriptorSets(dev, up_pl.desc_pool, 1, &up_dset);
+
+        try gate_buf.download(std.mem.sliceAsBytes(gate_out));
+        try up_buf.download(std.mem.sliceAsBytes(up_out));
     }
 
     // Dispatch w_gate and w_up in one command buffer (both read the same FFN-norm xb).

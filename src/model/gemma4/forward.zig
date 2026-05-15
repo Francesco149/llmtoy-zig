@@ -237,10 +237,27 @@ pub fn forwardOne(
 
         math.rmsnorm(xb, x, lw.ffn_norm, cfg.eps);
 
-        // Batch w_gate+w_up into one submit when both are on GPU.
-        const can_batch_ffn = gpu != null and glw != null and
+        // Three FFN-gate+up dispatch paths, mirroring the QKV logic:
+        //   1. Q8_1 path:  both gate+up have Q8_1 pipelines + aligned cols
+        //                   → quantize xb once then 2 parallel integer-dot matmuls
+        //   2. f32 batch:  both on GPU but at least one has no Q8_1 shader
+        //                   → existing batched f32-acts path
+        //   3. Per-call:   one or both sessions missing → mv() per matrix
+        const gate_q8_pl: ?*const MatvecPipeline = if (gpu) |g|
+            (if (glw != null and glw.?.w_gate != null) g.q8_1PipelineFor(lw.w_gate.type_) else null)
+        else null;
+        const up_q8_pl: ?*const MatvecPipeline = if (gpu) |g|
+            (if (glw != null and glw.?.w_up != null) g.q8_1PipelineFor(lw.w_up.type_) else null)
+        else null;
+        const can_q8_1_ffn = gate_q8_pl != null and up_q8_pl != null
+            and (lw.w_gate.type_ != .q3_k or d % 256 == 0)
+            and (lw.w_up.type_   != .q3_k or d % 256 == 0);
+        const can_batch_ffn = !can_q8_1_ffn and gpu != null and glw != null and
             glw.?.w_gate != null and glw.?.w_up != null;
-        if (can_batch_ffn) {
+        if (can_q8_1_ffn) {
+            try gpu.?.runLayerGateUpQ8_1(l, gate_q8_pl.?, up_q8_pl.?,
+                xb[0..d], gate_buf, up_buf);
+        } else if (can_batch_ffn) {
             const g = gpu.?;
             try g.runLayerGateUp(l,
                 g.pipelineFor(lw.w_gate.type_), g.pipelineFor(lw.w_up.type_),
@@ -345,6 +362,11 @@ pub fn forwardOne(
 
 // Run one matmul on the GPU (if session != null) or the CPU thread pool.
 // sess_opt is passed by value (cheap handle copy); no deinit is called here.
+//
+// Routing priority:
+//   1. GPU with Q8_1 pipeline + aligned cols  → runQ8_1Mv (integer-dot)
+//   2. GPU session present, no Q8_1 pipeline   → sess.run (f32-acts matvec)
+//   3. No GPU session                          → CPU thread pool
 fn mv(
     out: []f32,
     mat: wt_.RawMatrix,
@@ -356,6 +378,20 @@ fn mv(
 ) !void {
     if (sess_opt) |sess| {
         const gw_ = gw.?;
+        if (gw_.q8_1PipelineFor(mat.type_)) |q8_1_pl| {
+            // cols alignment: Q3_K/Q4_K need %256, Q5_0/Q5_1 need %32. The
+            // q8_1PipelineFor returns null for unsupported types so we only
+            // hit this for the four supported quant families.
+            const k_aligned = switch (mat.type_) {
+                .q3_k, .q4_k => sess.cols % 256 == 0,
+                .q5_0, .q5_1 => sess.cols % 32 == 0,
+                else => false,
+            };
+            if (k_aligned) {
+                try gw_.runQ8_1Mv(q8_1_pl, &sess, vec, out);
+                return;
+            }
+        }
         try sess.run(&gw_.ctx, gw_.pipelineFor(mat.type_),
             &gw_.shared_vec.?, &gw_.shared_out.?, vec, out);
     } else {
