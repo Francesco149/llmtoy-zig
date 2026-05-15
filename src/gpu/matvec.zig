@@ -18,45 +18,58 @@ const PushConst = extern struct { rows: u32, cols: u32 };
 
 // Compiled compute pipeline for one matvec shader variant.
 // Create one per quant format; reuse across all calls with that format.
+//
+// `rows_per_workgroup` determines the dispatch geometry: a `record(rows=R, cols=C)`
+// call dispatches `ceil(R / rows_per_workgroup)` workgroups in X. The original
+// f32 / Q8_0 / Q*_K shaders use 1 thread per row, so each workgroup of 64 threads
+// processes 64 rows (rows_per_workgroup = 64).  The Q8_1-activation shaders use
+// a full subgroup per row, so each workgroup processes 1 row.
 pub const MatvecPipeline = struct {
     pipeline: vk.VkPipeline,
     layout: vk.VkPipelineLayout,
     dset_layout: vk.VkDescriptorSetLayout,
     desc_pool: vk.VkDescriptorPool,
     device: vk.VkDevice,
+    rows_per_workgroup: u32,
 
     pub fn initF32(ctx: *const GpuContext) !MatvecPipeline {
         // SPIR-V size must be a multiple of 4 words — checked at comptime.
         comptime std.debug.assert(shaders.matvec_f32.len % 4 == 0);
-        return initFromSpv(ctx, &shaders.matvec_f32);
+        return initFromSpv(ctx, &shaders.matvec_f32, 64);
     }
 
     pub fn initQ8_0(ctx: *const GpuContext) !MatvecPipeline {
         comptime std.debug.assert(shaders.matvec_q8_0.len % 4 == 0);
-        return initFromSpv(ctx, &shaders.matvec_q8_0);
+        return initFromSpv(ctx, &shaders.matvec_q8_0, 64);
     }
 
     pub fn initQ3K(ctx: *const GpuContext) !MatvecPipeline {
         comptime std.debug.assert(shaders.matvec_q3_k.len % 4 == 0);
-        return initFromSpv(ctx, &shaders.matvec_q3_k);
+        return initFromSpv(ctx, &shaders.matvec_q3_k, 64);
     }
 
     pub fn initQ4K(ctx: *const GpuContext) !MatvecPipeline {
         comptime std.debug.assert(shaders.matvec_q4_k.len % 4 == 0);
-        return initFromSpv(ctx, &shaders.matvec_q4_k);
+        return initFromSpv(ctx, &shaders.matvec_q4_k, 64);
     }
 
     pub fn initQ5_1(ctx: *const GpuContext) !MatvecPipeline {
         comptime std.debug.assert(shaders.matvec_q5_1.len % 4 == 0);
-        return initFromSpv(ctx, &shaders.matvec_q5_1);
+        return initFromSpv(ctx, &shaders.matvec_q5_1, 64);
     }
 
     pub fn initQ5_0(ctx: *const GpuContext) !MatvecPipeline {
         comptime std.debug.assert(shaders.matvec_q5_0.len % 4 == 0);
-        return initFromSpv(ctx, &shaders.matvec_q5_0);
+        return initFromSpv(ctx, &shaders.matvec_q5_0, 64);
     }
 
-    fn initFromSpv(ctx: *const GpuContext, spv: anytype) !MatvecPipeline {
+    // Q4_K weights × Q8_1 activations, subgroup-cooperative (1 workgroup/row).
+    pub fn initQ4KQ8_1(ctx: *const GpuContext) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_q4_k_q8_1.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.matvec_q4_k_q8_1, 1);
+    }
+
+    fn initFromSpv(ctx: *const GpuContext, spv: anytype, rows_per_workgroup: u32) !MatvecPipeline {
         // align(4) on the const in shaders.zig should guarantee this, but
         // assert the actual runtime address in case @embedFile doesn't honour it.
         std.debug.assert(@intFromPtr(spv) % 4 == 0);
@@ -159,6 +172,7 @@ pub const MatvecPipeline = struct {
             .dset_layout = dset_layout,
             .desc_pool = desc_pool,
             .device = dev,
+            .rows_per_workgroup = rows_per_workgroup,
         };
     }
 
@@ -207,7 +221,7 @@ pub const MatvecPipeline = struct {
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
             0, @sizeOf(PushConst), &pc);
 
-        const groups = (rows + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        const groups = (rows + self.rows_per_workgroup - 1) / self.rows_per_workgroup;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
 
         return dset;
@@ -259,7 +273,7 @@ pub const MatvecPipeline = struct {
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
             0, @sizeOf(PushConst), &pc);
 
-        const groups = (rows + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        const groups = (rows + self.rows_per_workgroup - 1) / self.rows_per_workgroup;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
 
         return dset;
@@ -337,7 +351,7 @@ pub const MatvecPipeline = struct {
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
             0, @sizeOf(PushConst), &pc);
 
-        const groups = (rows + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        const groups = (rows + self.rows_per_workgroup - 1) / self.rows_per_workgroup;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
 
         _ = vk.vkEndCommandBuffer(cmd);
@@ -1676,5 +1690,116 @@ test "gpu quantize_q8_1 round-trip" {
     }
     std.debug.print("Q8_1 quantize round-trip n={}  max|D|={d:.6}  amax={d:.6}\n",
         .{ n, max_abs, max_amax });
+}
+
+// ── Q4_K × Q8_1 integer-dot matvec fuzz test ──────────────────────────────────
+//
+// End-to-end test: random Q4_K weights × random f32 activations.
+//   1. CPU quantizes activations to Q8_1 (basic format), then dequantizes back
+//      to f32 → this is the "Q8_1-rounded" activation that the GPU effectively
+//      computes against.
+//   2. CPU computes the f32 dot product (math.quantMatvec) on the Q8_1-rounded
+//      activation. Because the Q8_1 quants are identical on both sides, this
+//      is the deterministic reference the GPU's integer-dot path must match
+//      to within float-reduction-order noise (~1e-5 relative).
+//   3. GPU: upload Q8_1 x4 buffer + Q4_K matrix → run matvec_q4_k_q8_1.
+//   4. Assert rel < 1e-3 (loose to absorb f16 ds + per-row float order).
+fn fuzzQ4KQ8_1(rows: usize, cols: usize, seed: u64) !void {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    std.debug.assert(cols % 256 == 0);
+    std.debug.assert(cols % 128 == 0);
+
+    const al = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+
+    // Random Q4_K matrix bytes with clamped f16 super-scales (matches existing fuzz).
+    const blk_bytes_q4k: usize = 144;
+    const total_mat = rows * (cols / 256) * blk_bytes_q4k;
+    const mat = try al.alloc(u8, total_mat);
+    defer al.free(mat);
+    for (mat) |*b| b.* = r.int(u8);
+    const small_d_le: [2]u8 = .{ 0xCD, 0x21 }; // f16 ≈ 0.012
+    const blocks_per_row = cols / 256;
+    for (0..rows) |i| for (0..blocks_per_row) |b| {
+        const off = (i * blocks_per_row + b) * blk_bytes_q4k;
+        mat[off + 0] = small_d_le[0]; mat[off + 1] = small_d_le[1]; // d
+        mat[off + 2] = small_d_le[0]; mat[off + 3] = small_d_le[1]; // dmin
+    };
+
+    const vec = try al.alloc(f32, cols);
+    defer al.free(vec);
+    for (vec) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+
+    // CPU quantize activation to Q8_1 (basic) → dequant → reference activation.
+    const q8_1_basic = try al.alloc(u8, (cols / 32) * dq.Q8_1_BLOCK_BYTES);
+    defer al.free(q8_1_basic);
+    dq.quantizeQ8_1(vec, q8_1_basic);
+    const vec_q8_rounded = try al.alloc(f32, cols);
+    defer al.free(vec_q8_rounded);
+    dq.dequantQ8_1(q8_1_basic, vec_q8_rounded);
+
+    // CPU reference: f32 dot of dequantized weights × Q8_1-rounded activation.
+    const cpu_out = try al.alloc(f32, rows);
+    defer al.free(cpu_out);
+    const row_buf = try al.alloc(f32, cols);
+    defer al.free(row_buf);
+    math_mod.quantMatvec(cpu_out, mat, .q4_k, vec_q8_rounded, rows, cols, row_buf);
+
+    // Pack basic Q8_1 → x4 for the GPU shader.
+    const q8_1_x4 = try al.alloc(u8, q8_1_basic.len);
+    defer al.free(q8_1_x4);
+    dq.packQ8_1_x4(q8_1_basic, q8_1_x4);
+
+    // GPU side: device-local Q4_K weights, host-coherent Q8_1 acts + output.
+    var pipeline = try MatvecPipeline.initQ4KQ8_1(&gpu);
+    defer pipeline.deinit();
+    var session = try MatvecSession.initQ4K(&gpu, mat, @intCast(rows), @intCast(cols));
+    defer session.deinit();
+
+    var acts_buf = try GpuBuffer.initHostCoherent(&gpu, q8_1_x4.len,
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer acts_buf.deinit();
+    try acts_buf.upload(q8_1_x4);
+
+    var out_buf = try GpuBuffer.initHostCoherent(&gpu, rows * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer out_buf.deinit();
+
+    const cmd = try gpu.beginBatch();
+    _ = try pipeline.record(cmd, &session.mat_buf, &acts_buf, &out_buf,
+        @intCast(rows), @intCast(cols));
+    try gpu.submitBatch(cmd);
+
+    const gpu_out = try al.alloc(f32, rows);
+    defer al.free(gpu_out);
+    try out_buf.download(std.mem.sliceAsBytes(gpu_out));
+
+    var max_abs: f32 = 0.0;
+    var max_ref: f32 = 0.0;
+    for (cpu_out, gpu_out) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs) max_abs = d;
+        if (@abs(c) > max_ref) max_ref = @abs(c);
+    }
+    const rel = max_abs / (max_ref + 1e-6);
+    std.debug.print("Q4_K×Q8_1 fuzz rows={} cols={}  max|D|={d:.6}  rel={e:.3}\n",
+        .{ rows, cols, max_abs, rel });
+    try std.testing.expect(rel < 1e-3);
+}
+
+test "gpu matvec Q4_K × Q8_1 fuzz small" {
+    try fuzzQ4KQ8_1(32, 256, 11);
+}
+
+test "gpu matvec Q4_K × Q8_1 fuzz model-sized" {
+    // Closest analogue to a Gemma4 attention matmul: cols = d_model = 2304.
+    try fuzzQ4KQ8_1(64, 2304, 13);
 }
 
