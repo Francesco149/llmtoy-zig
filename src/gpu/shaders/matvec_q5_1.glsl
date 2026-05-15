@@ -3,11 +3,12 @@
 // Block layout (24 bytes, QK5_1 = 32 elements):
 //   [0..1]  f16  d  – scale
 //   [2..3]  f16  m  – addend
-//   [4..7]  u32  qh – 5th bit per element: bit i → bit 4 of element i
-//   [8..23] u8[16] qs – 4-bit nibbles, 2 per byte; element i: nibble i%2 of byte i/2
+//   [4..7]  u32  qh – 5th bit per element: bit j → element j (j<16); bit j+16 → element j+16
+//   [8..23] u8[16] qs – interleaved: lo nibble of qs[j] = element j; hi nibble = element j+16
 //
-// Decode: q5 = (qs[i/2] >> (4*(i%2)) & 0xF) | (((qh>>i)&1) << 4)
-//          x  = d * float(q5) + m
+// Decode (j = 0..15):
+//   lo: q5 = (qs[j] & 0xF) | ((qh>>j      ) & 1) << 4   →  x = d*q5 + m
+//   hi: q5 = (qs[j] >> 4)  | ((qh>>(j+16u)) & 1) << 4   →  x = d*q5 + m
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -54,10 +55,12 @@ void main() {
         uint qh = mat[(blk + 4u) >> 2u];
 
         uint vec_base = b * QK5_1;
-        for (uint i = 0u; i < QK5_1; i++) {
-            uint q4 = (byte_at(blk + 8u + (i >> 1u)) >> ((i & 1u) << 2u)) & 0xFu;
-            uint q5 = q4 | (((qh >> i) & 1u) << 4u);
-            sum = fma(d * float(q5) + m, vec_in[vec_base + i], sum);
+        for (uint j = 0u; j < 16u; j++) {
+            uint qb    = byte_at(blk + 8u + j);
+            uint q5_lo = (qb & 0xFu) | (((qh >> j)         & 1u) << 4u);
+            uint q5_hi = (qb >> 4u)  | (((qh >> (j + 16u)) & 1u) << 4u);
+            sum = fma(d * float(q5_lo) + m, vec_in[vec_base + j],       sum);
+            sum = fma(d * float(q5_hi) + m, vec_in[vec_base + j + 16u], sum);
         }
     }
 
