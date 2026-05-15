@@ -512,6 +512,11 @@ pub const FusedGateUpPipeline = struct {
 
     pub fn init(ctx: *const GpuContext) !FusedGateUpPipeline {
         comptime std.debug.assert(shaders.matvec_fused_gu_q3k.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.matvec_fused_gu_q3k);
+    }
+
+    fn initFromSpv(ctx: *const GpuContext, spv: anytype) !FusedGateUpPipeline {
+        std.debug.assert(@intFromPtr(spv) % 4 == 0);
         const dev = ctx.device;
 
         const bindings = [4]vk.VkDescriptorSetLayoutBinding{
@@ -541,8 +546,6 @@ pub const FusedGateUpPipeline = struct {
             return error.VkPipelineLayoutFailed;
         errdefer vk.vkDestroyPipelineLayout(dev, layout, null);
 
-        const spv = &shaders.matvec_fused_gu_q3k;
-        std.debug.assert(@intFromPtr(spv) % 4 == 0);
         const shader_ci = vk.VkShaderModuleCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
             .pNext = null, .flags = 0, .codeSize = spv.len, .pCode = @ptrCast(spv),

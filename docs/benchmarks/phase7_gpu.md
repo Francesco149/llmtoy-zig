@@ -152,14 +152,38 @@ Submit count per layer: **8 → 5** (wq+wk+wv=1, wo=1, gate+up=1, w_down=1, expe
 | Mode | tok/s prefill | tok/s decode |
 |------|--------------|--------------|
 | Before (Phase 7e) | 2.79 | 2.72 |
-| After batching | **3.23** | **3.11** |
-| Speedup vs CPU | +42% | +57% |
+| After batching | **3.10–3.17** | **3.06–3.09** |
+| Speedup vs CPU | +37–40% | +54–56% |
 
 Removing 3 submit cycles saves more than just submit overhead — each
 eliminated round-trip also removes an upload and a download of xb/output.
+(The previously reported 3.23/3.11 was a lucky single-run outlier; typical
+variance across runs is ±5%.)
 
-Next: fused dense FFN gate-gelu-up (Q4_K) to remove CPU gelu + w_down into
-same batch; then RMSNorm/residual/RoPE shaders to collapse to ≤2 submits/layer.
+## Phase 7g — Fused dense FFN (experiment, reverted)
+
+Attempted fusing gate-gelu-up + w_down into a single submit (4 submits/layer):
+one dispatch computes `gelu(gate@x) * (up@x)` into a device-local mid_buf,
+then a barrier + w_down dispatch reads mid_buf and writes the final output.
+Dense FFN gate/up are Q3_K (same shader as experts).
+
+| Mode | tok/s prefill | tok/s decode |
+|------|--------------|--------------|
+| Phase 7f (batched gate+up, separate down) | 3.10–3.17 | 3.06–3.09 |
+| Fused gate-gelu-up + down (1 submit) | 3.07–3.08 | 2.96–3.00 |
+
+The fused shader reads **two** Q3_K matrices (gate + up) per thread, doubling
+register pressure and reducing GPU wavefront occupancy versus running two
+separate 2112-row dispatches. The 1-submit saving (~0.1 ms/layer overhead) is
+smaller than the per-element compute regression, so the net result is slower.
+
+Contrast with the expert fused shader which _does_ help: expert matrices are
+smaller (704 rows vs 2112) and 8 are dispatched per batch, giving more total
+parallelism with less register pressure per wavefront.
+
+**Reverted**: kept 5 submits/layer (wq+wk+wv=1, wo=1, gate+up=1, w_down=1,
+experts=1). The fused Q3_K dense FFN shader is kept in
+`src/gpu/shaders/matvec_fused_gu_q4k.glsl` for reference.
 
 ## Notes
 

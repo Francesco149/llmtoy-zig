@@ -57,7 +57,7 @@ pub const GpuWeights = struct {
     pl_q5_1:    MatvecPipeline,
     pl_q5_0:    MatvecPipeline,
     pl_fused_gu: FusedGateUpPipeline,
-    pl_accum:   AccumPipeline,
+    pl_accum:    AccumPipeline,
     layers:     []GpuLayerWeights,
     lm_head:    ?MatvecSession,
     // Shared host-coherent I/O buffers sized to the largest matrix across all
