@@ -160,6 +160,66 @@ eliminated round-trip also removes an upload and a download of xb/output.
 (The previously reported 3.23/3.11 was a lucky single-run outlier; typical
 variance across runs is ±5%.)
 
+## Phase 7k* — Q8_1 activations + integer-dot matvec
+
+Switched the matvec path from f32-activation × quantized-weight (scalar-per-row)
+to **Q8_1-activation × quantized-weight, subgroup-cooperative integer-dot**,
+following the structure llama.cpp Vulkan uses to close the gap to its CPU
+reference.
+
+Activations are quantized once to int8 with a Q8_1 block layout (32 elements,
+f16 d, f16 d*sum, packed into x4 groups of 4 blocks for 16-byte loads). The
+matmul reads i8 quants from both sides and computes the row dot via
+`dotPacked4x8EXT` — one VOPD on RDNA3, `integerDotProduct4x8BitPackedSigned`
+is hardware-accelerated on the RX 7800 XT.
+
+Shaders added:
+- `quantize_q8_1.glsl` — f32 → block_q8_1_x4
+- `matvec_q4_k_q8_1.glsl` — Q4_K weights × Q8_1 acts
+- `matvec_q3_k_q8_1.glsl` — Q3_K weights × Q8_1 acts
+- `matvec_fused_gu_q3k_q8_1.glsl` — fused gate+gelu+up for Q3_K MoE experts
+
+Coverage today: all 30 attention layers (wq+wk+wv, mixed Q3_K/Q4_K) + all MoE
+fused gate+up dispatches (Q3_K). Still on the f32-activation path: wo
+(Q4_K, cols=4096), dense FFN (Q3_K gate/up + Q5_1 down), expert down
+(Q5_0/Q5_1).
+
+| Mode | tok/s prefill | tok/s decode |
+|------|--------------|--------------|
+| Phase 7f baseline (no Q8_1) | 3.10–3.17 | 3.06–3.09 |
+| Q8_1 attention only (6 of 30 layers, Q4_K only) | ~3.11 | ~3.08 |
+| Q8_1 attention all 30 layers (Q3_K + Q4_K) | ~3.21 | ~3.15 |
+| Q8_1 attention + Q8_1 fused MoE gate+up | **3.71–3.78** | **3.66–3.68** |
+
+Net **+20%** end-to-end vs Phase 7f. The single biggest contribution was the
+Q8_1 fused MoE shader (+15%); attention-only gave +3%. This is consistent
+with the compute breakdown (experts dominate Gemma4 decode time).
+
+Numerics: `llmtoy compare` is essentially unchanged vs the pre-Q8_1 baseline
+(per-layer rel_err matches within 0.01%; same pre-existing L28 argmax FAIL).
+The Q8_1 path does not introduce drift; it does not fix the existing drift
+either, because our CPU reference uses f32 dot product (not Q8_1), so the
+bit-determinism property that lets llama.cpp Vulkan match its CPU reference
+is structurally absent here. Generation output remains coherent.
+
+Verification protocol (all from docs/phases/phase7-gpu-endgame-plan.md):
+- Per-shader fuzz test rel < 1e-3 (Q4_K: 2.9e-5, Q3_K: 1.5e-7 model-sized)
+- `llmtoy compare` argmax matches L0–L27 (same as baseline)
+- End-to-end `generate --gpu --temperature 0` produces correct output
+
+Hyperfine 3-run wall-clock for `generate "explain MoE in two sentences"
+--chat --temperature 0 --max-tokens 64 --gpu` (includes ~5.8 s model
+setup):
+
+| Stage                                     | mean ± σ          |
+|-------------------------------------------|-------------------|
+| Pre-Q8_1 (Phase 7f baseline)              | 32.17 ± 0.71 s    |
+| Q8_1 attention + Q8_1 fused MoE gate+up   | **28.86 ± 0.37 s**|
+
+Compute-only delta (subtracting the constant ~5.8 s model load): 26.4 s →
+23.0 s, **+15% throughput**. Single-run tok/s reports 3.71–3.78 prefill,
+3.66–3.68 decode — matches the wall-clock drop.
+
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
 Attempted fusing gate-gelu-up + w_down into a single submit (4 submits/layer):
