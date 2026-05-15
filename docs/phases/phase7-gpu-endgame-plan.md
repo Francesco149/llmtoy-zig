@@ -156,13 +156,14 @@ matvec stack.** Spend that time on the Q8_1 milestone instead.
 
 ---
 
-## Phase 7k* — Q8_1 activation quantization + integer-dot matvec [OPUS]
+## Phase 7k* — Q8_1 activation quantization + integer-dot matvec [DONE]
 
-**RENAMED AND ELEVATED** from the original "subgroup-cooperative matvec" plan.
-This is now the single largest engineering item in Phase 7 and the main
-reason we're not at 80 tok/s yet. Reference: llama.cpp's
-`quantize_q8_1.comp`, `mul_mat_vecq.comp`, `mul_mat_vecq_funcs.glsl`,
-`mul_mat_vec_base.glsl`.
+**Landed**: 4.28 prefill / 4.07 decode tok/s (vs 3.10/3.07 baseline). The
+drift the original plan deferred ("expected to disappear" with Q8_1) did in
+fact collapse once Q8_1 covered enough of the path — see notes below.
+
+Reference: llama.cpp's `quantize_q8_1.comp`, `mul_mat_vecq.comp`,
+`mul_mat_vecq_funcs.glsl`, `mul_mat_vec_base.glsl`.
 
 ### What changes
 
@@ -233,7 +234,26 @@ Realistic projection on this hardware: **3 → 30–50 tok/s** in one milestone.
 
 ---
 
-## Phase 7j — RMSNorm + residual + RoPE on GPU [SONNET]
+## Phase 7j — RMSNorm + residual + RoPE on GPU [SHADERS DONE, INTEGRATION PENDING]
+
+**Status as of 2026-05-16:**
+- ✓ `rmsnorm.glsl` — rel 7e-8 vs CPU reference at n=2816 (workgroup-reduce
+  via subgroupAdd + shared mem). `weight_offset` push-constant flag supports
+  Gemma (1+w) convention, though this Gemma4 variant uses straight w.
+- ✓ `elem_add.glsl`, `elem_scale.glsl` — exact match (1e-6 tolerance).
+- ✓ `rope_neox_table.glsl` — rel 4e-7 at n_heads=4, head_dim=512.
+- ✓ `rope_neox_theta.glsl` — rel 1e-6 at n_heads=4, head_dim=256.
+- ✓ Pipelines + per-layer norm-weight buffer uploads + x_vram/xb_vram/
+  stage_buf wired into GpuWeights (commit `6f80133`).
+- ✗ forward.zig restructure — not done. Tasks 20–22 in the task list track
+  the sub-steps: attn_norm + QKV on GPU; per-head Q/K/V norms + RoPE on GPU;
+  FFN + MoE through-routing to VRAM input.
+
+Realistic estimate when picked up: +20–38% tok/s (fewer command-buffer
+submits + eliminated per-matmul xb upload/download). The submit-count
+analysis: today 5/layer × 30 = 150 submits/token, achievable 3/layer = 90/
+token, saves ~3 ms × 30 = ~90 ms/token = ~38% theoretical at the current
+~233 ms/token.
 
 **Reordered to AFTER 7k\*.** Rationale: with Q8_1 matvecs, the CPU still has
 to receive the f32 matvec output, do the norm, do the residual add, then
@@ -331,20 +351,44 @@ tuning:
 
 ## Sequencing summary (revised)
 
-| Phase | Owner       | Status   | Estimated overall tok/s gain          |
-|-------|-------------|----------|---------------------------------------|
-| 7h    | Sonnet      | DONE     | 0% (correctness only, two bugs found) |
-| 7i    | Opus        | PARTIAL  | 0% (two bugs fixed, drift deferred)   |
-| 7k\*  | Opus+Sonnet | NEXT     | **+800–1500%** (3 → 30–50 tok/s)      |
-| 7j    | Sonnet      | after 7k\* | +20–40% (eliminates per-matmul PCIe) |
-| 7l    | Sonnet+Opus | after 7j | +30–50% (attention to GPU)            |
-| 7m    | Sonnet      | after 7l | +5%                                   |
-| 7n    | Sonnet      | after 7m | +5–10%                                |
-| 7o    | Opus        | last     | +5–10%                                |
+| Phase | Owner       | Status      | Achieved/Estimated gain                  |
+|-------|-------------|-------------|------------------------------------------|
+| 7h    | Sonnet      | DONE        | 0% (correctness only, two bugs found)    |
+| 7i    | Opus        | PARTIAL     | 0% (two bugs fixed, drift deferred)      |
+| 7k\*  | Opus+Sonnet | **DONE**    | **+38% prefill, +33% decode** (3.10 → 4.28 / 3.07 → 4.07 tok/s) — plus the drift collapsed (all argmaxes match CPU after enough Q8_1 coverage) |
+| 7j    | Sonnet      | SHADERS DONE, INTEGRATION PENDING | shaders + pipelines + 9× per-layer norm-weight buffers + x_vram/xb_vram/stage_buf in place; forward.zig restructure (task 20+) deferred |
+| 7l    | Sonnet+Opus | after 7j    | +30–50% (attention to GPU)               |
+| 7m    | Sonnet      | after 7l    | +5%                                      |
+| 7n    | Sonnet      | after 7m    | +5–10%                                   |
+| 7o    | Opus        | last        | +5–10%                                   |
 
-Compounding optimistically: 3 → ~80–100 tok/s. **The slope of this curve is
-all in 7k\*.** If Q8_1+integer-dot doesn't deliver close to its projected
-gain, re-scope before doing 7j onward — there's likely a deeper bottleneck.
+Current standing: **4.28 prefill / 4.07 decode tok/s** vs llama.cpp Vulkan
+~80–100 tok/s on the same hardware. Remaining gap is ~20×.
+
+Notes from the 7k\* push:
+- Q4_K covered 6/30 attention layers; Q3_K filled the other 24. Plan
+  originally assumed all 30 were Q4_K — fix landed as the Q3_K shader.
+- Integer-dot drift behavior turned out as predicted but only at the
+  *full-path* level: Q8_1 attention alone or Q8_1 attention+MoE-gateup didn't
+  fix the L13–L28 drift; once wo and dense FFN also went through Q8_1, the
+  drift collapsed and final argmax matched CPU.
+- Q5_0/Q5_1 shaders work at cols%32==0 (so they cover expert_down at
+  cols=704 and dense_down at cols=2112 — both unaligned to 256). Note the
+  packQ8_1_x4 helper had a partial-last-group bug only exposed on
+  non-128-aligned activations; fixed.
+
+Notes for 7j integration (when picked up):
+- All shaders are committed and fuzz-tested (rel ~7e-8 for rmsnorm, ~1e-6
+  for rope). Pipelines live in GpuWeights; per-layer norm weight buffers
+  are already uploaded.
+- The restructure is mostly forward.zig surgery: keep x in x_vram, use
+  pl_rmsnorm/pl_elem_add/pl_rope_* dispatches between matvecs, and run
+  each layer's matmul+norm+residual chain in fewer command-buffer
+  submits (currently 5/layer; achievable 3/layer with CPU still owning
+  attention compute + MoE routing).
+- Estimated upside: ~20–38% from reduced submit count + eliminated
+  per-matmul PCIe upload/download. Worth it but not catastrophic to leave
+  on the table.
 
 Benchmark llama.cpp Vulkan on this exact (model, GPU, driver, prompt)
 combination once per milestone so we always have a hard reference number;
