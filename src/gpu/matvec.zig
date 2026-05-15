@@ -980,6 +980,513 @@ pub fn q8_1OutBytes(ncols: u32) u32 {
     return ((ncols + 127) / 128) * @as(u32, dq.Q8_1_X4_BYTES);
 }
 
+// ── RmsnormPipeline ───────────────────────────────────────────────────────────
+//
+// Per-row RMS normalization: y[i] = x[i] * rms_inv * (bias + w[i])
+// where rms_inv = 1 / sqrt(Σ x²/n + eps) and bias is either 0 or 1 to handle
+// the Gemma (1+w) weight convention via a flag.
+//
+// Bindings: 0=x_in (f32), 1=w (f32), 2=y_out (f32). One workgroup per call,
+// 256 threads. Push constant: { u32 n; f32 eps; u32 weight_offset; }.
+
+const RmsnormPushConst = extern struct {
+    n: u32,
+    eps: f32,
+    weight_offset: u32,
+};
+
+pub const RmsnormPipeline = struct {
+    pipeline:    vk.VkPipeline,
+    layout:      vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool:   vk.VkDescriptorPool,
+    device:      vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !RmsnormPipeline {
+        comptime std.debug.assert(shaders.rmsnorm.len % 4 == 0);
+        const dev = ctx.device;
+
+        const bindings = [3]vk.VkDescriptorSetLayoutBinding{
+            mkStorageBuf(0), mkStorageBuf(1), mkStorageBuf(2),
+        };
+        const dsl_ci = vk.VkDescriptorSetLayoutCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = null, .flags = 0,
+            .bindingCount = bindings.len, .pBindings = &bindings,
+        };
+        var dset_layout: vk.VkDescriptorSetLayout = null;
+        if (vk.vkCreateDescriptorSetLayout(dev, &dsl_ci, null, &dset_layout) != vk.VK_SUCCESS)
+            return error.VkDescSetLayoutFailed;
+        errdefer vk.vkDestroyDescriptorSetLayout(dev, dset_layout, null);
+
+        const pc_range = vk.VkPushConstantRange{
+            .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0, .size = @sizeOf(RmsnormPushConst),
+        };
+        const layout_ci = vk.VkPipelineLayoutCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = null, .flags = 0,
+            .setLayoutCount = 1, .pSetLayouts = &dset_layout,
+            .pushConstantRangeCount = 1, .pPushConstantRanges = &pc_range,
+        };
+        var layout: vk.VkPipelineLayout = null;
+        if (vk.vkCreatePipelineLayout(dev, &layout_ci, null, &layout) != vk.VK_SUCCESS)
+            return error.VkPipelineLayoutFailed;
+        errdefer vk.vkDestroyPipelineLayout(dev, layout, null);
+
+        const spv = &shaders.rmsnorm;
+        const shader_ci = vk.VkShaderModuleCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .pNext = null, .flags = 0, .codeSize = spv.len, .pCode = @ptrCast(spv),
+        };
+        var shader_mod: vk.VkShaderModule = null;
+        if (vk.vkCreateShaderModule(dev, &shader_ci, null, &shader_mod) != vk.VK_SUCCESS)
+            return error.VkShaderModuleFailed;
+        defer vk.vkDestroyShaderModule(dev, shader_mod, null);
+
+        const stage = vk.VkPipelineShaderStageCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = null, .flags = 0,
+            .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = shader_mod, .pName = "main", .pSpecializationInfo = null,
+        };
+        const pipeline_ci = vk.VkComputePipelineCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .pNext = null, .flags = 0, .stage = stage, .layout = layout,
+            .basePipelineHandle = null, .basePipelineIndex = -1,
+        };
+        var pipeline: vk.VkPipeline = null;
+        if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
+            return error.VkComputePipelineFailed;
+        errdefer vk.vkDestroyPipeline(dev, pipeline, null);
+
+        const pool_size = vk.VkDescriptorPoolSize{
+            .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 3 * 32,
+        };
+        const pool_ci = vk.VkDescriptorPoolCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = null,
+            .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+            .maxSets = 32, .poolSizeCount = 1, .pPoolSizes = &pool_size,
+        };
+        var desc_pool: vk.VkDescriptorPool = null;
+        if (vk.vkCreateDescriptorPool(dev, &pool_ci, null, &desc_pool) != vk.VK_SUCCESS)
+            return error.VkDescriptorPoolFailed;
+
+        return .{
+            .pipeline = pipeline, .layout = layout,
+            .dset_layout = dset_layout, .desc_pool = desc_pool, .device = dev,
+        };
+    }
+
+    pub fn record(
+        self: *const RmsnormPipeline,
+        cmd: vk.VkCommandBuffer,
+        x_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+        y_buf: *const GpuBuffer,
+        n: u32,
+        eps: f32,
+        weight_offset: bool,
+    ) !vk.VkDescriptorSet {
+        std.debug.assert(n % 256 == 0);
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null, .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [3]vk.VkDescriptorBufferInfo{
+            .{ .buffer = x_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = w_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = y_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [3]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+            mkWrite(dset, 2, &buf_infos[2]),
+        };
+        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            self.layout, 0, 1, &dset, 0, null);
+
+        const pc = RmsnormPushConst{
+            .n = n, .eps = eps,
+            .weight_offset = if (weight_offset) 1 else 0,
+        };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            0, @sizeOf(RmsnormPushConst), &pc);
+        vk.vkCmdDispatch(cmd, 1, 1, 1);
+
+        return dset;
+    }
+
+    pub fn deinit(self: *RmsnormPipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
+// ── ElemAddPipeline ───────────────────────────────────────────────────────────
+//
+// In-place elementwise add: a[i] += b[i]. 2 bindings (a read-write, b read-only),
+// push constant carries the length. One thread per element.
+
+const ElemPushConst = extern struct { n: u32 };
+const ElemScalePushConst = extern struct { n: u32, s: f32 };
+
+fn buildSimplePipeline(
+    ctx: *const GpuContext,
+    spv: anytype,
+    n_bindings: u32,
+    pc_size: u32,
+    max_sets: u32,
+) !struct {
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool: vk.VkDescriptorPool,
+} {
+    const dev = ctx.device;
+
+    // Variable-size descriptor binding list (max 4 for our shaders).
+    std.debug.assert(n_bindings >= 1 and n_bindings <= 4);
+    var bindings_buf: [4]vk.VkDescriptorSetLayoutBinding = undefined;
+    var b: u32 = 0;
+    while (b < n_bindings) : (b += 1) bindings_buf[b] = mkStorageBuf(b);
+    const dsl_ci = vk.VkDescriptorSetLayoutCreateInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .pNext = null, .flags = 0,
+        .bindingCount = n_bindings, .pBindings = &bindings_buf,
+    };
+    var dset_layout: vk.VkDescriptorSetLayout = null;
+    if (vk.vkCreateDescriptorSetLayout(dev, &dsl_ci, null, &dset_layout) != vk.VK_SUCCESS)
+        return error.VkDescSetLayoutFailed;
+    errdefer vk.vkDestroyDescriptorSetLayout(dev, dset_layout, null);
+
+    const pc_range = vk.VkPushConstantRange{
+        .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = pc_size,
+    };
+    const layout_ci = vk.VkPipelineLayoutCreateInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pNext = null, .flags = 0,
+        .setLayoutCount = 1, .pSetLayouts = &dset_layout,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &pc_range,
+    };
+    var layout: vk.VkPipelineLayout = null;
+    if (vk.vkCreatePipelineLayout(dev, &layout_ci, null, &layout) != vk.VK_SUCCESS)
+        return error.VkPipelineLayoutFailed;
+    errdefer vk.vkDestroyPipelineLayout(dev, layout, null);
+
+    const shader_ci = vk.VkShaderModuleCreateInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .pNext = null, .flags = 0, .codeSize = spv.len, .pCode = @ptrCast(spv),
+    };
+    var shader_mod: vk.VkShaderModule = null;
+    if (vk.vkCreateShaderModule(dev, &shader_ci, null, &shader_mod) != vk.VK_SUCCESS)
+        return error.VkShaderModuleFailed;
+    defer vk.vkDestroyShaderModule(dev, shader_mod, null);
+
+    const stage = vk.VkPipelineShaderStageCreateInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .pNext = null, .flags = 0, .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = shader_mod, .pName = "main", .pSpecializationInfo = null,
+    };
+    const pipeline_ci = vk.VkComputePipelineCreateInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .pNext = null, .flags = 0, .stage = stage, .layout = layout,
+        .basePipelineHandle = null, .basePipelineIndex = -1,
+    };
+    var pipeline: vk.VkPipeline = null;
+    if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
+        return error.VkComputePipelineFailed;
+    errdefer vk.vkDestroyPipeline(dev, pipeline, null);
+
+    const pool_size = vk.VkDescriptorPoolSize{
+        .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = n_bindings * max_sets,
+    };
+    const pool_ci = vk.VkDescriptorPoolCreateInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .pNext = null,
+        .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+        .maxSets = max_sets, .poolSizeCount = 1, .pPoolSizes = &pool_size,
+    };
+    var desc_pool: vk.VkDescriptorPool = null;
+    if (vk.vkCreateDescriptorPool(dev, &pool_ci, null, &desc_pool) != vk.VK_SUCCESS)
+        return error.VkDescriptorPoolFailed;
+
+    return .{
+        .pipeline = pipeline, .layout = layout,
+        .dset_layout = dset_layout, .desc_pool = desc_pool,
+    };
+}
+
+pub const ElemAddPipeline = struct {
+    pipeline:    vk.VkPipeline,
+    layout:      vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool:   vk.VkDescriptorPool,
+    device:      vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !ElemAddPipeline {
+        comptime std.debug.assert(shaders.elem_add.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.elem_add, 2, @sizeOf(ElemPushConst), 32);
+        return .{
+            .pipeline = built.pipeline, .layout = built.layout,
+            .dset_layout = built.dset_layout, .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn record(
+        self: *const ElemAddPipeline,
+        cmd: vk.VkCommandBuffer,
+        a_buf: *const GpuBuffer,
+        b_buf: *const GpuBuffer,
+        n: u32,
+    ) !vk.VkDescriptorSet {
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null, .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [2]vk.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = b_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [2]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+        };
+        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            self.layout, 0, 1, &dset, 0, null);
+        const pc = ElemPushConst{ .n = n };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            0, @sizeOf(ElemPushConst), &pc);
+        const groups = (n + 255) / 256;
+        vk.vkCmdDispatch(cmd, groups, 1, 1);
+        return dset;
+    }
+
+    pub fn deinit(self: *ElemAddPipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
+pub const ElemScalePipeline = struct {
+    pipeline:    vk.VkPipeline,
+    layout:      vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool:   vk.VkDescriptorPool,
+    device:      vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !ElemScalePipeline {
+        comptime std.debug.assert(shaders.elem_scale.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.elem_scale, 1, @sizeOf(ElemScalePushConst), 32);
+        return .{
+            .pipeline = built.pipeline, .layout = built.layout,
+            .dset_layout = built.dset_layout, .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn record(
+        self: *const ElemScalePipeline,
+        cmd: vk.VkCommandBuffer,
+        x_buf: *const GpuBuffer,
+        n: u32,
+        s: f32,
+    ) !vk.VkDescriptorSet {
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null, .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_info = vk.VkDescriptorBufferInfo{
+            .buffer = x_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE,
+        };
+        const write = mkWrite(dset, 0, &buf_info);
+        vk.vkUpdateDescriptorSets(dev, 1, &write, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            self.layout, 0, 1, &dset, 0, null);
+        const pc = ElemScalePushConst{ .n = n, .s = s };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            0, @sizeOf(ElemScalePushConst), &pc);
+        const groups = (n + 255) / 256;
+        vk.vkCmdDispatch(cmd, groups, 1, 1);
+        return dset;
+    }
+
+    pub fn deinit(self: *ElemScalePipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
+// ── RopeNeox pipelines ────────────────────────────────────────────────────────
+//
+// Two variants: `Table` reads a precomputed inverse-frequency table (Gemma4
+// global layers, freqs from rope_freqs.weight); `Theta` computes freqs from
+// a single theta base (Gemma4 SWA layers, theta = rope_theta_swa).
+//
+// One workgroup per head; the Zig wrapper dispatches `n_heads` workgroups.
+
+const RopeTablePushConst = extern struct { pos: u32, head_dim: u32 };
+const RopeThetaPushConst = extern struct { pos: u32, head_dim: u32, theta: f32 };
+
+pub const RopeNeoxTablePipeline = struct {
+    pipeline:    vk.VkPipeline,
+    layout:      vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool:   vk.VkDescriptorPool,
+    device:      vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !RopeNeoxTablePipeline {
+        comptime std.debug.assert(shaders.rope_neox_table.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.rope_neox_table, 2, @sizeOf(RopeTablePushConst), 64);
+        return .{
+            .pipeline = built.pipeline, .layout = built.layout,
+            .dset_layout = built.dset_layout, .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn record(
+        self: *const RopeNeoxTablePipeline,
+        cmd: vk.VkCommandBuffer,
+        vec_buf: *const GpuBuffer,
+        freqs_buf: *const GpuBuffer,
+        pos: u32,
+        head_dim: u32,
+        n_heads: u32,
+    ) !vk.VkDescriptorSet {
+        std.debug.assert(head_dim <= 512); // local_size_x is 256, half ≤ 256
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null, .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+        const buf_infos = [2]vk.VkDescriptorBufferInfo{
+            .{ .buffer = vec_buf.handle,   .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = freqs_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [2]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+        };
+        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            self.layout, 0, 1, &dset, 0, null);
+        const pc = RopeTablePushConst{ .pos = pos, .head_dim = head_dim };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            0, @sizeOf(RopeTablePushConst), &pc);
+        vk.vkCmdDispatch(cmd, n_heads, 1, 1);
+        return dset;
+    }
+
+    pub fn deinit(self: *RopeNeoxTablePipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
+pub const RopeNeoxThetaPipeline = struct {
+    pipeline:    vk.VkPipeline,
+    layout:      vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool:   vk.VkDescriptorPool,
+    device:      vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !RopeNeoxThetaPipeline {
+        comptime std.debug.assert(shaders.rope_neox_theta.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.rope_neox_theta, 1, @sizeOf(RopeThetaPushConst), 64);
+        return .{
+            .pipeline = built.pipeline, .layout = built.layout,
+            .dset_layout = built.dset_layout, .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn record(
+        self: *const RopeNeoxThetaPipeline,
+        cmd: vk.VkCommandBuffer,
+        vec_buf: *const GpuBuffer,
+        pos: u32,
+        head_dim: u32,
+        theta: f32,
+        n_heads: u32,
+    ) !vk.VkDescriptorSet {
+        std.debug.assert(head_dim <= 512);
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null, .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+        const buf_info = vk.VkDescriptorBufferInfo{
+            .buffer = vec_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE,
+        };
+        const write = mkWrite(dset, 0, &buf_info);
+        vk.vkUpdateDescriptorSets(dev, 1, &write, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            self.layout, 0, 1, &dset, 0, null);
+        const pc = RopeThetaPushConst{ .pos = pos, .head_dim = head_dim, .theta = theta };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            0, @sizeOf(RopeThetaPushConst), &pc);
+        vk.vkCmdDispatch(cmd, n_heads, 1, 1);
+        return dset;
+    }
+
+    pub fn deinit(self: *RopeNeoxThetaPipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
 // ── convenience functions ─────────────────────────────────────────────────────
 
 // One-shot fp32 matvec: upload matrix to VRAM, run, download result.
@@ -2047,5 +2554,275 @@ test "gpu matvec Q5_1 × Q8_1 fuzz small" {
 test "gpu matvec Q5_1 × Q8_1 fuzz model-sized" {
     try fuzzQuantQ8_1(.q5_1, 24, 32,
         MatvecPipeline.initQ5_1Q8_1, MatvecSession.initQ5_1, 64, 704, 53);
+}
+
+// ── rmsnorm fuzz test ─────────────────────────────────────────────────────────
+fn runRmsnormShader(
+    gpu: *const GpuContext,
+    x: []const f32,
+    w: []const f32,
+    eps: f32,
+    weight_offset: bool,
+    out: []f32,
+) !void {
+    var pl = try RmsnormPipeline.init(gpu);
+    defer pl.deinit();
+
+    var x_buf = try GpuBuffer.initHostCoherent(gpu, x.len * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer x_buf.deinit();
+    try x_buf.upload(std.mem.sliceAsBytes(x));
+
+    var w_buf = try GpuBuffer.initHostCoherent(gpu, w.len * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer w_buf.deinit();
+    try w_buf.upload(std.mem.sliceAsBytes(w));
+
+    var y_buf = try GpuBuffer.initHostCoherent(gpu, out.len * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer y_buf.deinit();
+
+    const cmd = try gpu.beginBatch();
+    _ = try pl.record(cmd, &x_buf, &w_buf, &y_buf, @intCast(x.len), eps, weight_offset);
+    try gpu.submitBatch(cmd);
+    try y_buf.download(std.mem.sliceAsBytes(out));
+}
+
+fn fuzzRmsnorm(n: usize, seed: u64, weight_offset: bool) !void {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    const al = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+
+    const x = try al.alloc(f32, n);    defer al.free(x);
+    const w = try al.alloc(f32, n);    defer al.free(w);
+    const cpu_out = try al.alloc(f32, n); defer al.free(cpu_out);
+    const gpu_out = try al.alloc(f32, n); defer al.free(gpu_out);
+
+    for (x) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
+    for (w) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+
+    // CPU reference: y = x * rms_inv * (bias + w)
+    var ss: f32 = 0.0;
+    for (x) |v| ss += v * v;
+    const eps: f32 = 1e-6;
+    const rms_inv: f32 = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(n)) + eps);
+    const bias: f32 = if (weight_offset) 1.0 else 0.0;
+    for (cpu_out, x, w) |*o, xi, wi| o.* = xi * rms_inv * (bias + wi);
+
+    try runRmsnormShader(&gpu, x, w, eps, weight_offset, gpu_out);
+
+    var max_abs: f32 = 0.0;
+    var max_ref: f32 = 0.0;
+    for (cpu_out, gpu_out) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs) max_abs = d;
+        if (@abs(c) > max_ref) max_ref = @abs(c);
+    }
+    const rel = max_abs / (max_ref + 1e-6);
+    std.debug.print("rmsnorm fuzz n={} bias={} max|D|={d:.6} rel={e:.3}\n",
+        .{ n, weight_offset, max_abs, rel });
+    try std.testing.expect(rel < 1e-5);
+}
+
+test "gpu rmsnorm n=512 fuzz" {
+    try fuzzRmsnorm(512, 71, false);  // head_dim_global
+}
+test "gpu rmsnorm n=2816 fuzz" {
+    try fuzzRmsnorm(2816, 73, false); // d_model
+}
+test "gpu rmsnorm n=2816 fuzz with (1+w) convention" {
+    try fuzzRmsnorm(2816, 79, true);  // exercise the weight_offset path
+}
+
+test "gpu elem_add fuzz" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    const al = std.testing.allocator;
+    const n: usize = 2816;
+    const a = try al.alloc(f32, n); defer al.free(a);
+    const b = try al.alloc(f32, n); defer al.free(b);
+    const expected = try al.alloc(f32, n); defer al.free(expected);
+    var prng = std.Random.DefaultPrng.init(81);
+    const r = prng.random();
+    for (a, b, expected) |*ai, *bi, *ei| {
+        ai.* = (r.float(f32) - 0.5) * 10.0;
+        bi.* = (r.float(f32) - 0.5) * 10.0;
+        ei.* = ai.* + bi.*;
+    }
+
+    var pl = try ElemAddPipeline.init(&gpu);
+    defer pl.deinit();
+    var a_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer a_buf.deinit();
+    var b_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer b_buf.deinit();
+    try a_buf.upload(std.mem.sliceAsBytes(a));
+    try b_buf.upload(std.mem.sliceAsBytes(b));
+
+    const cmd = try gpu.beginBatch();
+    _ = try pl.record(cmd, &a_buf, &b_buf, @intCast(n));
+    try gpu.submitBatch(cmd);
+
+    const got = try al.alloc(f32, n); defer al.free(got);
+    try a_buf.download(std.mem.sliceAsBytes(got));
+    for (got, expected) |g, e| try std.testing.expectApproxEqAbs(e, g, 1e-6);
+}
+
+test "gpu rope_neox_theta fuzz" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    const rope_mod = @import("../ops/rope.zig");
+    const al = std.testing.allocator;
+
+    const n_heads: usize = 4;
+    const head_dim: usize = 256;
+    const pos: usize = 13;
+    const theta: f32 = 10000.0;
+    const total = n_heads * head_dim;
+
+    const vec = try al.alloc(f32, total); defer al.free(vec);
+    const cpu_out = try al.alloc(f32, total); defer al.free(cpu_out);
+    var prng = std.Random.DefaultPrng.init(91);
+    const r = prng.random();
+    for (vec) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
+    @memcpy(cpu_out, vec);
+    for (0..n_heads) |h|
+        rope_mod.applyRopeNeox(cpu_out[h * head_dim ..][0..head_dim], pos, theta);
+
+    var pl = try RopeNeoxThetaPipeline.init(&gpu);
+    defer pl.deinit();
+    var vec_buf = try GpuBuffer.initHostCoherent(&gpu, total * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer vec_buf.deinit();
+    try vec_buf.upload(std.mem.sliceAsBytes(vec));
+    const cmd = try gpu.beginBatch();
+    _ = try pl.record(cmd, &vec_buf, @intCast(pos), @intCast(head_dim), theta, @intCast(n_heads));
+    try gpu.submitBatch(cmd);
+
+    const gpu_out = try al.alloc(f32, total); defer al.free(gpu_out);
+    try vec_buf.download(std.mem.sliceAsBytes(gpu_out));
+    var max_abs: f32 = 0.0;
+    var max_ref: f32 = 0.0;
+    for (cpu_out, gpu_out) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs) max_abs = d;
+        if (@abs(c) > max_ref) max_ref = @abs(c);
+    }
+    const rel = max_abs / (max_ref + 1e-6);
+    std.debug.print("rope_neox_theta fuzz n_heads={} hd={} pos={} max|D|={d:.6} rel={e:.3}\n",
+        .{ n_heads, head_dim, pos, max_abs, rel });
+    try std.testing.expect(rel < 1e-5);
+}
+
+test "gpu rope_neox_table fuzz" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    const rope_mod = @import("../ops/rope.zig");
+    const al = std.testing.allocator;
+
+    const n_heads: usize = 4;
+    const head_dim: usize = 512;
+    const pos: usize = 7;
+    const total = n_heads * head_dim;
+
+    const vec = try al.alloc(f32, total); defer al.free(vec);
+    const cpu_out = try al.alloc(f32, total); defer al.free(cpu_out);
+    const freqs = try al.alloc(f32, head_dim / 2); defer al.free(freqs);
+    var prng = std.Random.DefaultPrng.init(97);
+    const r = prng.random();
+    for (vec) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
+    // Generate plausible inverse-frequency values (≈ 1/theta^(2i/dim) shape).
+    for (freqs, 0..) |*f, i|
+        f.* = 1.0 / std.math.pow(f32, 10000.0,
+            @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(head_dim)));
+
+    @memcpy(cpu_out, vec);
+    for (0..n_heads) |h|
+        rope_mod.applyRopeFreqsNeox(cpu_out[h * head_dim ..][0..head_dim], freqs, pos);
+
+    var pl = try RopeNeoxTablePipeline.init(&gpu);
+    defer pl.deinit();
+    var vec_buf = try GpuBuffer.initHostCoherent(&gpu, total * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer vec_buf.deinit();
+    try vec_buf.upload(std.mem.sliceAsBytes(vec));
+    var freqs_buf = try GpuBuffer.initHostCoherent(&gpu, freqs.len * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer freqs_buf.deinit();
+    try freqs_buf.upload(std.mem.sliceAsBytes(freqs));
+
+    const cmd = try gpu.beginBatch();
+    _ = try pl.record(cmd, &vec_buf, &freqs_buf, @intCast(pos), @intCast(head_dim), @intCast(n_heads));
+    try gpu.submitBatch(cmd);
+
+    const gpu_out = try al.alloc(f32, total); defer al.free(gpu_out);
+    try vec_buf.download(std.mem.sliceAsBytes(gpu_out));
+    var max_abs: f32 = 0.0;
+    var max_ref: f32 = 0.0;
+    for (cpu_out, gpu_out) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs) max_abs = d;
+        if (@abs(c) > max_ref) max_ref = @abs(c);
+    }
+    const rel = max_abs / (max_ref + 1e-6);
+    std.debug.print("rope_neox_table fuzz n_heads={} hd={} pos={} max|D|={d:.6} rel={e:.3}\n",
+        .{ n_heads, head_dim, pos, max_abs, rel });
+    try std.testing.expect(rel < 1e-5);
+}
+
+test "gpu elem_scale fuzz" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    const al = std.testing.allocator;
+    const n: usize = 2816;
+    const x = try al.alloc(f32, n); defer al.free(x);
+    const s: f32 = 1.4142136; // sqrt(2)
+    var prng = std.Random.DefaultPrng.init(83);
+    const r = prng.random();
+    for (x) |*xi| xi.* = (r.float(f32) - 0.5) * 10.0;
+
+    var pl = try ElemScalePipeline.init(&gpu);
+    defer pl.deinit();
+    var x_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer x_buf.deinit();
+    try x_buf.upload(std.mem.sliceAsBytes(x));
+
+    const cmd = try gpu.beginBatch();
+    _ = try pl.record(cmd, &x_buf, @intCast(n), s);
+    try gpu.submitBatch(cmd);
+
+    const got = try al.alloc(f32, n); defer al.free(got);
+    try x_buf.download(std.mem.sliceAsBytes(got));
+    for (got, x) |g, xi| try std.testing.expectApproxEqAbs(xi * s, g, 1e-6);
 }
 

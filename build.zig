@@ -39,6 +39,16 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(matvec_q5_0_q8_1_spv, "matvec_q5_0_q8_1.spv");
     const matvec_q5_1_q8_1_spv = compileShader(b, "src/gpu/shaders/matvec_q5_1_q8_1.glsl");
     _ = wf.addCopyFile(matvec_q5_1_q8_1_spv, "matvec_q5_1_q8_1.spv");
+    const rmsnorm_spv = compileShader(b, "src/gpu/shaders/rmsnorm.glsl");
+    _ = wf.addCopyFile(rmsnorm_spv, "rmsnorm.spv");
+    const elem_add_spv = compileShader(b, "src/gpu/shaders/elem_add.glsl");
+    _ = wf.addCopyFile(elem_add_spv, "elem_add.spv");
+    const elem_scale_spv = compileShader(b, "src/gpu/shaders/elem_scale.glsl");
+    _ = wf.addCopyFile(elem_scale_spv, "elem_scale.spv");
+    const rope_table_spv = compileShader(b, "src/gpu/shaders/rope_neox_table.glsl");
+    _ = wf.addCopyFile(rope_table_spv, "rope_neox_table.spv");
+    const rope_theta_spv = compileShader(b, "src/gpu/shaders/rope_neox_theta.glsl");
+    _ = wf.addCopyFile(rope_theta_spv, "rope_neox_theta.spv");
     // align(4): VkShaderModuleCreateInfo.pCode requires 4-byte aligned SPIR-V data.
     // Declaring the embedded file with align(4) makes &matvec_f32 satisfy that
     // requirement without a runtime allocation or copy.
@@ -57,6 +67,11 @@ pub fn build(b: *std.Build) void {
         \\pub const matvec_fused_gu_q3k_q8_1 align(4) = @embedFile("matvec_fused_gu_q3k_q8_1.spv").*;
         \\pub const matvec_q5_0_q8_1    align(4) = @embedFile("matvec_q5_0_q8_1.spv").*;
         \\pub const matvec_q5_1_q8_1    align(4) = @embedFile("matvec_q5_1_q8_1.spv").*;
+        \\pub const rmsnorm             align(4) = @embedFile("rmsnorm.spv").*;
+        \\pub const elem_add            align(4) = @embedFile("elem_add.spv").*;
+        \\pub const elem_scale          align(4) = @embedFile("elem_scale.spv").*;
+        \\pub const rope_neox_table     align(4) = @embedFile("rope_neox_table.spv").*;
+        \\pub const rope_neox_theta     align(4) = @embedFile("rope_neox_theta.spv").*;
     );
     const shaders_mod = b.createModule(.{ .root_source_file = shaders_src });
 
