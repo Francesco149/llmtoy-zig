@@ -60,10 +60,14 @@ Completed steps (Qwen2.5-0.5B Q4_K_M, Ryzen 3600):
 - [x] fp32 matvec compute shader compiled from GLSL → SPIR-V at build time
 - [x] `llmtoy gpu-info` command: device name + correctness smoke test
 - [x] GPU matvec unit test in `zig build test`
-- [ ] Device-local buffers with staging for upload/download (faster PCIe)
-- [ ] Quantized matvec shaders (Q8×fp32, Q4_K×fp32) for Gemma4 APEX quant types
-- [ ] Wire GPU matvec into Gemma4 forward pass as optional backend
-- [ ] Benchmark GPU vs CPU on Gemma4 APEX I Mini
+- [x] Device-local buffers with staging for upload/download
+- [x] Q3_K / Q4_K / Q5_0 / Q5_1 / Q8_0 matvec shaders for Gemma4 APEX
+- [x] Gemma4 GPU path with batched MoE expert dispatch (Phase 7a–7f)
+- [x] Benchmark GPU vs CPU on Gemma4 APEX I Mini (`docs/benchmarks/phase7_gpu.md`)
+- [ ] **Endgame plan: `docs/phases/phase7-gpu-endgame-plan.md`** (match/beat llama.cpp)
+  - Phase 7h: CPU↔GPU logit-equality harness (blocks all further work)
+  - Phase 7i: fix correctness regression surfaced by 7h
+  - Phase 7j–7o: norm/residual/RoPE/attention to GPU, subgroup matvec, single-submit per layer
 
 ## Phase 8 — Multimodal (stretch)
 - SigLIP vision encoder (Gemma4 integration)
