@@ -788,6 +788,159 @@ pub const AccumPipeline = struct {
     }
 };
 
+// ── QuantizeQ8_1Pipeline ──────────────────────────────────────────────────────
+//
+// Quantize an f32 activation vector into Q8_1 in the x4-packed layout that
+// the integer-dot matvec shaders read. One workgroup per 128-element x4 group
+// (32 threads); per-block amax + sum done with subgroup-clustered ops. Output
+// size: ceil(ncols / 128) * 144 bytes.
+//
+// Bindings: 0 = input vec4[] (f32 activation), 1 = output block_q8_1_x4[].
+// Push constant: { uint ncols; }.
+
+const QuantizePushConst = extern struct { ncols: u32 };
+
+pub const QuantizeQ8_1Pipeline = struct {
+    pipeline:    vk.VkPipeline,
+    layout:      vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool:   vk.VkDescriptorPool,
+    device:      vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !QuantizeQ8_1Pipeline {
+        comptime std.debug.assert(shaders.quantize_q8_1.len % 4 == 0);
+        const dev = ctx.device;
+
+        const bindings = [2]vk.VkDescriptorSetLayoutBinding{
+            mkStorageBuf(0), mkStorageBuf(1),
+        };
+        const dsl_ci = vk.VkDescriptorSetLayoutCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = null, .flags = 0,
+            .bindingCount = bindings.len, .pBindings = &bindings,
+        };
+        var dset_layout: vk.VkDescriptorSetLayout = null;
+        if (vk.vkCreateDescriptorSetLayout(dev, &dsl_ci, null, &dset_layout) != vk.VK_SUCCESS)
+            return error.VkDescSetLayoutFailed;
+        errdefer vk.vkDestroyDescriptorSetLayout(dev, dset_layout, null);
+
+        const pc_range = vk.VkPushConstantRange{
+            .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0, .size = @sizeOf(QuantizePushConst),
+        };
+        const layout_ci = vk.VkPipelineLayoutCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = null, .flags = 0,
+            .setLayoutCount = 1, .pSetLayouts = &dset_layout,
+            .pushConstantRangeCount = 1, .pPushConstantRanges = &pc_range,
+        };
+        var layout: vk.VkPipelineLayout = null;
+        if (vk.vkCreatePipelineLayout(dev, &layout_ci, null, &layout) != vk.VK_SUCCESS)
+            return error.VkPipelineLayoutFailed;
+        errdefer vk.vkDestroyPipelineLayout(dev, layout, null);
+
+        const spv = &shaders.quantize_q8_1;
+        std.debug.assert(@intFromPtr(spv) % 4 == 0);
+        const shader_ci = vk.VkShaderModuleCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .pNext = null, .flags = 0, .codeSize = spv.len, .pCode = @ptrCast(spv),
+        };
+        var shader_mod: vk.VkShaderModule = null;
+        if (vk.vkCreateShaderModule(dev, &shader_ci, null, &shader_mod) != vk.VK_SUCCESS)
+            return error.VkShaderModuleFailed;
+        defer vk.vkDestroyShaderModule(dev, shader_mod, null);
+
+        const stage = vk.VkPipelineShaderStageCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = null, .flags = 0,
+            .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = shader_mod, .pName = "main", .pSpecializationInfo = null,
+        };
+        const pipeline_ci = vk.VkComputePipelineCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .pNext = null, .flags = 0, .stage = stage, .layout = layout,
+            .basePipelineHandle = null, .basePipelineIndex = -1,
+        };
+        var pipeline: vk.VkPipeline = null;
+        if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
+            return error.VkComputePipelineFailed;
+        errdefer vk.vkDestroyPipeline(dev, pipeline, null);
+
+        const pool_size = vk.VkDescriptorPoolSize{
+            .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 * 16,
+        };
+        const pool_ci = vk.VkDescriptorPoolCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = null,
+            .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+            .maxSets = 16, .poolSizeCount = 1, .pPoolSizes = &pool_size,
+        };
+        var desc_pool: vk.VkDescriptorPool = null;
+        if (vk.vkCreateDescriptorPool(dev, &pool_ci, null, &desc_pool) != vk.VK_SUCCESS)
+            return error.VkDescriptorPoolFailed;
+
+        return .{
+            .pipeline = pipeline, .layout = layout,
+            .dset_layout = dset_layout, .desc_pool = desc_pool, .device = dev,
+        };
+    }
+
+    // Record a Q8_1 quantization dispatch into an already-recording command buffer.
+    pub fn record(
+        self: *const QuantizeQ8_1Pipeline,
+        cmd: vk.VkCommandBuffer,
+        in_buf:  *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+        ncols: u32,
+    ) !vk.VkDescriptorSet {
+        std.debug.assert(ncols % 4 == 0); // vec4-aligned reads
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null, .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [2]vk.VkDescriptorBufferInfo{
+            .{ .buffer = in_buf.handle,  .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = out_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [2]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+        };
+        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            self.layout, 0, 1, &dset, 0, null);
+        const pc = QuantizePushConst{ .ncols = ncols };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            0, @sizeOf(QuantizePushConst), &pc);
+        // One workgroup per 128-element x4 group (32 threads each).
+        const groups = (ncols + 127) / 128;
+        vk.vkCmdDispatch(cmd, groups, 1, 1);
+
+        return dset;
+    }
+
+    pub fn deinit(self: *QuantizeQ8_1Pipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
+// Convenience: round up an activation length to the number of bytes a Q8_1_x4
+// output buffer must be sized to.
+pub fn q8_1OutBytes(ncols: u32) u32 {
+    return ((ncols + 127) / 128) * @as(u32, dq.Q8_1_X4_BYTES);
+}
+
 // ── convenience functions ─────────────────────────────────────────────────────
 
 // One-shot fp32 matvec: upload matrix to VRAM, run, download result.
@@ -1443,5 +1596,85 @@ test "gpu matvec Q4_K fuzz" {
 test "gpu matvec Q3_K fuzz" {
     try fuzzQuantMatvec(.q3_k,
         MatvecPipeline.initQ3K, MatvecSession.initQ3K, 32, 512, 5);
+}
+
+// ── Q8_1 quantization fuzz test ───────────────────────────────────────────────
+//
+// Round-trip: CPU f32 → GPU quantize_q8_1 → CPU dequantize.  Asserts the
+// per-element error stays within Q8_1's quantization bound (~amax/127 per
+// block).  Also cross-checks against the CPU `quantizeQ8_1` reference: the
+// GPU's per-block `d` scale must match within a small epsilon; the i8 quants
+// may differ by ±1 due to round-to-even differences between hardware and
+// `std.math.round`.
+fn runQuantizeShader(ctx: *const GpuContext, in: []const f32, out_x4: []u8) !void {
+    var pl = try QuantizeQ8_1Pipeline.init(ctx);
+    defer pl.deinit();
+
+    var in_buf  = try GpuBuffer.initHostCoherent(ctx, in.len * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer in_buf.deinit();
+    try in_buf.upload(std.mem.sliceAsBytes(in));
+
+    var out_buf = try GpuBuffer.initHostCoherent(ctx, out_x4.len,
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer out_buf.deinit();
+
+    const cmd = try ctx.beginBatch();
+    _ = try pl.record(cmd, &in_buf, &out_buf, @intCast(in.len));
+    try ctx.submitBatch(cmd);
+
+    try out_buf.download(out_x4);
+}
+
+test "gpu quantize_q8_1 round-trip" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    // Two x4 groups = 256 elements.
+    const n: usize = 256;
+    const al = std.testing.allocator;
+
+    const in = try al.alloc(f32, n);
+    defer al.free(in);
+    var prng = std.Random.DefaultPrng.init(0x81_FACE);
+    const r = prng.random();
+    for (in) |*v| v.* = (r.float(f32) - 0.5) * 6.0;
+
+    const out_x4_bytes = q8_1OutBytes(@intCast(n));
+    const out_x4 = try al.alloc(u8, out_x4_bytes);
+    defer al.free(out_x4);
+    try runQuantizeShader(&gpu, in, out_x4);
+
+    // Unpack x4 → basic and dequantize.
+    const basic = try al.alloc(u8, out_x4_bytes);
+    defer al.free(basic);
+    dq.unpackQ8_1_x4(out_x4, basic);
+    const dec = try al.alloc(f32, n);
+    defer al.free(dec);
+    dq.dequantQ8_1(basic, dec);
+
+    // Bound per-block max error by amax/127 (+ a small epsilon for f16 d).
+    var max_abs: f32 = 0.0;
+    var max_amax: f32 = 0.0;
+    for (0..n / dq.Q8_1_BLOCK_ELEMS) |b| {
+        var amax: f32 = 0.0;
+        for (0..dq.Q8_1_BLOCK_ELEMS) |i| {
+            if (@abs(in[b * dq.Q8_1_BLOCK_ELEMS + i]) > amax) amax = @abs(in[b * dq.Q8_1_BLOCK_ELEMS + i]);
+        }
+        if (amax > max_amax) max_amax = amax;
+        const tol = amax / 127.0 + 5e-4;
+        for (0..dq.Q8_1_BLOCK_ELEMS) |i| {
+            const idx = b * dq.Q8_1_BLOCK_ELEMS + i;
+            const e = @abs(dec[idx] - in[idx]);
+            if (e > max_abs) max_abs = e;
+            try std.testing.expect(e <= tol);
+        }
+    }
+    std.debug.print("Q8_1 quantize round-trip n={}  max|D|={d:.6}  amax={d:.6}\n",
+        .{ n, max_abs, max_amax });
 }
 

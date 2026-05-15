@@ -27,6 +27,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(matvec_fused_gu_q3k_spv, "matvec_fused_gu_q3k.spv");
     const expert_accum_spv = compileShader(b, "src/gpu/shaders/expert_accum.glsl");
     _ = wf.addCopyFile(expert_accum_spv, "expert_accum.spv");
+    const quantize_q8_1_spv = compileShader(b, "src/gpu/shaders/quantize_q8_1.glsl");
+    _ = wf.addCopyFile(quantize_q8_1_spv, "quantize_q8_1.spv");
     // align(4): VkShaderModuleCreateInfo.pCode requires 4-byte aligned SPIR-V data.
     // Declaring the embedded file with align(4) makes &matvec_f32 satisfy that
     // requirement without a runtime allocation or copy.
@@ -39,6 +41,7 @@ pub fn build(b: *std.Build) void {
         \\pub const matvec_q5_0         align(4) = @embedFile("matvec_q5_0.spv").*;
         \\pub const matvec_fused_gu_q3k align(4) = @embedFile("matvec_fused_gu_q3k.spv").*;
         \\pub const expert_accum        align(4) = @embedFile("expert_accum.spv").*;
+        \\pub const quantize_q8_1       align(4) = @embedFile("quantize_q8_1.spv").*;
     );
     const shaders_mod = b.createModule(.{ .root_source_file = shaders_src });
 
@@ -73,9 +76,13 @@ pub fn build(b: *std.Build) void {
 }
 
 fn compileShader(b: *std.Build, src: []const u8) std.Build.LazyPath {
+    // vulkan1.3 lets shaders use GL_EXT_integer_dot_product,
+    // GL_EXT_shader_explicit_arithmetic_types_int8 / int16 / float16,
+    // and the subgroup-arithmetic / clustered ops needed by the Q8_1 path.
+    // Compatibility note: existing shaders still compile under 1.3.
     const run = b.addSystemCommand(&.{
         "glslc",
-        "--target-env=vulkan1.1",
+        "--target-env=vulkan1.3",
         "-fshader-stage=compute",
     });
     run.addFileArg(b.path(src));

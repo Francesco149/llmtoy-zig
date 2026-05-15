@@ -485,6 +485,127 @@ pub fn dequantQ5_1(data: []const u8, out: []f32) void {
     }
 }
 
+// ── Q8_1 ──────────────────────────────────────────────────────────────────────
+//
+// Block layout (36 bytes for 32 elements):
+//   [0..1]   f16 d  — scale (amax / 127)
+//   [2..3]   f16 s  — d * sum(qs[i])  (used by Q4_1/Q5_1/Q4_K/Q5_K dot product)
+//   [4..35]  i8[32] qs — symmetric int8 quants
+//
+// Dequant (for unit tests): val = d * qs[i]
+//
+// Q8_1 is exclusively used as the *activation* format for integer-dot matmuls.
+// Compared with Q8_0 it carries an extra `s` term so dot products against
+// k-quant weights (which have non-zero biases) can be computed in pure
+// integer arithmetic + a single end-of-block correction.
+//
+// Two memory layouts:
+//   block_q8_1     (basic)        — laid out one block at a time as above
+//   block_q8_1_x4  (4-block pack) — { f16vec2 ds[4]; i32 qs[32] } per 128 elems
+// The x4 layout is what the GPU mul_mat_vecq path expects. `packX4` and
+// `unpackX4` convert between the two; CPU-only callers use the basic format.
+
+pub const Q8_1_BLOCK_ELEMS = 32;
+pub const Q8_1_BLOCK_BYTES = 4 + Q8_1_BLOCK_ELEMS; // 36
+pub const Q8_1_X4_BYTES    = 4 * Q8_1_BLOCK_BYTES;  // 144 per 128 elements
+
+fn f32ToF16Bytes(x: f32) [2]u8 {
+    const h: u16 = @bitCast(@as(f16, @floatCast(x)));
+    return .{ @intCast(h & 0xFF), @intCast(h >> 8) };
+}
+
+pub fn quantizeQ8_1(in: []const f32, out: []u8) void {
+    const n_blocks = in.len / Q8_1_BLOCK_ELEMS;
+    std.debug.assert(out.len >= n_blocks * Q8_1_BLOCK_BYTES);
+    for (0..n_blocks) |b| {
+        const src = in[b * Q8_1_BLOCK_ELEMS ..][0..Q8_1_BLOCK_ELEMS];
+        var amax: f32 = 0.0;
+        for (src) |v| {
+            const a = @abs(v);
+            if (a > amax) amax = a;
+        }
+        const d: f32 = amax / 127.0;
+        // Round-to-nearest-even matches GGML's reference; saturate to [-127, 127].
+        // Use 1/d only when amax > 0 to avoid div-by-zero on all-zero blocks.
+        const inv_d: f32 = if (d != 0.0) 1.0 / d else 0.0;
+        var sum_qs: i32 = 0;
+        const blk = out[b * Q8_1_BLOCK_BYTES ..][0..Q8_1_BLOCK_BYTES];
+        const d_h = f32ToF16Bytes(d);
+        blk[0] = d_h[0];
+        blk[1] = d_h[1];
+        for (0..Q8_1_BLOCK_ELEMS) |i| {
+            const q_f = @round(src[i] * inv_d);
+            const q_i: i32 = @intFromFloat(std.math.clamp(q_f, -127.0, 127.0));
+            sum_qs += q_i;
+            blk[4 + i] = @bitCast(@as(i8, @intCast(q_i)));
+        }
+        const s: f32 = d * @as(f32, @floatFromInt(sum_qs));
+        const s_h = f32ToF16Bytes(s);
+        blk[2] = s_h[0];
+        blk[3] = s_h[1];
+    }
+}
+
+pub fn dequantQ8_1(data: []const u8, out: []f32) void {
+    const n_blocks = out.len / Q8_1_BLOCK_ELEMS;
+    for (0..n_blocks) |b| {
+        const blk = data[b * Q8_1_BLOCK_BYTES ..][0..Q8_1_BLOCK_BYTES];
+        const d = f16Bytes(blk[0..2]);
+        for (0..Q8_1_BLOCK_ELEMS) |i| {
+            const q: i8 = @bitCast(blk[4 + i]);
+            out[b * Q8_1_BLOCK_ELEMS + i] = d * @as(f32, @floatFromInt(q));
+        }
+    }
+}
+
+/// Repack 4 consecutive Q8_1 blocks (basic format) into one block_q8_1_x4:
+///   { f16vec2 ds[4]; int32_t qs[32]; }   (144 bytes per 128 elements)
+/// The qs[32] array is just the four 32-byte qs arrays laid end-to-end and
+/// reinterpreted as 32 little-endian int32 words — same byte content as
+/// `&basic[i].qs[0]` for `i = 0..4`.
+pub fn packQ8_1_x4(basic: []const u8, x4: []u8) void {
+    const n_groups = basic.len / Q8_1_X4_BYTES;
+    std.debug.assert(x4.len >= n_groups * Q8_1_X4_BYTES);
+    for (0..n_groups) |g| {
+        const src = basic[g * Q8_1_X4_BYTES ..][0..Q8_1_X4_BYTES];
+        const dst = x4[g * Q8_1_X4_BYTES ..][0..Q8_1_X4_BYTES];
+        // ds: 4 × f16vec2 = 16 bytes at offset 0
+        for (0..4) |i| {
+            // basic[i]: [d_lo d_hi s_lo s_hi qs0..qs31] (36 bytes)
+            const src_blk = src[i * Q8_1_BLOCK_BYTES ..][0..4];
+            const dst_ds  = dst[i * 4 ..][0..4];
+            @memcpy(dst_ds, src_blk);
+        }
+        // qs: 4 × 32 i8 = 128 bytes at offset 16
+        for (0..4) |i| {
+            const src_qs = basic[g * Q8_1_X4_BYTES + i * Q8_1_BLOCK_BYTES + 4 ..][0..32];
+            const dst_qs = dst[16 + i * 32 ..][0..32];
+            @memcpy(dst_qs, src_qs);
+        }
+    }
+}
+
+/// Inverse of packQ8_1_x4. Useful for the GPU fuzz test (CPU dequant of
+/// shader output).
+pub fn unpackQ8_1_x4(x4: []const u8, basic: []u8) void {
+    const n_groups = x4.len / Q8_1_X4_BYTES;
+    std.debug.assert(basic.len >= n_groups * Q8_1_X4_BYTES);
+    for (0..n_groups) |g| {
+        const src = x4[g * Q8_1_X4_BYTES ..][0..Q8_1_X4_BYTES];
+        const dst = basic[g * Q8_1_X4_BYTES ..][0..Q8_1_X4_BYTES];
+        for (0..4) |i| {
+            const src_ds = src[i * 4 ..][0..4];
+            const dst_blk = dst[i * Q8_1_BLOCK_BYTES ..][0..4];
+            @memcpy(dst_blk, src_ds);
+        }
+        for (0..4) |i| {
+            const src_qs = x4[g * Q8_1_X4_BYTES + 16 + i * 32 ..][0..32];
+            const dst_qs = basic[g * Q8_1_X4_BYTES + i * Q8_1_BLOCK_BYTES + 4 ..][0..32];
+            @memcpy(dst_qs, src_qs);
+        }
+    }
+}
+
 // ── IQ4_NL ────────────────────────────────────────────────────────────────────
 //
 // Block layout (18 bytes for 32 elements):
@@ -644,4 +765,68 @@ test "dequantQ4K: zero block gives all zeros" {
     var out: [QK_K]f32 = undefined;
     dequantQ4K(&blk, &out);
     for (out) |v| try std.testing.expectApproxEqAbs(@as(f32, 0.0), v, 1e-6);
+}
+
+test "Q8_1: round-trip stays within 1/127" {
+    // Random-ish f32 input across several blocks. Q8_1 has at most amax/127
+    // absolute error per element, so |dequant(quantize(x)) - x| ≤ amax/127.
+    const n = 4 * Q8_1_BLOCK_ELEMS;
+    var src: [n]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const r = prng.random();
+    var amax_per_block: [4]f32 = @splat(0.0);
+    for (0..4) |b| {
+        for (0..Q8_1_BLOCK_ELEMS) |i| {
+            const v = (r.float(f32) - 0.5) * 4.0;
+            src[b * Q8_1_BLOCK_ELEMS + i] = v;
+            if (@abs(v) > amax_per_block[b]) amax_per_block[b] = @abs(v);
+        }
+    }
+    var buf: [4 * Q8_1_BLOCK_BYTES]u8 = undefined;
+    quantizeQ8_1(&src, &buf);
+    var dec: [n]f32 = undefined;
+    dequantQ8_1(&buf, &dec);
+    for (0..4) |b| {
+        const tol = amax_per_block[b] / 127.0 + 1e-5;
+        for (0..Q8_1_BLOCK_ELEMS) |i| {
+            const idx = b * Q8_1_BLOCK_ELEMS + i;
+            try std.testing.expect(@abs(dec[idx] - src[idx]) <= tol);
+        }
+    }
+}
+
+test "Q8_1: s = d * sum(qs) matches stored s" {
+    // The `s` field encodes d*sum(qs) so that mul_q8_1 for asymmetric weight
+    // formats (Q4_1, Q5_1, Q4_K, Q5_K) can do `sum_qs * d_w + s * dmin_w`
+    // entirely in integer arithmetic on the dot side.
+    var src: [Q8_1_BLOCK_ELEMS]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(7);
+    const r = prng.random();
+    for (&src) |*v| v.* = (r.float(f32) - 0.5) * 3.0;
+    var buf: [Q8_1_BLOCK_BYTES]u8 = undefined;
+    quantizeQ8_1(&src, &buf);
+    const d = f16Bytes(buf[0..2]);
+    const s = f16Bytes(buf[2..4]);
+    var sum_qs: i32 = 0;
+    for (0..Q8_1_BLOCK_ELEMS) |i| {
+        const q: i8 = @bitCast(buf[4 + i]);
+        sum_qs += q;
+    }
+    const expected_s = d * @as(f32, @floatFromInt(sum_qs));
+    try std.testing.expectApproxEqAbs(expected_s, s, 1e-2);
+}
+
+test "Q8_1: x4 pack / unpack round-trip" {
+    // packX4 reorders bytes from { ds, qs }[4] to { ds[4], qs[4×32] }, and
+    // unpackX4 reverses it. Verify round-trip is byte-exact on a random buffer.
+    const bytes = 4 * Q8_1_BLOCK_BYTES; // one x4 group
+    var basic: [bytes]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(11);
+    const r = prng.random();
+    for (&basic) |*b| b.* = r.int(u8);
+    var x4: [bytes]u8 = undefined;
+    packQ8_1_x4(&basic, &x4);
+    var basic2: [bytes]u8 = undefined;
+    unpackQ8_1_x4(&x4, &basic2);
+    try std.testing.expectEqualSlices(u8, &basic, &basic2);
 }

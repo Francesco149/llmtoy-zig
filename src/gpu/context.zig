@@ -10,7 +10,9 @@ pub const GpuContext = struct {
     cmd_pool: vk.VkCommandPool,
 
     pub fn init() !GpuContext {
-        // Instance
+        // We require Vulkan 1.3 for shaderIntegerDotProduct (core in 1.3) plus
+        // shaderInt8 / shaderFloat16 / 8-bit + 16-bit storage (core in 1.2/1.1).
+        // These are the foundation of the Q8_1-activation matvec path.
         const app_info = vk.VkApplicationInfo{
             .sType = vk.VK_STRUCTURE_TYPE_APPLICATION_INFO,
             .pNext = null,
@@ -18,7 +20,7 @@ pub const GpuContext = struct {
             .applicationVersion = vk.VK_MAKE_VERSION(0, 7, 0),
             .pEngineName = "llmtoy",
             .engineVersion = vk.VK_MAKE_VERSION(0, 7, 0),
-            .apiVersion = vk.VK_API_VERSION_1_1,
+            .apiVersion = vk.VK_API_VERSION_1_3,
         };
         const inst_ci = vk.VkInstanceCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -73,9 +75,39 @@ pub const GpuContext = struct {
             .queueCount = 1,
             .pQueuePriorities = &priority,
         };
+
+        // Feature chain: V13 → V12 → V11 → Features2.  Everything we need for the
+        // Q8_1 + integer-dot matvec path lives in core Vulkan 1.3.  RX 7800 XT
+        // (RADV) reports all of these as true; an unsupported device will fail
+        // device creation with a clear error.
+        var v13 = std.mem.zeroes(vk.VkPhysicalDeviceVulkan13Features);
+        v13.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        v13.shaderIntegerDotProduct = vk.VK_TRUE;        // dotPacked4x8EXT
+
+        var v12 = std.mem.zeroes(vk.VkPhysicalDeviceVulkan12Features);
+        v12.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        v12.pNext = &v13;
+        v12.shaderFloat16 = vk.VK_TRUE;                  // f16vec2 ds, dm
+        v12.shaderInt8 = vk.VK_TRUE;                     // int8_t arithmetic
+        v12.storageBuffer8BitAccess = vk.VK_TRUE;        // int8_t qs[32] loads
+        v12.shaderSubgroupExtendedTypes = vk.VK_TRUE;    // subgroupAdd(int32_t) etc.
+        v12.uniformAndStorageBuffer8BitAccess = vk.VK_TRUE;
+
+        var v11 = std.mem.zeroes(vk.VkPhysicalDeviceVulkan11Features);
+        v11.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+        v11.pNext = &v12;
+        v11.storageBuffer16BitAccess = vk.VK_TRUE;       // f16vec2 / int16 loads
+        v11.uniformAndStorageBuffer16BitAccess = vk.VK_TRUE;
+
+        var feats2 = std.mem.zeroes(vk.VkPhysicalDeviceFeatures2);
+        feats2.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        feats2.pNext = &v11;
+        feats2.features.shaderInt16 = vk.VK_TRUE;        // i16vec2 unpack in Q5_0/Q5_1
+        feats2.features.shaderInt64 = vk.VK_TRUE;
+
         const dev_ci = vk.VkDeviceCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-            .pNext = null,
+            .pNext = &feats2,
             .flags = 0,
             .queueCreateInfoCount = 1,
             .pQueueCreateInfos = &queue_ci,
@@ -83,7 +115,7 @@ pub const GpuContext = struct {
             .ppEnabledLayerNames = null,
             .enabledExtensionCount = 0,
             .ppEnabledExtensionNames = null,
-            .pEnabledFeatures = null,
+            .pEnabledFeatures = null,                    // using Features2 in pNext instead
         };
         var device: vk.VkDevice = undefined;
         if (vk.vkCreateDevice(phys_dev, &dev_ci, null, &device) != vk.VK_SUCCESS)
