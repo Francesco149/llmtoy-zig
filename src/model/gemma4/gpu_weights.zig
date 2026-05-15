@@ -23,6 +23,11 @@ const MatvecSession       = mv_mod.MatvecSession;
 const FusedGateUpPipeline = mv_mod.FusedGateUpPipeline;
 const AccumPipeline       = mv_mod.AccumPipeline;
 const QuantizeQ8_1Pipeline = mv_mod.QuantizeQ8_1Pipeline;
+const RmsnormPipeline     = mv_mod.RmsnormPipeline;
+const ElemAddPipeline     = mv_mod.ElemAddPipeline;
+const ElemScalePipeline   = mv_mod.ElemScalePipeline;
+const RopeNeoxTablePipeline = mv_mod.RopeNeoxTablePipeline;
+const RopeNeoxThetaPipeline = mv_mod.RopeNeoxThetaPipeline;
 const wt_                = @import("weights.zig");
 const Gemma4Weights      = wt_.Gemma4Weights;
 const Gemma4LayerWeights = wt_.Gemma4LayerWeights;
@@ -38,6 +43,19 @@ pub const GpuLayerWeights = struct {
     w_up:   ?MatvecSession,
     w_down: ?MatvecSession,
 
+    // 7j: each per-layer RMSNorm weight pre-uploaded to a device-local f32
+    // buffer.  Lets the GPU rmsnorm shader bind it directly; sized to the
+    // norm's element count (d_model for body norms, hd for q_norm/k_norm).
+    attn_norm_buf:           ?GpuBuffer,
+    post_attention_norm_buf: ?GpuBuffer,
+    q_norm_buf:              ?GpuBuffer,
+    k_norm_buf:              ?GpuBuffer,
+    ffn_norm_buf:            ?GpuBuffer,
+    pre_ffw_norm_2_buf:      ?GpuBuffer,
+    post_ffw_norm_1_buf:     ?GpuBuffer,
+    post_ffw_norm_2_buf:     ?GpuBuffer,
+    post_ffw_norm_buf:       ?GpuBuffer,
+
     pub fn deinitAll(self: *GpuLayerWeights) void {
         if (self.wq)     |*s| s.deinit();
         if (self.wk)     |*s| s.deinit();
@@ -46,6 +64,15 @@ pub const GpuLayerWeights = struct {
         if (self.w_gate) |*s| s.deinit();
         if (self.w_up)   |*s| s.deinit();
         if (self.w_down) |*s| s.deinit();
+        if (self.attn_norm_buf)           |*b| b.deinit();
+        if (self.post_attention_norm_buf) |*b| b.deinit();
+        if (self.q_norm_buf)              |*b| b.deinit();
+        if (self.k_norm_buf)              |*b| b.deinit();
+        if (self.ffn_norm_buf)            |*b| b.deinit();
+        if (self.pre_ffw_norm_2_buf)      |*b| b.deinit();
+        if (self.post_ffw_norm_1_buf)     |*b| b.deinit();
+        if (self.post_ffw_norm_2_buf)     |*b| b.deinit();
+        if (self.post_ffw_norm_buf)       |*b| b.deinit();
     }
 };
 
@@ -65,6 +92,12 @@ pub const GpuWeights = struct {
     pl_fused_gu: FusedGateUpPipeline,
     pl_fused_gu_q8_1: FusedGateUpPipeline,
     pl_accum:    AccumPipeline,
+    // 7j primitives — per-token f32 ops on VRAM residual stream.
+    pl_rmsnorm:      RmsnormPipeline,
+    pl_elem_add:     ElemAddPipeline,
+    pl_elem_scale:   ElemScalePipeline,
+    pl_rope_table:   RopeNeoxTablePipeline,
+    pl_rope_theta:   RopeNeoxThetaPipeline,
     layers:     []GpuLayerWeights,
     lm_head:    ?MatvecSession,
     // Shared host-coherent I/O buffers sized to the largest matrix across all
@@ -75,6 +108,18 @@ pub const GpuWeights = struct {
     // Quantize-shader writes; mul_mat_vec_q*_q8_1 shaders read.  Lives in VRAM
     // so neither path crosses PCIe per token.
     shared_acts_q8_1: ?GpuBuffer,
+    // 7j VRAM-resident residual stream + intermediate. Both sized to
+    // max_cols (≥ d_model). x_vram holds the running residual; xb_vram holds
+    // norm outputs and other transient f32 vectors.
+    x_vram:   ?GpuBuffer,
+    xb_vram:  ?GpuBuffer,
+    // Persistent host-coherent staging buffer for x_vram uploads/downloads —
+    // sized to max_cols. Avoids re-allocating a staging buffer per upload.
+    stage_buf: ?GpuBuffer,
+    // Global norm weights uploaded to VRAM (out_norm) and optional precomputed
+    // RoPE inverse frequencies (Gemma4 global layers).
+    out_norm_buf:   ?GpuBuffer,
+    rope_freqs_buf: ?GpuBuffer,
     // Flat [n_layers × n_experts] expert session arrays; null = CPU fallback.
     expert_gate: ?[]?MatvecSession,
     expert_up:   ?[]?MatvecSession,
@@ -171,12 +216,28 @@ pub const GpuWeights = struct {
         var pl_accum = try AccumPipeline.init(&ctx);
         errdefer pl_accum.deinit();
         std.debug.print("  init: pl_accum ok\n", .{});
+        var pl_rmsnorm = try RmsnormPipeline.init(&ctx);
+        errdefer pl_rmsnorm.deinit();
+        var pl_elem_add = try ElemAddPipeline.init(&ctx);
+        errdefer pl_elem_add.deinit();
+        var pl_elem_scale = try ElemScalePipeline.init(&ctx);
+        errdefer pl_elem_scale.deinit();
+        var pl_rope_table = try RopeNeoxTablePipeline.init(&ctx);
+        errdefer pl_rope_table.deinit();
+        var pl_rope_theta = try RopeNeoxThetaPipeline.init(&ctx);
+        errdefer pl_rope_theta.deinit();
+        std.debug.print("  init: pl_rmsnorm + elem + rope ok\n", .{});
 
         const layers = try allocator.alloc(GpuLayerWeights, g4cfg.n_layers);
         errdefer allocator.free(layers);
         for (layers) |*l| l.* = .{
             .wq = null, .wk = null, .wv = null, .wo = null,
             .w_gate = null, .w_up = null, .w_down = null,
+            .attn_norm_buf = null, .post_attention_norm_buf = null,
+            .q_norm_buf = null, .k_norm_buf = null,
+            .ffn_norm_buf = null, .pre_ffw_norm_2_buf = null,
+            .post_ffw_norm_1_buf = null, .post_ffw_norm_2_buf = null,
+            .post_ffw_norm_buf = null,
         };
 
         var gw = GpuWeights{
@@ -190,9 +251,14 @@ pub const GpuWeights = struct {
             .pl_q5_1 = pl_q5_1, .pl_q5_0 = pl_q5_0,
             .pl_fused_gu = pl_fused_gu, .pl_fused_gu_q8_1 = pl_fused_gu_q8_1,
             .pl_accum = pl_accum,
+            .pl_rmsnorm = pl_rmsnorm, .pl_elem_add = pl_elem_add,
+            .pl_elem_scale = pl_elem_scale,
+            .pl_rope_table = pl_rope_table, .pl_rope_theta = pl_rope_theta,
             .layers = layers, .lm_head = null,
             .shared_vec = null, .shared_out = null,
             .shared_acts_q8_1 = null,
+            .x_vram = null, .xb_vram = null, .stage_buf = null,
+            .out_norm_buf = null, .rope_freqs_buf = null,
             .expert_gate = null, .expert_up = null, .expert_down = null,
             .n_experts = g4cfg.n_experts, .n_experts_used = g4cfg.n_experts_used,
             .expert_in_buf = null, .expert_mid_bufs = null, .expert_mid_q8_1_bufs = null,
@@ -215,6 +281,19 @@ pub const GpuWeights = struct {
                 return error.InsufficientMemory;
             }
             try uploadLayerBatch(&ctx, &gw.layers[l], &g4w.layers[l]);
+            // Upload per-layer norm weights to VRAM for GPU rmsnorm dispatches.
+            // Each is tiny (≤ 12 KiB for d_model=2816) so we don't bother batching.
+            const glw = &gw.layers[l];
+            const lwx = &g4w.layers[l];
+            glw.attn_norm_buf           = try uploadF32(&ctx, lwx.attn_norm);
+            glw.post_attention_norm_buf = try uploadF32(&ctx, lwx.post_attention_norm);
+            glw.q_norm_buf              = try uploadF32(&ctx, lwx.q_norm);
+            glw.k_norm_buf              = try uploadF32(&ctx, lwx.k_norm);
+            glw.ffn_norm_buf            = try uploadF32(&ctx, lwx.ffn_norm);
+            glw.pre_ffw_norm_2_buf      = try uploadF32(&ctx, lwx.pre_ffw_norm_2);
+            glw.post_ffw_norm_1_buf     = try uploadF32(&ctx, lwx.post_ffw_norm_1);
+            glw.post_ffw_norm_2_buf     = try uploadF32(&ctx, lwx.post_ffw_norm_2);
+            glw.post_ffw_norm_buf       = try uploadF32(&ctx, lwx.post_ffw_norm);
             const vram_used = vramUsedMB();
             const gtt_used  = gttUsedMB();
             const mem_avail = availableMemoryMB();
@@ -223,6 +302,10 @@ pub const GpuWeights = struct {
         }
 
         // lm_head staging can be 400+ MiB; fall back to CPU on alloc failure.
+        // Global norms + RoPE freqs uploaded once for the whole model.
+        gw.out_norm_buf   = try uploadF32(&ctx, g4w.out_norm);
+        gw.rope_freqs_buf = try uploadF32(&ctx, g4w.rope_freqs);
+
         gw.lm_head = uploadSingleBatch(&ctx, g4w.lm_head) catch |e| blk: {
             std.debug.print("  lm_head GPU upload failed ({s}), using CPU\n", .{@errorName(e)});
             break :blk null;
@@ -255,6 +338,19 @@ pub const GpuWeights = struct {
         std.debug.print("  shared I/O bufs: vec={} KiB out={} KiB q8_1_acts={} KiB\n",
             .{ max_cols * @sizeOf(f32) / 1024, max_rows * @sizeOf(f32) / 1024,
                q8_1_bytes / 1024 });
+
+        // 7j VRAM residual + scratch + staging. Sized to the maximum f32
+        // vector we'll handle (d_model OR n_heads*head_dim_global, whichever
+        // is larger — max_cols covers both since wo's cols dimension equals
+        // n_heads*head_dim_global).
+        gw.x_vram = try GpuBuffer.initDeviceLocal(&gw.ctx,
+            max_cols * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.xb_vram = try GpuBuffer.initDeviceLocal(&gw.ctx,
+            max_cols * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.stage_buf = try GpuBuffer.initStaging(&gw.ctx, max_cols * @sizeOf(f32));
+        std.debug.print("  7j VRAM bufs: x={} KiB xb={} KiB stage={} KiB\n",
+            .{ max_cols * @sizeOf(f32) / 1024, max_cols * @sizeOf(f32) / 1024,
+               max_cols * @sizeOf(f32) / 1024 });
 
         // Per-projection output buffers for batched QKV and gate+up dispatch.
         // Sized per-projection so all three (or two) can be in-flight simultaneously.
@@ -369,6 +465,11 @@ pub const GpuWeights = struct {
         if (self.v_out_buf)    |*b| b.deinit();
         if (self.k_out_buf)    |*b| b.deinit();
         if (self.q_out_buf)    |*b| b.deinit();
+        if (self.rope_freqs_buf) |*b| b.deinit();
+        if (self.out_norm_buf)   |*b| b.deinit();
+        if (self.stage_buf) |*b| b.deinit();
+        if (self.xb_vram)   |*b| b.deinit();
+        if (self.x_vram)    |*b| b.deinit();
         if (self.shared_acts_q8_1) |*b| b.deinit();
         if (self.shared_out) |*b| b.deinit();
         if (self.shared_vec) |*b| b.deinit();
@@ -380,6 +481,11 @@ pub const GpuWeights = struct {
         self.pl_fused_gu.deinit();
         self.pl_q5_0.deinit();
         self.pl_q5_1.deinit();
+        self.pl_rope_theta.deinit();
+        self.pl_rope_table.deinit();
+        self.pl_elem_scale.deinit();
+        self.pl_elem_add.deinit();
+        self.pl_rmsnorm.deinit();
         self.pl_quantize_q8_1.deinit();
         self.pl_q5_1_q8_1.deinit();
         self.pl_q5_0_q8_1.deinit();
@@ -641,6 +747,25 @@ pub const GpuWeights = struct {
         return ed[l * self.n_experts + e];
     }
 
+    // Upload an f32 vector to x_vram via the persistent staging buffer.
+    // Synchronous: writes staging → records copy → submits → waits. Used
+    // once after embed lookup to seed the residual stream; subsequent
+    // per-layer ops update x_vram in place via shader dispatches.
+    pub fn uploadX(self: *const GpuWeights, src: []const f32) !void {
+        const stage = &(self.stage_buf orelse return error.NotOnGpu);
+        const x = &(self.x_vram orelse return error.NotOnGpu);
+        try stage.upload(std.mem.sliceAsBytes(src));
+        try self.ctx.copyBuffer(stage.handle, x.handle, src.len * @sizeOf(f32));
+    }
+
+    // Download x_vram → out (f32 slice). Submits a copy + waits.
+    pub fn downloadX(self: *const GpuWeights, out: []f32) !void {
+        const stage = &(self.stage_buf orelse return error.NotOnGpu);
+        const x = &(self.x_vram orelse return error.NotOnGpu);
+        try self.ctx.copyBuffer(x.handle, stage.handle, out.len * @sizeOf(f32));
+        try stage.download(std.mem.sliceAsBytes(out));
+    }
+
     // Pipeline for the f32-activation path.
     pub fn pipelineFor(self: *const GpuWeights, t: GgmlType) *const MatvecPipeline {
         return switch (t) {
@@ -837,6 +962,20 @@ fn schedUpload(
     nsb.* += 1;
 
     return sess;
+}
+
+// Upload an f32 slice to a fresh device-local buffer. One submit per call —
+// only used at init time for the small (≤ 12 KiB) norm weights.
+fn uploadF32(ctx: *const GpuCtx, src: []const f32) !GpuBuffer {
+    const size = src.len * @sizeOf(f32);
+    var staging = try GpuBuffer.initStaging(ctx, size);
+    defer staging.deinit();
+    try staging.upload(std.mem.sliceAsBytes(src));
+
+    var dst = try GpuBuffer.initDeviceLocal(ctx, size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    errdefer dst.deinit();
+    try ctx.copyBuffer(staging.handle, dst.handle, size);
+    return dst;
 }
 
 // Upload one layer's ≤7 matrices in a single command buffer submission.
