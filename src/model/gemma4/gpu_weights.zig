@@ -22,6 +22,7 @@ const MatvecPipeline      = mv_mod.MatvecPipeline;
 const MatvecSession       = mv_mod.MatvecSession;
 const FusedGateUpPipeline = mv_mod.FusedGateUpPipeline;
 const AccumPipeline       = mv_mod.AccumPipeline;
+const QuantizeQ8_1Pipeline = mv_mod.QuantizeQ8_1Pipeline;
 const wt_                = @import("weights.zig");
 const Gemma4Weights      = wt_.Gemma4Weights;
 const Gemma4LayerWeights = wt_.Gemma4LayerWeights;
@@ -54,6 +55,8 @@ pub const GpuWeights = struct {
     pl_q8_0:    MatvecPipeline,
     pl_q3_k:    MatvecPipeline,
     pl_q4_k:    MatvecPipeline,
+    pl_q4_k_q8_1:    MatvecPipeline,
+    pl_quantize_q8_1: QuantizeQ8_1Pipeline,
     pl_q5_1:    MatvecPipeline,
     pl_q5_0:    MatvecPipeline,
     pl_fused_gu: FusedGateUpPipeline,
@@ -64,6 +67,10 @@ pub const GpuWeights = struct {
     // sessions. Eliminates 420+ individual per-session HOST_COHERENT allocations.
     shared_vec:  ?GpuBuffer,
     shared_out:  ?GpuBuffer,
+    // Device-local Q8_1-quantized activation, sized to q8_1OutBytes(max_cols).
+    // Quantize-shader writes; mul_mat_vec_q*_q8_1 shaders read.  Lives in VRAM
+    // so neither path crosses PCIe per token.
+    shared_acts_q8_1: ?GpuBuffer,
     // Flat [n_layers × n_experts] expert session arrays; null = CPU fallback.
     expert_gate: ?[]?MatvecSession,
     expert_up:   ?[]?MatvecSession,
@@ -124,6 +131,12 @@ pub const GpuWeights = struct {
         errdefer pl_q4_k.deinit();
         std.debug.print("  init: pl_q4_k ok (VRAM={} MiB GTT={} MiB sys={} MiB)\n",
             .{ vramUsedMB(), gttUsedMB(), availableMemoryMB() });
+        var pl_q4_k_q8_1 = try MatvecPipeline.initQ4KQ8_1(&ctx);
+        errdefer pl_q4_k_q8_1.deinit();
+        std.debug.print("  init: pl_q4_k_q8_1 ok\n", .{});
+        var pl_quantize_q8_1 = try QuantizeQ8_1Pipeline.init(&ctx);
+        errdefer pl_quantize_q8_1.deinit();
+        std.debug.print("  init: pl_quantize_q8_1 ok\n", .{});
         var pl_q5_1 = try MatvecPipeline.initQ5_1(&ctx);
         errdefer pl_q5_1.deinit();
         std.debug.print("  init: pl_q5_1 ok (VRAM={} MiB GTT={} MiB sys={} MiB)\n",
@@ -149,10 +162,13 @@ pub const GpuWeights = struct {
         var gw = GpuWeights{
             .ctx = ctx, .pl_f32 = pl_f32, .pl_q8_0 = pl_q8_0,
             .pl_q3_k = pl_q3_k, .pl_q4_k = pl_q4_k,
+            .pl_q4_k_q8_1 = pl_q4_k_q8_1,
+            .pl_quantize_q8_1 = pl_quantize_q8_1,
             .pl_q5_1 = pl_q5_1, .pl_q5_0 = pl_q5_0,
             .pl_fused_gu = pl_fused_gu, .pl_accum = pl_accum,
             .layers = layers, .lm_head = null,
             .shared_vec = null, .shared_out = null,
+            .shared_acts_q8_1 = null,
             .expert_gate = null, .expert_up = null, .expert_down = null,
             .n_experts = g4cfg.n_experts, .n_experts_used = g4cfg.n_experts_used,
             .expert_in_buf = null, .expert_mid_bufs = null,
@@ -208,8 +224,13 @@ pub const GpuWeights = struct {
             max_cols * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         gw.shared_out = try GpuBuffer.initHostCoherent(&gw.ctx,
             max_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        std.debug.print("  shared I/O bufs: vec={} KiB out={} KiB\n",
-            .{ max_cols * @sizeOf(f32) / 1024, max_rows * @sizeOf(f32) / 1024 });
+        // Q8_1 activation buffer lives in VRAM; quantize-shader writes, matvec reads.
+        const q8_1_bytes = mv_mod.q8_1OutBytes(max_cols);
+        gw.shared_acts_q8_1 = try GpuBuffer.initDeviceLocal(&gw.ctx,
+            q8_1_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std.debug.print("  shared I/O bufs: vec={} KiB out={} KiB q8_1_acts={} KiB\n",
+            .{ max_cols * @sizeOf(f32) / 1024, max_rows * @sizeOf(f32) / 1024,
+               q8_1_bytes / 1024 });
 
         // Per-projection output buffers for batched QKV and gate+up dispatch.
         // Sized per-projection so all three (or two) can be in-flight simultaneously.
@@ -312,6 +333,7 @@ pub const GpuWeights = struct {
         if (self.v_out_buf)    |*b| b.deinit();
         if (self.k_out_buf)    |*b| b.deinit();
         if (self.q_out_buf)    |*b| b.deinit();
+        if (self.shared_acts_q8_1) |*b| b.deinit();
         if (self.shared_out) |*b| b.deinit();
         if (self.shared_vec) |*b| b.deinit();
         if (self.lm_head) |*s| s.deinit();
@@ -321,6 +343,8 @@ pub const GpuWeights = struct {
         self.pl_fused_gu.deinit();
         self.pl_q5_0.deinit();
         self.pl_q5_1.deinit();
+        self.pl_quantize_q8_1.deinit();
+        self.pl_q4_k_q8_1.deinit();
         self.pl_q4_k.deinit();
         self.pl_q3_k.deinit();
         self.pl_q8_0.deinit();
@@ -373,6 +397,39 @@ pub const GpuWeights = struct {
         try q_buf.download(std.mem.sliceAsBytes(q_out));
         try k_buf.download(std.mem.sliceAsBytes(k_out));
         if (v_dset != null) try self.v_out_buf.?.download(std.mem.sliceAsBytes(v_out));
+    }
+
+    // Q8_1-activation matvec: one f32 → Q8_1 quantize pass, then one matvec.
+    // The two dispatches share a command buffer with a compute-compute barrier
+    // between them so the matvec sees the freshly-written Q8_1 acts.
+    // Currently only Q4_K weights are wired up (pl_q4_k_q8_1).
+    pub fn runQ8_1Mv(
+        self: *const GpuWeights,
+        sess: *const MatvecSession,
+        xb: []const f32,
+        out: []f32,
+    ) !void {
+        std.debug.assert(sess.cols % 256 == 0);
+        const vec_buf  = &self.shared_vec.?;
+        const out_buf  = &self.shared_out.?;
+        const acts_buf = &self.shared_acts_q8_1.?;
+
+        try vec_buf.upload(std.mem.sliceAsBytes(xb));
+
+        const cmd = try self.ctx.beginBatch();
+        const q_dset = try self.pl_quantize_q8_1.record(
+            cmd, vec_buf, acts_buf, sess.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+        const mv_dset = try self.pl_q4_k_q8_1.record(
+            cmd, &sess.mat_buf, acts_buf, out_buf, sess.rows, sess.cols);
+        try self.ctx.submitBatch(cmd);
+
+        _ = vk.vkFreeDescriptorSets(self.ctx.device,
+            self.pl_quantize_q8_1.desc_pool, 1, &q_dset);
+        _ = vk.vkFreeDescriptorSets(self.ctx.device,
+            self.pl_q4_k_q8_1.desc_pool, 1, &mv_dset);
+
+        try out_buf.download(std.mem.sliceAsBytes(out));
     }
 
     // Dispatch w_gate and w_up in one command buffer (both read the same FFN-norm xb).

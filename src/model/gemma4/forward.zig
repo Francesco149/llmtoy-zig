@@ -29,6 +29,14 @@ pub const GpuWeights        = gpu_w_.GpuWeights;
 pub const GpuLayerWeights   = gpu_w_.GpuLayerWeights;
 const MatvecPipeline        = @import("../../gpu/matvec.zig").MatvecPipeline;
 
+// ── debug toggles ─────────────────────────────────────────────────────────────
+//
+// Set DBG_Q8_1_L0_WQ = true to route layer-0 attn_q through the new
+// Q8_1-activation / integer-dot matvec.  The plan calls for verifying this
+// single matmul under `llmtoy compare` and benchmark before expanding.
+// Leave false in committed code unless we're actively debugging.
+const DBG_Q8_1_L0_WQ: bool = false;
+
 /// Process one token at `pos`, writing new K/V into `kv`.
 /// Returns a caller-owned logit slice.
 /// Pass gpu != null to offload attention + dense-FFN matmuls to the GPU.
@@ -121,9 +129,14 @@ pub fn forwardOne(
         // - wv missing entirely (shared-V layer): batch QK, copy K into V.
         // - wv present but CPU-only (e.g. Q5_K at L3): take the per-call path so V
         //   actually runs on CPU instead of being silently skipped.
+        //
+        // DBG_Q8_1_L0_WQ: on layer 0, disable batching so wq can take the new
+        // Q8_1 path; wk/wv stay on the existing f32-activation matvec.
+        const dbg_q8_1_here = DBG_Q8_1_L0_WQ and l == 0 and glw != null and glw.?.wq != null
+            and lw.wq.type_ == .q4_k;
         const wv_present = lw.wv != null;
         const wv_on_gpu  = wv_present and (if (glw) |g| g.wv != null else false);
-        const can_batch_qkv = gpu != null and glw != null and
+        const can_batch_qkv = !dbg_q8_1_here and gpu != null and glw != null and
             glw.?.wq != null and glw.?.wk != null and (!wv_present or wv_on_gpu);
         if (can_batch_qkv) {
             const g = gpu.?;
@@ -134,7 +147,11 @@ pub fn forwardOne(
                 xb[0..d], q[0..nq_l], k_cur, v_cur);
             if (!wv_present) @memcpy(v_cur, k_cur);
         } else {
-            try mv(q[0..nq_l], lw.wq, xb[0..d], scratch, pool, if (glw) |g| g.wq else null, gpu);
+            if (dbg_q8_1_here) {
+                try gpu.?.runQ8_1Mv(&glw.?.wq.?, xb[0..d], q[0..nq_l]);
+            } else {
+                try mv(q[0..nq_l], lw.wq, xb[0..d], scratch, pool, if (glw) |g| g.wq else null, gpu);
+            }
             try mv(k_cur,      lw.wk, xb[0..d], scratch, pool, if (glw) |g| g.wk else null, gpu);
             if (lw.wv) |wv| {
                 try mv(v_cur, wv, xb[0..d], scratch, pool, if (glw) |g| g.wv else null, gpu);
