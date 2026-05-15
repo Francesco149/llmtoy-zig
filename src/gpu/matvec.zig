@@ -6,6 +6,8 @@ const GpuContext = @import("context.zig").GpuContext;
 const GpuBuffer = @import("buffer.zig").GpuBuffer;
 const shaders = @import("gpu_shaders");
 const GgmlType = @import("../gguf/types.zig").GgmlType;
+const dq = @import("../quant/dequant.zig");
+const math_mod = @import("../ops/math.zig");
 
 const WORKGROUP_SIZE: u32 = 64;
 
@@ -1337,3 +1339,109 @@ test "gpu expert accum correctness" {
         try std.testing.expectApproxEqAbs(result[i], expected[i], 0.1);
     }
 }
+
+// ── per-quant fuzz tests ──────────────────────────────────────────────────────
+//
+// Generate random block-quantized matrix bytes (with a clamped f16 scale to
+// avoid NaN/Inf), then assert that GPU matvec matches CPU dequant + dot to
+// within 1e-4 relative.  Catches indexing/ordering bugs that the small
+// hand-crafted tests above miss (e.g. the original Q5_1 nibble interleave).
+
+fn fuzzQuantMatvec(
+    comptime tag: GgmlType,
+    initPipeline: anytype,
+    initSession: anytype,
+    rows: usize,
+    cols: usize,
+    seed: u64,
+) !void {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r  = prng.random();
+    const al = std.testing.allocator;
+
+    const blk_bytes  = math_mod.rowBytes(tag, cols);
+    const total_mat  = rows * blk_bytes;
+    const mat = try al.alloc(u8, total_mat);
+    defer al.free(mat);
+    for (mat) |*b| b.* = r.int(u8);
+
+    // Stamp every block's f16 scales to small magnitudes so the dequant doesn't
+    // explode into NaN/Inf.  Layouts share the convention of f16 d at offset 0,
+    // and (for Q5_1 / Q4_K / Q5_K) f16 m or dmin at offset 2.
+    const block_elems: usize = switch (tag) {
+        .q4_k, .q5_k, .q3_k, .q6_k => 256,
+        else => 32,
+    };
+    const blocks_per_row = cols / block_elems;
+    const small_d_le: [2]u8 = .{ 0xCD, 0x21 }; // f16 ≈ 0.012
+    for (0..rows) |i| for (0..blocks_per_row) |b| {
+        const off = (i * blocks_per_row + b) * blk_bytes;
+        mat[off + 0] = small_d_le[0]; mat[off + 1] = small_d_le[1];
+        // Q5_1 / Q4_K / Q5_K all have a second f16 at [2..3]
+        if (tag == .q5_1 or tag == .q4_k or tag == .q5_k) {
+            mat[off + 2] = small_d_le[0]; mat[off + 3] = small_d_le[1];
+        }
+    };
+
+    const vec = try al.alloc(f32, cols);
+    defer al.free(vec);
+    for (vec) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+
+    // CPU reference via existing dequant + dot.
+    const cpu_out = try al.alloc(f32, rows);
+    defer al.free(cpu_out);
+    const row_buf = try al.alloc(f32, cols);
+    defer al.free(row_buf);
+    math_mod.quantMatvec(cpu_out, mat, tag, vec, rows, cols, row_buf);
+
+    // GPU.
+    var pipeline = try initPipeline(&gpu);
+    defer pipeline.deinit();
+    var session = try initSession(&gpu, mat, @intCast(rows), @intCast(cols));
+    defer session.deinit();
+
+    const gpu_out = try al.alloc(f32, rows);
+    defer al.free(gpu_out);
+    try session.runOwned(&gpu, &pipeline, vec, gpu_out);
+
+    var max_abs: f32 = 0.0;
+    var max_ref: f32 = 0.0;
+    for (cpu_out, gpu_out) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs) max_abs = d;
+        if (@abs(c) > max_ref) max_ref = @abs(c);
+    }
+    const rel = max_abs / (max_ref + 1e-6);
+    std.debug.print("{s} fuzz rows={} cols={}  max|D|={d:.6}  rel={e:.3}\n",
+        .{ tag.label(), rows, cols, max_abs, rel });
+    try std.testing.expect(rel < 1e-4);
+}
+
+test "gpu matvec Q8_0 fuzz" {
+    try fuzzQuantMatvec(.q8_0,
+        MatvecPipeline.initQ8_0, MatvecSession.initQ8_0, 32, 256, 1);
+}
+test "gpu matvec Q5_0 fuzz" {
+    try fuzzQuantMatvec(.q5_0,
+        MatvecPipeline.initQ5_0, MatvecSession.initQ5_0, 32, 256, 2);
+}
+test "gpu matvec Q5_1 fuzz" {
+    try fuzzQuantMatvec(.q5_1,
+        MatvecPipeline.initQ5_1, MatvecSession.initQ5_1, 32, 256, 3);
+}
+test "gpu matvec Q4_K fuzz" {
+    try fuzzQuantMatvec(.q4_k,
+        MatvecPipeline.initQ4K, MatvecSession.initQ4K, 32, 512, 4);
+}
+test "gpu matvec Q3_K fuzz" {
+    try fuzzQuantMatvec(.q3_k,
+        MatvecPipeline.initQ3K, MatvecSession.initQ3K, 32, 512, 5);
+}
+
