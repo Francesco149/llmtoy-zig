@@ -558,30 +558,28 @@ pub fn dequantQ8_1(data: []const u8, out: []f32) void {
     }
 }
 
-/// Repack 4 consecutive Q8_1 blocks (basic format) into one block_q8_1_x4:
+/// Repack consecutive Q8_1 blocks (basic format) into block_q8_1_x4 groups:
 ///   { f16vec2 ds[4]; int32_t qs[32]; }   (144 bytes per 128 elements)
-/// The qs[32] array is just the four 32-byte qs arrays laid end-to-end and
-/// reinterpreted as 32 little-endian int32 words — same byte content as
-/// `&basic[i].qs[0]` for `i = 0..4`.
+/// The qs[32] array is the four 32-byte qs arrays laid end-to-end and
+/// reinterpreted as 32 little-endian int32 words.
+///
+/// The number of basic blocks is `basic.len / Q8_1_BLOCK_BYTES`. When that's
+/// not a multiple of 4, the partial last x4 group is zero-padded so the GPU
+/// shaders can index up to the full ceil count without reading garbage.
 pub fn packQ8_1_x4(basic: []const u8, x4: []u8) void {
-    const n_groups = basic.len / Q8_1_X4_BYTES;
+    const n_blocks = basic.len / Q8_1_BLOCK_BYTES;
+    const n_groups = (n_blocks + 3) / 4;
     std.debug.assert(x4.len >= n_groups * Q8_1_X4_BYTES);
-    for (0..n_groups) |g| {
-        const src = basic[g * Q8_1_X4_BYTES ..][0..Q8_1_X4_BYTES];
-        const dst = x4[g * Q8_1_X4_BYTES ..][0..Q8_1_X4_BYTES];
-        // ds: 4 × f16vec2 = 16 bytes at offset 0
-        for (0..4) |i| {
-            // basic[i]: [d_lo d_hi s_lo s_hi qs0..qs31] (36 bytes)
-            const src_blk = src[i * Q8_1_BLOCK_BYTES ..][0..4];
-            const dst_ds  = dst[i * 4 ..][0..4];
-            @memcpy(dst_ds, src_blk);
-        }
-        // qs: 4 × 32 i8 = 128 bytes at offset 16
-        for (0..4) |i| {
-            const src_qs = basic[g * Q8_1_X4_BYTES + i * Q8_1_BLOCK_BYTES + 4 ..][0..32];
-            const dst_qs = dst[16 + i * 32 ..][0..32];
-            @memcpy(dst_qs, src_qs);
-        }
+    @memset(x4[0 .. n_groups * Q8_1_X4_BYTES], 0); // pad partial last group
+    for (0..n_blocks) |bi| {
+        const g = bi / 4;
+        const i = bi % 4;
+        const src_blk_off = bi * Q8_1_BLOCK_BYTES;
+        const dst_grp_off = g * Q8_1_X4_BYTES;
+        // ds @ offset 0 (16 bytes): 4 × f16vec2
+        @memcpy(x4[dst_grp_off + i * 4 ..][0..4], basic[src_blk_off ..][0..4]);
+        // qs @ offset 16 (128 bytes): 4 × 32 bytes
+        @memcpy(x4[dst_grp_off + 16 + i * 32 ..][0..32], basic[src_blk_off + 4 ..][0..32]);
     }
 }
 

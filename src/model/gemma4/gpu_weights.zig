@@ -57,6 +57,8 @@ pub const GpuWeights = struct {
     pl_q4_k:    MatvecPipeline,
     pl_q3_k_q8_1:    MatvecPipeline,
     pl_q4_k_q8_1:    MatvecPipeline,
+    pl_q5_0_q8_1:    MatvecPipeline,
+    pl_q5_1_q8_1:    MatvecPipeline,
     pl_quantize_q8_1: QuantizeQ8_1Pipeline,
     pl_q5_1:    MatvecPipeline,
     pl_q5_0:    MatvecPipeline,
@@ -89,6 +91,10 @@ pub const GpuWeights = struct {
     //                     CPU reads it after submit.
     expert_in_buf:      ?GpuBuffer,
     expert_mid_bufs:    ?[]GpuBuffer,
+    // Per-expert Q8_1-quantized mid buffers — populated by a quantize dispatch
+    // between phase 1 and phase 2 when down has a Q8_1 pipeline. Sized to
+    // q8_1OutBytes(d_expert).
+    expert_mid_q8_1_bufs: ?[]GpuBuffer,
     expert_all_out_buf: ?GpuBuffer,
     expert_scales_buf:  ?GpuBuffer,
     moe_gpu_buf:        ?GpuBuffer,
@@ -139,6 +145,12 @@ pub const GpuWeights = struct {
         var pl_q4_k_q8_1 = try MatvecPipeline.initQ4KQ8_1(&ctx);
         errdefer pl_q4_k_q8_1.deinit();
         std.debug.print("  init: pl_q4_k_q8_1 ok\n", .{});
+        var pl_q5_0_q8_1 = try MatvecPipeline.initQ5_0Q8_1(&ctx);
+        errdefer pl_q5_0_q8_1.deinit();
+        std.debug.print("  init: pl_q5_0_q8_1 ok\n", .{});
+        var pl_q5_1_q8_1 = try MatvecPipeline.initQ5_1Q8_1(&ctx);
+        errdefer pl_q5_1_q8_1.deinit();
+        std.debug.print("  init: pl_q5_1_q8_1 ok\n", .{});
         var pl_quantize_q8_1 = try QuantizeQ8_1Pipeline.init(&ctx);
         errdefer pl_quantize_q8_1.deinit();
         std.debug.print("  init: pl_quantize_q8_1 ok\n", .{});
@@ -172,6 +184,8 @@ pub const GpuWeights = struct {
             .pl_q3_k = pl_q3_k, .pl_q4_k = pl_q4_k,
             .pl_q3_k_q8_1 = pl_q3_k_q8_1,
             .pl_q4_k_q8_1 = pl_q4_k_q8_1,
+            .pl_q5_0_q8_1 = pl_q5_0_q8_1,
+            .pl_q5_1_q8_1 = pl_q5_1_q8_1,
             .pl_quantize_q8_1 = pl_quantize_q8_1,
             .pl_q5_1 = pl_q5_1, .pl_q5_0 = pl_q5_0,
             .pl_fused_gu = pl_fused_gu, .pl_fused_gu_q8_1 = pl_fused_gu_q8_1,
@@ -181,7 +195,7 @@ pub const GpuWeights = struct {
             .shared_acts_q8_1 = null,
             .expert_gate = null, .expert_up = null, .expert_down = null,
             .n_experts = g4cfg.n_experts, .n_experts_used = g4cfg.n_experts_used,
-            .expert_in_buf = null, .expert_mid_bufs = null,
+            .expert_in_buf = null, .expert_mid_bufs = null, .expert_mid_q8_1_bufs = null,
             .expert_all_out_buf = null, .expert_scales_buf = null, .moe_gpu_buf = null,
             .expert_in_slice = null, .expert_scales_slice = null, .moe_gpu_slice = null,
             .q_out_buf = null, .k_out_buf = null, .v_out_buf = null,
@@ -306,6 +320,14 @@ pub const GpuWeights = struct {
             gw.expert_mid_bufs.?[k] = try GpuBuffer.initDeviceLocal(&gw.ctx,
                 g4cfg.d_expert * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         }
+        // Per-expert Q8_1 mid buffers (sized for the d_expert column count).
+        // 8 experts × q8_1OutBytes(704) = 8 × 864 = 6912 bytes total — trivial.
+        const mid_q8_1_bytes = mv_mod.q8_1OutBytes(@intCast(g4cfg.d_expert));
+        gw.expert_mid_q8_1_bufs = try allocator.alloc(GpuBuffer, nu);
+        for (0..nu) |k| {
+            gw.expert_mid_q8_1_bufs.?[k] = try GpuBuffer.initDeviceLocal(&gw.ctx,
+                mid_q8_1_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        }
 
         gw.expert_all_out_buf = try GpuBuffer.initDeviceLocal(&gw.ctx,
             nu * g4cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -330,6 +352,10 @@ pub const GpuWeights = struct {
         if (self.moe_gpu_buf)       |*b| { b.unmap(); b.deinit(); }
         if (self.expert_scales_buf) |*b| { b.unmap(); b.deinit(); }
         if (self.expert_all_out_buf)|*b| b.deinit();
+        if (self.expert_mid_q8_1_bufs) |bs| {
+            for (bs) |*b| b.deinit();
+            self.allocator.free(bs);
+        }
         if (self.expert_mid_bufs)   |bs| {
             for (bs) |*b| b.deinit();
             self.allocator.free(bs);
@@ -355,6 +381,8 @@ pub const GpuWeights = struct {
         self.pl_q5_0.deinit();
         self.pl_q5_1.deinit();
         self.pl_quantize_q8_1.deinit();
+        self.pl_q5_1_q8_1.deinit();
+        self.pl_q5_0_q8_1.deinit();
         self.pl_q4_k_q8_1.deinit();
         self.pl_q3_k_q8_1.deinit();
         self.pl_q4_k.deinit();
@@ -515,6 +543,8 @@ pub const GpuWeights = struct {
         return switch (t) {
             .q3_k => &self.pl_q3_k_q8_1,
             .q4_k => &self.pl_q4_k_q8_1,
+            .q5_0 => &self.pl_q5_0_q8_1,
+            .q5_1 => &self.pl_q5_1_q8_1,
             else  => null,
         };
     }
@@ -617,7 +647,13 @@ pub const GpuWeights = struct {
                 return error.ExpertNotOnGpu;
         }
 
-        const pl_dn = self.pipelineFor(down_type);
+        const pl_dn_f32 = self.pipelineFor(down_type);
+        // Optional Q8_1-acts pipeline for down. When non-null, each expert's
+        // f32 mid_buf gets quantized to its own Q8_1 mid_q8_1_buf between
+        // phases, and down reads that instead of the raw f32 mid_buf.
+        const pl_dn_q8_1 = self.q8_1PipelineFor(down_type);
+        const use_q8_1_dn = pl_dn_q8_1 != null;
+        const mid_q8_1_bufs = self.expert_mid_q8_1_bufs;
 
         // Use the Q8_1 fused gate+up shader when gate/up are Q3_K.  Both fused
         // shaders share the same binding layout; we just swap pipelines.
@@ -638,6 +674,7 @@ pub const GpuWeights = struct {
 
         const cmd = try self.ctx.beginBatch();
         var fused_dsets: [16]vk.VkDescriptorSet = undefined;
+        var quant_dn_dsets: [16]vk.VkDescriptorSet = undefined;
         var down_dsets:  [16]vk.VkDescriptorSet = undefined;
         var quant_dset:  ?vk.VkDescriptorSet = null;
 
@@ -656,8 +693,21 @@ pub const GpuWeights = struct {
                 cmd, &sg.mat_buf, &su.mat_buf, gu_in_buf, &mid_bufs[k], sg.rows, sg.cols);
         }
 
-        // Barrier: fused writes mid_bufs, down reads mid_bufs
+        // Barrier: fused writes mid_bufs; either quantize or down reads them.
         GpuCtx.recordShaderBarrier(cmd);
+
+        // Phase 1.5 (Q8_1 down only): quantize each expert's f32 mid_buf into
+        // its own Q8_1 mid_q8_1_buf. One dispatch per expert; cheap relative
+        // to the down matmul that follows.
+        if (use_q8_1_dn) {
+            const sd0 = ed_sessions[layer * self.n_experts + top_idx[0]].?;
+            const d_expert: u32 = @intCast(sd0.cols);
+            for (0..n) |k| {
+                quant_dn_dsets[k] = try self.pl_quantize_q8_1.record(
+                    cmd, &mid_bufs[k], &mid_q8_1_bufs.?[k], d_expert);
+            }
+            GpuCtx.recordShaderBarrier(cmd);
+        }
 
         // Phase 2: down matmul; each expert writes into its sub-range of expert_all_out_buf.
         const d_model: u64 = blk: {
@@ -668,8 +718,11 @@ pub const GpuWeights = struct {
             const sd = ed_sessions[layer * self.n_experts + top_idx[k]].?;
             const out_off = k * d_model * @sizeOf(f32);
             const out_sz  = d_model * @sizeOf(f32);
+            const dn_in_buf: *const GpuBuffer = if (use_q8_1_dn)
+                &mid_q8_1_bufs.?[k] else &mid_bufs[k];
+            const pl_dn = if (use_q8_1_dn) pl_dn_q8_1.? else pl_dn_f32;
             down_dsets[k] = try pl_dn.recordToRange(
-                cmd, &sd.mat_buf, &mid_bufs[k],
+                cmd, &sd.mat_buf, dn_in_buf,
                 all_out_buf.handle, out_off, out_sz, sd.rows, sd.cols);
         }
 
@@ -682,10 +735,15 @@ pub const GpuWeights = struct {
 
         try self.ctx.submitBatch(cmd);
 
+        const pl_dn_used = if (use_q8_1_dn) pl_dn_q8_1.? else pl_dn_f32;
         for (fused_dsets[0..n]) |*ds|
             _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_gu.desc_pool, 1, ds);
         for (down_dsets[0..n]) |*ds|
-            _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_dn.desc_pool, 1, ds);
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_dn_used.desc_pool, 1, ds);
+        if (use_q8_1_dn) {
+            for (quant_dn_dsets[0..n]) |*ds|
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, ds);
+        }
         if (quant_dset) |*ds|
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, ds);
         var accum_ds = accum_dset;

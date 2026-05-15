@@ -178,22 +178,27 @@ Shaders added:
 - `matvec_q4_k_q8_1.glsl` — Q4_K weights × Q8_1 acts
 - `matvec_q3_k_q8_1.glsl` — Q3_K weights × Q8_1 acts
 - `matvec_fused_gu_q3k_q8_1.glsl` — fused gate+gelu+up for Q3_K MoE experts
+- `matvec_q5_0_q8_1.glsl` — Q5_0 weights × Q8_1 acts
+- `matvec_q5_1_q8_1.glsl` — Q5_1 weights × Q8_1 acts
 
 Coverage today: all 30 attention layers (wq+wk+wv, mixed Q3_K/Q4_K) + all MoE
-fused gate+up dispatches (Q3_K). Still on the f32-activation path: wo
-(Q4_K, cols=4096), dense FFN (Q3_K gate/up + Q5_1 down), expert down
-(Q5_0/Q5_1).
+expert matmuls (fused Q3_K gate+up AND Q5_0/Q5_1 down). Still on the
+f32-activation path: wo (Q4_K, cols=4096) and dense FFN (Q3_K gate/up + Q5_1
+down).
 
 | Mode | tok/s prefill | tok/s decode |
 |------|--------------|--------------|
 | Phase 7f baseline (no Q8_1) | 3.10–3.17 | 3.06–3.09 |
 | Q8_1 attention only (6 of 30 layers, Q4_K only) | ~3.11 | ~3.08 |
 | Q8_1 attention all 30 layers (Q3_K + Q4_K) | ~3.21 | ~3.15 |
-| Q8_1 attention + Q8_1 fused MoE gate+up | **3.71–3.78** | **3.66–3.68** |
+| Q8_1 attention + Q8_1 fused MoE gate+up | 3.71–3.78 | 3.66–3.68 |
+| Q8_1 attention + full Q8_1 MoE (gate+up + down) | **~3.86** | **~3.66–3.70** |
 
-Net **+20%** end-to-end vs Phase 7f. The single biggest contribution was the
-Q8_1 fused MoE shader (+15%); attention-only gave +3%. This is consistent
-with the compute breakdown (experts dominate Gemma4 decode time).
+Net **~+22% prefill / +20% decode** end-to-end vs Phase 7f baseline. The
+biggest contribution is the Q8_1 fused MoE gate+up (+15%); the down-side
+Q5_0/Q5_1 Q8_1 path adds another +2–4% on top (it's a smaller matmul but
+already had the f32-acts batch-friendly down dispatch eliminating most of
+the f32 overhead).
 
 Numerics: `llmtoy compare` is essentially unchanged vs the pre-Q8_1 baseline
 (per-layer rel_err matches within 0.01%; same pre-existing L28 argmax FAIL).
@@ -211,14 +216,15 @@ Hyperfine 3-run wall-clock for `generate "explain MoE in two sentences"
 --chat --temperature 0 --max-tokens 64 --gpu` (includes ~5.8 s model
 setup):
 
-| Stage                                     | mean ± σ          |
-|-------------------------------------------|-------------------|
-| Pre-Q8_1 (Phase 7f baseline)              | 32.17 ± 0.71 s    |
-| Q8_1 attention + Q8_1 fused MoE gate+up   | **28.86 ± 0.37 s**|
+| Stage                                          | mean ± σ          |
+|------------------------------------------------|-------------------|
+| Pre-Q8_1 (Phase 7f baseline)                   | 32.17 ± 0.71 s    |
+| Q8_1 attention + Q8_1 fused MoE gate+up        | 28.86 ± 0.37 s    |
+| Q8_1 attention + full Q8_1 MoE (gate+up+down)  | **27.57 ± 0.41 s**|
 
-Compute-only delta (subtracting the constant ~5.8 s model load): 26.4 s →
-23.0 s, **+15% throughput**. Single-run tok/s reports 3.71–3.78 prefill,
-3.66–3.68 decode — matches the wall-clock drop.
+Compute-only delta (subtracting the ~5.8 s model load): 26.4 s → 21.8 s,
+**+21% throughput** at the full-Q8_1-MoE stage. Single-run tok/s reports
+3.86 prefill / 3.66–3.70 decode — matches the wall-clock drop.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
