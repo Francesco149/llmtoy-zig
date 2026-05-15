@@ -531,13 +531,21 @@ pub const FusedGateUpPipeline = struct {
     dset_layout: vk.VkDescriptorSetLayout,
     desc_pool:  vk.VkDescriptorPool,
     device:     vk.VkDevice,
+    rows_per_workgroup: u32,
 
     pub fn init(ctx: *const GpuContext) !FusedGateUpPipeline {
         comptime std.debug.assert(shaders.matvec_fused_gu_q3k.len % 4 == 0);
-        return initFromSpv(ctx, &shaders.matvec_fused_gu_q3k);
+        return initFromSpv(ctx, &shaders.matvec_fused_gu_q3k, 64);
     }
 
-    fn initFromSpv(ctx: *const GpuContext, spv: anytype) !FusedGateUpPipeline {
+    // Q3_K weights × Q8_1 activations, fused gate-gelu-up. Same 4-binding
+    // layout (gate, up, acts, out); 32 threads cooperate per output row.
+    pub fn initQ8_1(ctx: *const GpuContext) !FusedGateUpPipeline {
+        comptime std.debug.assert(shaders.matvec_fused_gu_q3k_q8_1.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.matvec_fused_gu_q3k_q8_1, 1);
+    }
+
+    fn initFromSpv(ctx: *const GpuContext, spv: anytype, rows_per_workgroup: u32) !FusedGateUpPipeline {
         std.debug.assert(@intFromPtr(spv) % 4 == 0);
         const dev = ctx.device;
 
@@ -610,6 +618,7 @@ pub const FusedGateUpPipeline = struct {
         return .{
             .pipeline = pipeline, .layout = layout,
             .dset_layout = dset_layout, .desc_pool = desc_pool, .device = dev,
+            .rows_per_workgroup = rows_per_workgroup,
         };
     }
 
@@ -653,7 +662,7 @@ pub const FusedGateUpPipeline = struct {
         const pc = PushConst{ .rows = rows, .cols = cols };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
             0, @sizeOf(PushConst), &pc);
-        const groups = (rows + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        const groups = (rows + self.rows_per_workgroup - 1) / self.rows_per_workgroup;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
 
         return dset;

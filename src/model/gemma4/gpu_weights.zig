@@ -61,6 +61,7 @@ pub const GpuWeights = struct {
     pl_q5_1:    MatvecPipeline,
     pl_q5_0:    MatvecPipeline,
     pl_fused_gu: FusedGateUpPipeline,
+    pl_fused_gu_q8_1: FusedGateUpPipeline,
     pl_accum:    AccumPipeline,
     layers:     []GpuLayerWeights,
     lm_head:    ?MatvecSession,
@@ -152,6 +153,9 @@ pub const GpuWeights = struct {
         var pl_fused_gu = try FusedGateUpPipeline.init(&ctx);
         errdefer pl_fused_gu.deinit();
         std.debug.print("  init: pl_fused_gu ok\n", .{});
+        var pl_fused_gu_q8_1 = try FusedGateUpPipeline.initQ8_1(&ctx);
+        errdefer pl_fused_gu_q8_1.deinit();
+        std.debug.print("  init: pl_fused_gu_q8_1 ok\n", .{});
         var pl_accum = try AccumPipeline.init(&ctx);
         errdefer pl_accum.deinit();
         std.debug.print("  init: pl_accum ok\n", .{});
@@ -170,7 +174,8 @@ pub const GpuWeights = struct {
             .pl_q4_k_q8_1 = pl_q4_k_q8_1,
             .pl_quantize_q8_1 = pl_quantize_q8_1,
             .pl_q5_1 = pl_q5_1, .pl_q5_0 = pl_q5_0,
-            .pl_fused_gu = pl_fused_gu, .pl_accum = pl_accum,
+            .pl_fused_gu = pl_fused_gu, .pl_fused_gu_q8_1 = pl_fused_gu_q8_1,
+            .pl_accum = pl_accum,
             .layers = layers, .lm_head = null,
             .shared_vec = null, .shared_out = null,
             .shared_acts_q8_1 = null,
@@ -345,6 +350,7 @@ pub const GpuWeights = struct {
         for (self.layers) |*l| l.deinitAll();
         self.allocator.free(self.layers);
         self.pl_accum.deinit();
+        self.pl_fused_gu_q8_1.deinit();
         self.pl_fused_gu.deinit();
         self.pl_q5_0.deinit();
         self.pl_q5_1.deinit();
@@ -590,7 +596,6 @@ pub const GpuWeights = struct {
         router_out: []const f32,
         moe_buf: []f32,
     ) !void {
-        _ = gate_up_type; // fused pipeline is Q3_K-specific; gate_up_type must be q3_k
         const n = top_idx.len;
         const eg_sessions = self.expert_gate orelse return error.ExpertNotOnGpu;
         const eu_sessions = self.expert_up   orelse return error.ExpertNotOnGpu;
@@ -603,6 +608,7 @@ pub const GpuWeights = struct {
         const in_slice     = self.expert_in_slice     orelse return error.ExpertNotOnGpu;
         const scales_slice = self.expert_scales_slice orelse return error.ExpertNotOnGpu;
         const moe_slice    = self.moe_gpu_slice       orelse return error.ExpertNotOnGpu;
+        const acts_q8_1    = &(self.shared_acts_q8_1  orelse return error.ExpertNotOnGpu);
 
         for (top_idx) |eidx| {
             if (eg_sessions[layer * self.n_experts + eidx] == null or
@@ -612,6 +618,14 @@ pub const GpuWeights = struct {
         }
 
         const pl_dn = self.pipelineFor(down_type);
+
+        // Use the Q8_1 fused gate+up shader when gate/up are Q3_K.  Both fused
+        // shaders share the same binding layout; we just swap pipelines.
+        const use_q8_1_gu = gate_up_type == .q3_k;
+        const pl_gu = if (use_q8_1_gu) &self.pl_fused_gu_q8_1 else &self.pl_fused_gu;
+        // For the Q8_1 path the gate+up dispatches read `acts_q8_1` instead of
+        // `in_buf`. moe_in.len gives us the column count for the quantize call.
+        const gu_in_buf = if (use_q8_1_gu) acts_q8_1 else in_buf;
 
         // Write inputs and per-expert scales to HOST_COHERENT buffers.
         @memcpy(in_slice, moe_in);
@@ -625,13 +639,21 @@ pub const GpuWeights = struct {
         const cmd = try self.ctx.beginBatch();
         var fused_dsets: [16]vk.VkDescriptorSet = undefined;
         var down_dsets:  [16]vk.VkDescriptorSet = undefined;
+        var quant_dset:  ?vk.VkDescriptorSet = null;
+
+        // Optional Phase 0: f32 moe_in → Q8_1 in shared_acts_q8_1 once.
+        if (use_q8_1_gu) {
+            quant_dset = try self.pl_quantize_q8_1.record(
+                cmd, in_buf, acts_q8_1, @intCast(moe_in.len));
+            GpuCtx.recordShaderBarrier(cmd);
+        }
 
         // Phase 1: fused gate-gelu-up for each expert
         for (0..n) |k| {
             const sg = eg_sessions[layer * self.n_experts + top_idx[k]].?;
             const su = eu_sessions[layer * self.n_experts + top_idx[k]].?;
-            fused_dsets[k] = try self.pl_fused_gu.record(
-                cmd, &sg.mat_buf, &su.mat_buf, in_buf, &mid_bufs[k], sg.rows, sg.cols);
+            fused_dsets[k] = try pl_gu.record(
+                cmd, &sg.mat_buf, &su.mat_buf, gu_in_buf, &mid_bufs[k], sg.rows, sg.cols);
         }
 
         // Barrier: fused writes mid_bufs, down reads mid_bufs
@@ -661,9 +683,11 @@ pub const GpuWeights = struct {
         try self.ctx.submitBatch(cmd);
 
         for (fused_dsets[0..n]) |*ds|
-            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_fused_gu.desc_pool, 1, ds);
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_gu.desc_pool, 1, ds);
         for (down_dsets[0..n]) |*ds|
             _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_dn.desc_pool, 1, ds);
+        if (quant_dset) |*ds|
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, ds);
         var accum_ds = accum_dset;
         _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_accum.desc_pool, 1, &accum_ds);
 
