@@ -336,6 +336,35 @@ CPU `perf` after IQ4_NL no longer shows `dotIQ4NL`. Remaining model-side CPU
 fallback is primarily `dequantQ5K`, which maps to the two Q5_K attention-V
 tensors in layers 3 and 4.
 
+## Phase 7m/Q5_K — Last quantized matmul fallback removed
+
+Added `matvec_q5_k_q8_1.glsl` for the two remaining Q5_K attention-V tensors:
+`blk.3.attn_v.weight` and `blk.4.attn_v.weight`. This makes every quantized
+matmul tensor in this Gemma4 APEX-I-Mini GGUF GPU-supported; `llmtoy info`
+now reports `unsupported GPU quant tensors: none`.
+
+Verification:
+
+- `zig build test`: Q5_K x Q8_1 fuzz passes at `rel=5.731e-4` small and
+  `rel=3.731e-4` for attn-V-shaped `64x2816`.
+- Full `llmtoy compare`: all layer argmaxes match; final argmax token `1852`
+  matches. Worst layer was L28 at `rel=5.669%`, argmax ok.
+
+Same short prompt as above:
+
+| Metric | + IQ4_NL | + Q5_K |
+|--------|----------|--------|
+| Prefill | 15.23 tok/s | 17.52 tok/s |
+| Decode | 15.05 tok/s | 17.08 tok/s |
+| Unsupported quant tensors | 2 Q5_K | none |
+
+CPU `perf` after Q5_K no longer shows `dequantQ5K`, `dotIQ4NL`, or
+`dequantQ6K`. The largest CPU samples are now Vulkan allocation/setup,
+memcpy upload/download, and orchestration around `runExpertBatch` rather than
+quantized CPU matvec. The next optimization target should therefore stop adding
+one-off quant fallbacks and move to the planned microbench/MMVQ work or reduce
+known synchronization/download overhead.
+
 The submit-count reductions buy ~150–300 µs/token in saved overhead. On
 RX 7800 XT with our shaders the absolute per-submit cost (~150 µs) is
 small relative to the 220 ms of GPU matmul work per token, so each saved

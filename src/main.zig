@@ -301,7 +301,7 @@ fn cmdInfo(out: *std.Io.Writer, path: []const u8, io: std.Io, gpa: std.mem.Alloc
 
 fn isGpuQuantSupported(t: @import("gguf/types.zig").GgmlType) bool {
     return switch (t) {
-        .f32, .q8_0, .q3_k, .q4_k, .q5_0, .q5_1, .q6_k => true,
+        .f32, .q8_0, .q3_k, .q4_k, .q5_0, .q5_1, .q6_k, .q5_k, .iq4_nl => true,
         else => false,
     };
 }

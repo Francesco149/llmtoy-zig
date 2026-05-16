@@ -4,16 +4,16 @@ Current status as of 2026-05-16: the Vulkan path is correct enough to optimize,
 but still well behind llama.cpp Vulkan on the same Gemma4 26B A4B / RX 7800 XT
 class setup. The earlier plan correctly pushed us toward Q8_1 activations and
 more GPU-resident state, but the code has moved on: Q8_1 matvecs, GPU
-RMSNorm/RoPE, VRAM KV cache, decode attention, GPU timestamp profiling, Q6_K
-x Q8_1 lm_head/token-embedding coverage, and IQ4_NL x Q8_1 expert-down
-coverage now exist.
+RMSNorm/RoPE, VRAM KV cache, decode attention, GPU timestamp profiling, and
+Q8_1 paths for every quantized matmul format used by the target GGUF now exist.
 
 The ground truth now is simple:
 
 - End-to-end decode was about 4 tok/s before the Q6_K fallback fix, about
-  10 tok/s after Q6_K, and about 15 tok/s after IQ4_NL expert-down coverage.
-  llama.cpp is reported around 80-100 tok/s on this hardware, but Phase 7t must
-  turn that into a local apples-to-apples reference run.
+  10 tok/s after Q6_K, about 15 tok/s after IQ4_NL expert-down coverage, and
+  about 17 tok/s after Q5_K attention-V coverage. llama.cpp is reported around
+  80-100 tok/s on this hardware, but Phase 7t must turn that into a local
+  apples-to-apples reference run.
 - Submit count and CPU attention were secondary effects before profiling.
 - Initial timestamp profiling showed only about 307 ms of measured GPU dispatch
   time across a 28-token short run while wall time was about 6.2 s. CPU `perf`
@@ -22,9 +22,9 @@ The ground truth now is simple:
 - The repo now has early opt-in GPU timestamp profiling. It is sufficient to
   catch large blind spots, but still needs per-layer/per-shape detail before
   shader work can move fast.
-- After Q6_K and IQ4_NL fallback removal, the expected dominant bottleneck is
-  cumulative GPU layer work, the remaining Q5_K attention-V CPU fallback, and
-  synchronization around many small dispatch batches.
+- After Q6_K, IQ4_NL, and Q5_K fallback removal, the expected dominant
+  bottleneck is cumulative GPU layer work, synchronization around many small
+  dispatch batches, and remaining CPU orchestration/download overhead.
 
 The target is not "make one more fused shader." The target is to either port
 llama.cpp's actual Vulkan MMVQ/MMQ strategy faithfully enough to match it, or
@@ -163,7 +163,7 @@ final decode pipeline should look much closer to llama.cpp's Vulkan graph:
 
 - Weights are uploaded once and stay in VRAM. Supported quant formats include
   all formats the target model actually uses on hot tensors: Q3_K, Q4_K,
-  Q5_0/Q5_1, Q6_K, IQ4_NL, and later Q5_K only when profiling proves it matters.
+  Q5_0/Q5_1, Q5_K, Q6_K, and IQ4_NL.
 - The residual stream, normalized activations, Q/K/V, KV cache, MoE
   intermediates, and logits scratch stay device-resident across the token. CPU
   should not see intermediate vectors except for sampling/logits and optional
@@ -181,8 +181,8 @@ final decode pipeline should look much closer to llama.cpp's Vulkan graph:
   spans, CPU perf, and periodic llama.cpp reference runs are the source of truth.
 
 This means near-term fixes are only worth doing if they either remove a current
-CPU fallback or become one of the final MMVQ/MMQ kernels. Q6_K x Q8_1 and
-IQ4_NL x Q8_1 both qualify: they remove observed fallbacks now and cover quant
+CPU fallback or become one of the final MMVQ/MMQ kernels. Q6_K, IQ4_NL, and
+Q5_K x Q8_1 all qualified because they removed observed fallbacks and cover
 formats used by this target model.
 
 ---
@@ -222,6 +222,14 @@ After adding IQ4_NL x Q8_1 expert-down routing:
 - `llmtoy info` maps the remaining unsupported model tensors to two Q5_K
   attention-V matrices in layers 3 and 4. That is now the only known quantized
   matmul CPU fallback in this model.
+
+After adding Q5_K x Q8_1 attention-V routing:
+
+- Prefill/generation rose again to about 17 tok/s on the same short prompt.
+- `dequantQ5K` disappeared from CPU `perf`.
+- `llmtoy info` now reports no unsupported GPU quant tensors for this target
+  GGUF. Future work should stop chasing one-off quant fallbacks and move to
+  MMVQ/MMQ kernel shape, synchronization, and command/descriptor overhead.
 
 Add a GPU profiler that can answer: where does one token spend GPU time, by
 layer and by dispatch type?
@@ -300,9 +308,7 @@ Goal: replace the current one-row Q8_1 matvec shaders with a close port of
 llama.cpp's MMVQ structure, then tune for RX 7800 XT.
 
 Start with Q4_K because it is easiest to compare against
-`mul_mat_vec_q4_k.comp`. Then port Q3_K, Q5_0, Q5_1, Q6_K, and IQ4_NL. Add
-Q5_K only if the remaining layer-3/4 attention-V fallback matters after broader
-MMVQ and synchronization work.
+`mul_mat_vec_q4_k.comp`. Then port Q3_K, Q5_0, Q5_1, Q6_K, Q5_K, and IQ4_NL.
 
 Implementation plan:
 
@@ -334,8 +340,8 @@ Implementation plan:
    Its current lookup-table shader is useful, but it is not a faithful
    llama.cpp MMVQ-style kernel.
 
-8. Add Q5_K only if profiling shows the two layer-3/4 attention-V tensors have
-   material cost. Correctness first; K-quants are easy to get subtly wrong.
+8. Add Q5_K to the MMVQ family after the fallback-removal shader is stable.
+   Correctness first; K-quants are easy to get subtly wrong.
 
 Acceptance criteria:
 

@@ -90,6 +90,11 @@ pub const MatvecPipeline = struct {
         return initFromSpv(ctx, &shaders.matvec_q6_k_q8_1, 1);
     }
 
+    pub fn initQ5KQ8_1(ctx: *const GpuContext) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_q5_k_q8_1.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.matvec_q5_k_q8_1, 1);
+    }
+
     pub fn initIQ4NLQ8_1(ctx: *const GpuContext) !MatvecPipeline {
         comptime std.debug.assert(shaders.matvec_iq4_nl_q8_1.len % 4 == 0);
         return initFromSpv(ctx, &shaders.matvec_iq4_nl_q8_1, 1);
@@ -429,6 +434,13 @@ pub const MatvecSession = struct {
         return initBytes(ctx, mat_bytes, rows, cols);
     }
 
+    // Upload a Q5_K quantized matrix (raw GGUF bytes) to VRAM.
+    pub fn initQ5K(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
+        std.debug.assert(cols % 256 == 0);
+        std.debug.assert(mat_bytes.len == rows * (cols / 256) * 176);
+        return initBytes(ctx, mat_bytes, rows, cols);
+    }
+
     // Upload an IQ4_NL quantized matrix (raw GGUF bytes) to VRAM.
     pub fn initIQ4NL(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
         std.debug.assert(cols % 32 == 0);
@@ -446,6 +458,7 @@ pub const MatvecSession = struct {
             .q5_1 => try initQ5_1(ctx, mat_data, rows, cols),
             .q5_0 => try initQ5_0(ctx, mat_data, rows, cols),
             .q6_k => try initQ6K(ctx, mat_data, rows, cols),
+            .q5_k => try initQ5K(ctx, mat_data, rows, cols),
             .iq4_nl => try initIQ4NL(ctx, mat_data, rows, cols),
             else  => null,
         };
@@ -2968,6 +2981,16 @@ test "gpu matvec Q6_K × Q8_1 fuzz small" {
 test "gpu matvec Q6_K × Q8_1 fuzz lm-head-shaped cols" {
     try fuzzQuantQ8_1(.q6_k, 210, 256,
         MatvecPipeline.initQ6KQ8_1, MatvecSession.initQ6K, 64, 2816, 61);
+}
+
+test "gpu matvec Q5_K × Q8_1 fuzz small" {
+    try fuzzQuantQ8_1(.q5_k, 176, 256,
+        MatvecPipeline.initQ5KQ8_1, MatvecSession.initQ5K, 32, 256, 73);
+}
+
+test "gpu matvec Q5_K × Q8_1 fuzz attn-v-shaped cols" {
+    try fuzzQuantQ8_1(.q5_k, 176, 256,
+        MatvecPipeline.initQ5KQ8_1, MatvecSession.initQ5K, 64, 2816, 79);
 }
 
 test "gpu matvec IQ4_NL × Q8_1 fuzz small" {

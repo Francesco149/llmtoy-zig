@@ -450,7 +450,7 @@ fn mv(
             // q8_1PipelineFor returns null for unsupported types so we only
             // hit this for supported quant families.
             const k_aligned = switch (mat.type_) {
-                .q3_k, .q4_k, .q6_k => sess.cols % 256 == 0,
+                .q3_k, .q4_k, .q5_k, .q6_k => sess.cols % 256 == 0,
                 .q5_0, .q5_1 => sess.cols % 32 == 0,
                 else => false,
             };
