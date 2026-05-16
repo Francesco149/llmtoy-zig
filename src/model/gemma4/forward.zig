@@ -113,17 +113,9 @@ pub fn forwardOne(
         const gpu_here = if (gpu_layer_range) |r| (l >= r[0] and l <= r[1]) else true;
         const glw: ?*const GpuLayerWeights = if (gpu != null and gpu_here) &gpu.?.layers[l] else null;
 
-        // ── Attention ─────────────────────────────────────────────────────────
-
-        // Three QKV dispatch paths, in priority order:
-        //   1. Q8_1 path:  wq+wk+(wv) are all on GPU with a Q8_1 pipeline
-        //      (currently Q3_K or Q4_K) → GPU rmsnorm(x, attn_norm) +
-        //      quantize + matvecs all in one command-buffer submit
-        //      (runLayerAttnQ8_1). CPU never touches xb on this path.
-        //   2. f32 batch:  all on GPU but some lack a Q8_1 pipeline (e.g. wv
-        //      is Q5_K at L3) → CPU rmsnorm + parallel f32-activation matvecs.
-        //   3. Per-call:   some session is missing / CPU-only → CPU rmsnorm +
-        //      independent mv() calls so each can take its own path.
+        // Decide all per-layer GPU dispatch paths up front.  The wo + post-
+        // attention residual stage is part of the dense FFN submit when
+        // can_full_fused is true, so we skip it in the attention block below.
         const wv_present = lw.wv != null;
         const wv_on_gpu  = wv_present and (if (glw) |g| g.wv != null else false);
         const wq_q8_1 = gpu != null and glw != null and glw.?.wq != null
@@ -135,6 +127,35 @@ pub fn forwardOne(
             and (!wv_present or wv_q8_1);
         const can_batch_qkv = !can_q8_1_qkv and gpu != null and glw != null and
             glw.?.wq != null and glw.?.wk != null and (!wv_present or wv_on_gpu);
+
+        const wo_q8_pl: ?*const MatvecPipeline = if (gpu) |g|
+            (if (glw != null and glw.?.wo != null) g.q8_1PipelineFor(lw.wo.type_) else null)
+        else null;
+        const gate_q8_pl: ?*const MatvecPipeline = if (gpu) |g|
+            (if (glw != null and glw.?.w_gate != null) g.q8_1PipelineFor(lw.w_gate.type_) else null)
+        else null;
+        const up_q8_pl: ?*const MatvecPipeline = if (gpu) |g|
+            (if (glw != null and glw.?.w_up != null) g.q8_1PipelineFor(lw.w_up.type_) else null)
+        else null;
+        const can_q8_1_ffn = gate_q8_pl != null and up_q8_pl != null
+            and (lw.w_gate.type_ != .q3_k or d % 256 == 0)
+            and (lw.w_up.type_   != .q3_k or d % 256 == 0);
+        const w_down_on_gpu = gpu != null and glw != null and glw.?.w_down != null;
+        const can_fused_dense = can_q8_1_ffn and w_down_on_gpu;
+        // Full fused path also needs wo on Q8_1.  wo cols = nq_l: 256-aligned
+        // (n_heads × head_dim ∈ {1024, 2048} for Gemma4) so Q3_K Q8_1 works.
+        const wo_q8_1_ok = wo_q8_pl != null
+            and (lw.wo.type_ != .q3_k or nq_l % 256 == 0);
+        const can_full_fused = can_fused_dense and wo_q8_1_ok;
+
+        // ── Attention ─────────────────────────────────────────────────────────
+        //
+        // QKV dispatch paths, in priority order:
+        //   1. Q8_1 path:  wq+wk+(wv) all on GPU with Q8_1 pipelines →
+        //      runLayerAttnQ8_1 fuses rmsnorm + quantize + matvecs.
+        //   2. f32 batch:  some session lacks a Q8_1 pipeline (e.g. Q5_K wv) →
+        //      CPU rmsnorm + parallel f32-activation matvecs.
+        //   3. Per-call:   any session missing / CPU-only → CPU rmsnorm + mv().
 
         if (can_q8_1_qkv) {
             const g = gpu.?;
@@ -230,41 +251,41 @@ pub fn forwardOne(
         }
 
         // Output projection → post-attention norm → first residual.
-        try mv(attn_buf, lw.wo, attn_concat[0..nq_l], scratch, pool, if (glw) |g| g.wo else null, gpu);
-        math.rmsnorm(attn_buf, attn_buf, lw.post_attention_norm, cfg.eps);
-        for (x, attn_buf) |*xi, a| xi.* += a;
+        // can_full_fused: skipped here; runLayerAttnResidualDenseFfnQ8_1 below
+        // does wo + post_attn_norm + residual on the GPU in one submit.
+        if (!can_full_fused) {
+            try mv(attn_buf, lw.wo, attn_concat[0..nq_l], scratch, pool, if (glw) |g| g.wo else null, gpu);
+            math.rmsnorm(attn_buf, attn_buf, lw.post_attention_norm, cfg.eps);
+            for (x, attn_buf) |*xi, a| xi.* += a;
+        }
 
         // ── Dense FFN path ────────────────────────────────────────────────────
-
-        // Four FFN dispatch paths, in priority order:
-        //   0. Full Q8_1 fused chain: gate+up have Q8_1, w_down is on GPU →
-        //      runLayerDenseFfnQ8_1 does rmsnorm + quantize + gate + up +
-        //      gelu*up + w_down + post_ffw_norm_1 in ONE submit. Eliminates
-        //      one CPU GELU step and one entire submit (the prior w_down).
-        //   1. Q8_1 gate+up only: w_down not on GPU → fused gate+up GPU,
-        //      then CPU GELU + CPU/GPU w_down + CPU post_ffw_norm_1.
-        //   2. f32 batch:  both on GPU but at least one has no Q8_1 shader.
-        //   3. Per-call:   one or both sessions missing.
-        const gate_q8_pl: ?*const MatvecPipeline = if (gpu) |g|
-            (if (glw != null and glw.?.w_gate != null) g.q8_1PipelineFor(lw.w_gate.type_) else null)
-        else null;
-        const up_q8_pl: ?*const MatvecPipeline = if (gpu) |g|
-            (if (glw != null and glw.?.w_up != null) g.q8_1PipelineFor(lw.w_up.type_) else null)
-        else null;
-        const can_q8_1_ffn = gate_q8_pl != null and up_q8_pl != null
-            and (lw.w_gate.type_ != .q3_k or d % 256 == 0)
-            and (lw.w_up.type_   != .q3_k or d % 256 == 0);
+        //
+        // FFN dispatch paths, in priority order:
+        //   -1. Full fused chain: also folds wo + post_attn_norm + residual
+        //       in, so the entire post-attention block runs in ONE submit
+        //       (runLayerAttnResidualDenseFfnQ8_1). 3 submits/layer total.
+        //    0. Fused dense FFN only (runLayerDenseFfnQ8_1): rmsnorm + gate +
+        //       up + gelu*up + w_down + post_ffw_norm_1 in one submit, but wo
+        //       still goes through its own submit. 4 submits/layer.
+        //    1. Q8_1 gate+up only: w_down not on GPU.
+        //    2. f32 batch.
+        //    3. Per-call.
         const can_batch_ffn = !can_q8_1_ffn and gpu != null and glw != null and
             glw.?.w_gate != null and glw.?.w_up != null;
-        const w_down_on_gpu = gpu != null and glw != null and glw.?.w_down != null;
-        const can_fused_dense = can_q8_1_ffn and w_down_on_gpu;
 
-        if (can_fused_dense) {
+        if (can_full_fused) {
+            const g = gpu.?;
+            try g.runLayerAttnResidualDenseFfnQ8_1(l, cfg.eps,
+                wo_q8_pl.?, gate_q8_pl.?, up_q8_pl.?,
+                g.pipelineFor(lw.w_down.type_),
+                x, attn_concat[0..nq_l], ffn_buf);
+            // x updated with post-attn residual; ffn_buf has post_ffw_norm_1.
+        } else if (can_fused_dense) {
             const g = gpu.?;
             try g.runLayerDenseFfnQ8_1(l, cfg.eps,
                 gate_q8_pl.?, up_q8_pl.?, g.pipelineFor(lw.w_down.type_),
                 x, ffn_buf);
-            // ffn_buf already holds post_ffw_norm_1(w_down(gelu(gate)*up))
         } else {
             if (can_q8_1_ffn) {
                 try gpu.?.runLayerFfnGateUpQ8_1(l, cfg.eps, gate_q8_pl.?, up_q8_pl.?,

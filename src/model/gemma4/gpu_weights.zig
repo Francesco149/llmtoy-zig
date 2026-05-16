@@ -124,6 +124,13 @@ pub const GpuWeights = struct {
     // Host-coherent download buffer for the final post_ffw_norm_1 result of
     // the fused dense FFN chain.  d_model floats.
     dense_ffn_out_buf: ?GpuBuffer,
+    // Phase 7j step 2 — wo absorbed into the dense FFN submit.
+    //   attn_in_buf: HOST_COHERENT upload buffer for attn_concat (caller
+    //                writes after CPU sdpAttn finishes).  Sized to max_nq.
+    //   attn_vram:   wo output (rows = d_model), modified in place by
+    //                post_attention_norm, then read by elem_add.
+    attn_in_buf: ?GpuBuffer,
+    attn_vram:   ?GpuBuffer,
     // Persistent host-coherent staging buffer for x_vram uploads/downloads —
     // sized to max_cols. Avoids re-allocating a staging buffer per upload.
     stage_buf: ?GpuBuffer,
@@ -273,6 +280,7 @@ pub const GpuWeights = struct {
             .x_vram = null, .xb_vram = null, .stage_buf = null,
             .gate_vram = null, .up_vram = null, .ffn_vram = null,
             .dense_ffn_out_buf = null,
+            .attn_in_buf = null, .attn_vram = null,
             .out_norm_buf = null, .rope_freqs_buf = null,
             .expert_gate = null, .expert_up = null, .expert_down = null,
             .n_experts = g4cfg.n_experts, .n_experts_used = g4cfg.n_experts_used,
@@ -384,6 +392,21 @@ pub const GpuWeights = struct {
         std.debug.print("  dense FFN VRAM: gate={} KiB up={} KiB ffn={} KiB out={} KiB\n",
             .{ dffn_bytes / 1024, dffn_bytes / 1024,
                g4cfg.d_model * @sizeOf(f32) / 1024,
+               g4cfg.d_model * @sizeOf(f32) / 1024 });
+
+        // wo input/output buffers for the combined attn-residual + dense FFN
+        // submit.  attn_in_buf is HOST_COHERENT because the caller uploads
+        // attn_concat right before the submit; attn_vram lives in VRAM so the
+        // post_attention_norm + elem_add chain runs without PCIe traffic.
+        var max_nq: u32 = 0;
+        for (gw.layers) |l| if (l.wo) |s| if (s.cols > max_nq) { max_nq = s.cols; };
+        if (max_nq == 0) max_nq = @intCast(g4cfg.d_model);
+        gw.attn_in_buf = try GpuBuffer.initHostCoherent(&gw.ctx,
+            max_nq * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.attn_vram = try GpuBuffer.initDeviceLocal(&gw.ctx,
+            g4cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std.debug.print("  wo fusion bufs: attn_in={} KiB (host) attn_vram={} KiB (VRAM)\n",
+            .{ max_nq * @sizeOf(f32) / 1024,
                g4cfg.d_model * @sizeOf(f32) / 1024 });
 
         // Per-projection output buffers for batched QKV and gate+up dispatch.
@@ -501,6 +524,8 @@ pub const GpuWeights = struct {
         if (self.q_out_buf)    |*b| b.deinit();
         if (self.rope_freqs_buf) |*b| b.deinit();
         if (self.out_norm_buf)   |*b| b.deinit();
+        if (self.attn_vram)   |*b| b.deinit();
+        if (self.attn_in_buf) |*b| b.deinit();
         if (self.dense_ffn_out_buf) |*b| b.deinit();
         if (self.ffn_vram)  |*b| b.deinit();
         if (self.up_vram)   |*b| b.deinit();
@@ -961,6 +986,148 @@ pub const GpuWeights = struct {
         _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &norm2_dset);
 
         try out_buf.download(std.mem.sliceAsBytes(ffn_out));
+    }
+
+    // 7j integrated wo + post-attention residual + dense FFN — collapses
+    // the prior wo submit and the dense FFN submit into ONE GPU submit:
+    //   1. quantize(attn_concat)              → shared_acts_q8_1   (acts for wo)
+    //   2. wo matvec (Q8_1)                    → attn_vram           (rows=d_model)
+    //   3. rmsnorm(attn_vram, post_attn_norm) → attn_vram (in place)
+    //   4. elem_add(x_buf, attn_vram)          → x_buf (post-attn residual)
+    //   5. rmsnorm(x_buf, ffn_norm)            → xb_vram
+    //   6. quantize(xb_vram)                   → shared_acts_q8_1   (acts for FFN)
+    //   7. gate matvec  (Q8_1)                 → gate_vram
+    //   8. up   matvec  (Q8_1)                 → up_vram
+    //   9. gelu_mul: gate_vram = gelu(g)*u    (in place)
+    //  10. w_down matvec (f32-acts pl_q3_k)    → ffn_vram
+    //  11. rmsnorm(ffn_vram, post_ffw_norm_1)  → dense_ffn_out_buf
+    // After submit, host-coherent x_buf holds the post-attention residual
+    // (x + attn_buf after norm) and dense_ffn_out_buf holds the dense FFN
+    // output (post_ffw_norm_1 applied).  Caller downloads both.
+    //
+    // Saves one submit (the standalone wo submit) compared to the
+    // runLayerDenseFfnQ8_1 entry point, and removes one CPU rmsnorm
+    // (post_attention_norm) plus one CPU residual loop.  Per-layer GPU
+    // submit count drops from 4 to 3 on the Q8_1 path.
+    //
+    // Requirements:
+    //   - wo, w_gate, w_up have Q8_1 pipelines; w_down has a regular
+    //     (f32-acts) pipeline.
+    //   - Uploads x and attn_concat to shared_vec / attn_in_buf internally;
+    //     caller just passes the slices.
+    //   - On return, ffn_out holds post_ffw_norm_1(...) and x (input slice)
+    //     has been overwritten with the post-attention residual.
+    pub fn runLayerAttnResidualDenseFfnQ8_1(
+        self: *const GpuWeights,
+        layer: usize,
+        eps: f32,
+        wo_pl:   *const MatvecPipeline,    // Q8_1 pipeline for wo
+        gate_pl: *const MatvecPipeline,    // Q8_1 pipeline for w_gate
+        up_pl:   *const MatvecPipeline,    // Q8_1 pipeline for w_up
+        down_pl: *const MatvecPipeline,    // f32-acts pipeline for w_down
+        x: []f32,                          // in: unnormalized residual; out: x + post_attn_norm(wo(attn_concat))
+        attn_concat: []const f32,          // CPU sdpAttn output, length = nq
+        ffn_out: []f32,                    // post_ffw_norm_1 result (d_model)
+    ) !void {
+        const lw     = &self.layers[layer];
+        const wo     = lw.wo     orelse return error.NotOnGpu;
+        const w_gate = lw.w_gate orelse return error.NotOnGpu;
+        const w_up   = lw.w_up   orelse return error.NotOnGpu;
+        const w_down = lw.w_down orelse return error.NotOnGpu;
+        const post_attn_buf       = &(lw.post_attention_norm_buf orelse return error.NotOnGpu);
+        const ffn_norm_buf        = &(lw.ffn_norm_buf            orelse return error.NotOnGpu);
+        const post_ffw_norm_1_buf = &(lw.post_ffw_norm_1_buf     orelse return error.NotOnGpu);
+        std.debug.assert(wo.cols == attn_concat.len);
+        std.debug.assert(wo.cols % 32 == 0);              // quantize block size
+        std.debug.assert(wo.rows == x.len);                // d_model
+        std.debug.assert(w_gate.cols == x.len);
+        std.debug.assert(w_gate.cols % 256 == 0);          // rmsnorm needs %256
+        std.debug.assert(w_gate.rows == w_up.rows);
+        std.debug.assert(w_down.cols == w_gate.rows);      // d_ffn
+        std.debug.assert(w_down.rows == x.len);
+        std.debug.assert(w_down.rows == ffn_out.len);
+
+        const x_buf       = &self.shared_vec.?;                     // host-coherent x
+        const attn_in_buf = &(self.attn_in_buf orelse return error.NotOnGpu);
+        const attn_vram   = &(self.attn_vram   orelse return error.NotOnGpu);
+        const xb_buf      = &(self.xb_vram     orelse return error.NotOnGpu);
+        const acts_buf    = &self.shared_acts_q8_1.?;
+        const gate_buf    = &(self.gate_vram   orelse return error.NotOnGpu);
+        const up_buf      = &(self.up_vram     orelse return error.NotOnGpu);
+        const ffn_buf     = &(self.ffn_vram    orelse return error.NotOnGpu);
+        const out_buf     = &(self.dense_ffn_out_buf orelse return error.NotOnGpu);
+
+        try x_buf.upload(std.mem.sliceAsBytes(x));
+        try attn_in_buf.upload(std.mem.sliceAsBytes(attn_concat));
+
+        const cmd = try self.ctx.beginBatch();
+
+        // wo: quantize attn_concat, then Q8_1 matvec into attn_vram.
+        const wo_quant_dset = try self.pl_quantize_q8_1.record(
+            cmd, attn_in_buf, acts_buf, @intCast(attn_concat.len));
+        GpuCtx.recordShaderBarrier(cmd);
+        const wo_dset = try wo_pl.record(
+            cmd, &wo.mat_buf, acts_buf, attn_vram, wo.rows, wo.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        // post_attention_norm in place on attn_vram.
+        const post_attn_dset = try self.pl_rmsnorm.record(
+            cmd, attn_vram, post_attn_buf, attn_vram,
+            @intCast(wo.rows), eps, false);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        // Residual: x_buf += attn_vram.  x_buf is HOST_COHERENT shared_vec
+        // pre-loaded by the caller; after this dispatch it carries the new x.
+        const add_dset = try self.pl_elem_add.record(
+            cmd, x_buf, attn_vram, @intCast(wo.rows));
+        GpuCtx.recordShaderBarrier(cmd);
+
+        // ffn_norm(x_buf) → xb_vram.
+        const ffn_norm_dset = try self.pl_rmsnorm.record(
+            cmd, x_buf, ffn_norm_buf, xb_buf,
+            @intCast(wo.rows), eps, false);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        // Re-quantize xb for the FFN Q8_1 matvecs.
+        const ffn_quant_dset = try self.pl_quantize_q8_1.record(
+            cmd, xb_buf, acts_buf, w_gate.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const gate_dset = try gate_pl.record(
+            cmd, &w_gate.mat_buf, acts_buf, gate_buf, w_gate.rows, w_gate.cols);
+        const up_dset   = try up_pl.record(
+            cmd, &w_up.mat_buf,   acts_buf, up_buf,   w_up.rows,   w_up.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const gelu_dset = try self.pl_gelu_mul.record(
+            cmd, gate_buf, up_buf, w_gate.rows);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const down_dset = try down_pl.record(
+            cmd, &w_down.mat_buf, gate_buf, ffn_buf, w_down.rows, w_down.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const post_ffw_dset = try self.pl_rmsnorm.record(
+            cmd, ffn_buf, post_ffw_norm_1_buf, out_buf,
+            @intCast(w_down.rows), eps, false);
+
+        try self.ctx.submitBatch(cmd);
+
+        const dev = self.ctx.device;
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_quantize_q8_1.desc_pool, 1, &wo_quant_dset);
+        _ = vk.vkFreeDescriptorSets(dev, wo_pl.desc_pool, 1, &wo_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &post_attn_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_elem_add.desc_pool, 1, &add_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &ffn_norm_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_quantize_q8_1.desc_pool, 1, &ffn_quant_dset);
+        _ = vk.vkFreeDescriptorSets(dev, gate_pl.desc_pool, 1, &gate_dset);
+        _ = vk.vkFreeDescriptorSets(dev, up_pl.desc_pool, 1, &up_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_gelu_mul.desc_pool, 1, &gelu_dset);
+        _ = vk.vkFreeDescriptorSets(dev, down_pl.desc_pool, 1, &down_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &post_ffw_dset);
+
+        try out_buf.download(std.mem.sliceAsBytes(ffn_out));
+        try x_buf.download(std.mem.sliceAsBytes(x));
     }
 
     // Dispatch w_gate and w_up in one command buffer (both read the same FFN-norm xb).

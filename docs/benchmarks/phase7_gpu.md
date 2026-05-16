@@ -237,6 +237,40 @@ Compute-only delta (subtracting the ~5.8 s model load): 26.4 s → 19.6 s,
 **+34% throughput**. Single-run tok/s reports 4.28 prefill / 4.07 decode —
 matches the wall-clock drop.
 
+## Phase 7j — Submit-fusion via VRAM intermediates (5 → 3 submits/layer)
+
+Reuses the 7j scaffolding (rmsnorm + elem_add + gelu_mul + dense FFN VRAM
+buffers + attn_in_buf/attn_vram) to collapse per-layer submits:
+
+| Step | Per-layer submits | Description |
+|------|---|-----------|
+| `a6ce98c` (7k\* baseline)              | 5 | QKV, wo, gate+up, w_down, experts |
+| `runLayerAttnQ8_1` + `runLayerFfnGateUpQ8_1` | 5 | Same submit count — only folds the two CPU rmsnorms into existing submits |
+| `runLayerDenseFfnQ8_1`                       | 4 | Fuses gate+up + GPU GELU + w_down + post_ffw_norm_1 — eliminates the standalone w_down submit |
+| `runLayerAttnResidualDenseFfnQ8_1`           | 3 | Also folds wo + post_attn_norm + residual into the same submit |
+
+Hyperfine 5-run wall-clock for `generate "Write three lines about the
+history of Rome." --chat --temperature 0 --max-tokens 64 --gpu` (includes
+~5.7 s model setup):
+
+| Build                                         | mean ± σ          |
+|-----------------------------------------------|-------------------|
+| `a6ce98c` baseline (5 submits/layer)          | 28.603 ± 0.125 s  |
+| Fused dense FFN (4 submits/layer)             | 28.394 ± 0.191 s  |
+| Full fused attn-residual + dense FFN (3 sub.) | 28.445 ± 0.178 s  |
+
+The submit-count reductions buy ~150–300 µs/token in saved overhead. On
+RX 7800 XT with our shaders the absolute per-submit cost (~150 µs) is
+small relative to the 220 ms of GPU matmul work per token, so each saved
+submit gives ~0.07% wall-clock — not the 1–2% the original plan estimated.
+**Major remaining lever is matmul throughput**, which is Phase 7l's
+target (attention compute on GPU, fp16 coopmat, persistent command
+buffers).
+
+All 30 layer argmaxes still match CPU; final lm_head argmax still
+matches CPU on the "explain MoE" prompt. Per-layer rel\_err is comparable
+to baseline (layer 28 worst case 4.83% vs baseline 5.59%).
+
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
 Attempted fusing gate-gelu-up + w_down into a single submit (4 submits/layer):

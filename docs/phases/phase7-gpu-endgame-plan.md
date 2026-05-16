@@ -234,26 +234,37 @@ Realistic projection on this hardware: **3 → 30–50 tok/s** in one milestone.
 
 ---
 
-## Phase 7j — RMSNorm + residual + RoPE on GPU [SHADERS DONE, INTEGRATION PENDING]
+## Phase 7j — RMSNorm + residual + GPU GELU [INTEGRATED, SUBMIT 5 → 3]
 
-**Status as of 2026-05-16:**
-- ✓ `rmsnorm.glsl` — rel 7e-8 vs CPU reference at n=2816 (workgroup-reduce
-  via subgroupAdd + shared mem). `weight_offset` push-constant flag supports
-  Gemma (1+w) convention, though this Gemma4 variant uses straight w.
-- ✓ `elem_add.glsl`, `elem_scale.glsl` — exact match (1e-6 tolerance).
-- ✓ `rope_neox_table.glsl` — rel 4e-7 at n_heads=4, head_dim=512.
-- ✓ `rope_neox_theta.glsl` — rel 1e-6 at n_heads=4, head_dim=256.
+**Status as of 2026-05-16 (integration session):**
+- ✓ All shaders done: `rmsnorm.glsl`, `elem_add.glsl`, `elem_scale.glsl`,
+  `gelu_mul.glsl`, `rope_neox_{table,theta}.glsl`. All fuzz-tested.
 - ✓ Pipelines + per-layer norm-weight buffer uploads + x_vram/xb_vram/
-  stage_buf wired into GpuWeights (commit `6f80133`).
-- ✗ forward.zig restructure — not done. Tasks 20–22 in the task list track
-  the sub-steps: attn_norm + QKV on GPU; per-head Q/K/V norms + RoPE on GPU;
-  FFN + MoE through-routing to VRAM input.
+  stage_buf in GpuWeights (commit `6f80133`).
+- ✓ **`runLayerAttnQ8_1`** — fuses attn_norm + quantize + QKV in 1 submit.
+- ✓ **`runLayerDenseFfnQ8_1`** — fuses ffn_norm + quantize + gate/up +
+  gelu*up + w_down + post_ffw_norm_1 in 1 submit (kills 1 submit/layer).
+- ✓ **`runLayerAttnResidualDenseFfnQ8_1`** — also folds wo + post_attn_norm +
+  residual into the same submit (kills another 1/layer). Per-layer count
+  drops from 5 → 3.
+- ✗ RoPE / per-head Q/K/V norms on GPU — not integrated; per-head dispatches
+  add their own submit cost and the CPU SIMD path is already cheap.
+  Deferred indefinitely (better addressed in 7l with full attention on GPU).
 
-Realistic estimate when picked up: +20–38% tok/s (fewer command-buffer
-submits + eliminated per-matmul xb upload/download). The submit-count
-analysis: today 5/layer × 30 = 150 submits/token, achievable 3/layer = 90/
-token, saves ~3 ms × 30 = ~90 ms/token = ~38% theoretical at the current
-~233 ms/token.
+**Actual measured gain:** ~0.5% on a 64-token generate
+(28.60 s baseline → 28.44 s with full 3-submit chain — borderline 1σ).
+
+**Plan estimate was wrong.** The +20–38% number assumed each saved submit
+was ~3 ms of overhead. Measured on RX 7800 XT (Mesa RADV), per-submit
+overhead is closer to **~100–200 µs**. The 5 → 3 reduction saves
+~300–600 µs/token out of ~245 ms = 0.1–0.25%.
+
+**What this means for the remaining gap to llama.cpp (4 → 80–100 tok/s):**
+submit count was not the bottleneck. The bottleneck is **GPU matmul
+throughput** — Q3_K/Q4_K integer-dot on this hardware/driver, plus the
+inability to overlap CPU attention with GPU FFN. Phase 7l (attention on
+GPU + KV-cache in VRAM) is the only remaining structural lever that
+addresses this directly.
 
 **Reordered to AFTER 7k\*.** Rationale: with Q8_1 matvecs, the CPU still has
 to receive the f32 matvec output, do the norm, do the residual add, then
@@ -356,7 +367,7 @@ tuning:
 | 7h    | Sonnet      | DONE        | 0% (correctness only, two bugs found)    |
 | 7i    | Opus        | PARTIAL     | 0% (two bugs fixed, drift deferred)      |
 | 7k\*  | Opus+Sonnet | **DONE**    | **+38% prefill, +33% decode** (3.10 → 4.28 / 3.07 → 4.07 tok/s) — plus the drift collapsed (all argmaxes match CPU after enough Q8_1 coverage) |
-| 7j    | Sonnet      | SHADERS DONE, INTEGRATION PENDING | shaders + pipelines + 9× per-layer norm-weight buffers + x_vram/xb_vram/stage_buf in place; forward.zig restructure (task 20+) deferred |
+| 7j    | Sonnet+Opus | **DONE**    | 5 → 3 submits/layer; +0.5% wall-clock (submit overhead was much smaller than estimated) |
 | 7l    | Sonnet+Opus | after 7j    | +30–50% (attention to GPU)               |
 | 7m    | Sonnet      | after 7l    | +5%                                      |
 | 7n    | Sonnet      | after 7m    | +5–10%                                   |
