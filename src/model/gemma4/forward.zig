@@ -151,13 +151,32 @@ pub fn forwardOne(
         // ── Attention ─────────────────────────────────────────────────────────
         //
         // QKV dispatch paths, in priority order:
+        //   0. 7l.1 KV-VRAM path: Q8_1 QKV + GPU per-head Q/K/V norms + GPU
+        //      RoPE + GPU KV cache append in ONE submit. Requires wv present
+        //      (global SWA layers without wv fall through to path 1).
         //   1. Q8_1 path:  wq+wk+(wv) all on GPU with Q8_1 pipelines →
         //      runLayerAttnQ8_1 fuses rmsnorm + quantize + matvecs.
         //   2. f32 batch:  some session lacks a Q8_1 pipeline (e.g. Q5_K wv) →
         //      CPU rmsnorm + parallel f32-activation matvecs.
         //   3. Per-call:   any session missing / CPU-only → CPU rmsnorm + mv().
+        const kv_cap_l = kv.cap[l];
+        const kv_slot_l = pos % kv_cap_l;
+        const can_q8_1_kv_vram = can_q8_1_qkv and wv_present
+            and (if (gpu) |g| g.k_vram != null else false);
 
-        if (can_q8_1_qkv) {
+        var gpu_did_norms_and_rope = false;
+        if (can_q8_1_kv_vram) {
+            const g = gpu.?;
+            const wq_q8_pl = g.q8_1PipelineFor(lw.wq.type_).?;
+            const wk_q8_pl = g.q8_1PipelineFor(lw.wk.type_).?;
+            const wv_q8_pl = g.q8_1PipelineFor(lw.wv.?.type_).?;
+            try g.runLayerAttnQ8_1KvVram(l, cfg.eps,
+                wq_q8_pl, wk_q8_pl, wv_q8_pl,
+                @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd),
+                @intCast(pos), is_swa, cfg.rope_theta_swa, @intCast(kv_slot_l),
+                x, q[0..nq_l], k_cur, v_cur);
+            gpu_did_norms_and_rope = true;
+        } else if (can_q8_1_qkv) {
             const g = gpu.?;
             const wq_q8_pl = g.q8_1PipelineFor(lw.wq.type_).?;
             const wk_q8_pl = g.q8_1PipelineFor(lw.wk.type_).?;
@@ -187,35 +206,35 @@ pub fn forwardOne(
             }
         }
 
-        // Per-head Q and K norms (weighted RMSNorm).
-        for (0..cfg.n_heads) |h| math.rmsnorm(
-            q[h * hd ..][0..hd], q[h * hd ..][0..hd], lw.q_norm, cfg.eps);
-        for (0..n_kv_l) |h| math.rmsnorm(
-            k_cur[h * hd ..][0..hd], k_cur[h * hd ..][0..hd], lw.k_norm, cfg.eps);
+        // Per-head Q/K/V norms + RoPE on Q,K. Done on GPU in 7l.1 path; CPU
+        // here is the fallback for paths 1–3.
+        if (!gpu_did_norms_and_rope) {
+            for (0..cfg.n_heads) |h| math.rmsnorm(
+                q[h * hd ..][0..hd], q[h * hd ..][0..hd], lw.q_norm, cfg.eps);
+            for (0..n_kv_l) |h| math.rmsnorm(
+                k_cur[h * hd ..][0..hd], k_cur[h * hd ..][0..hd], lw.k_norm, cfg.eps);
+            for (0..n_kv_l) |h| math.rmsnormRaw(
+                v_cur[h * hd ..][0..hd], v_cur[h * hd ..][0..hd], cfg.eps);
 
-        // Plain (unweighted) RMSNorm on V — Gemma4 applies this after V projection.
-        for (0..n_kv_l) |h| math.rmsnormRaw(
-            v_cur[h * hd ..][0..hd], v_cur[h * hd ..][0..hd], cfg.eps);
-
-        // RoPE on Q heads.
-        if (is_swa) {
-            for (0..cfg.n_heads) |h|
-                rope_mod.applyRopeNeox(q[h * hd ..][0..hd], pos, cfg.rope_theta_swa);
-            for (0..n_kv_l) |h|
-                rope_mod.applyRopeNeox(k_cur[h * hd ..][0..hd], pos, cfg.rope_theta_swa);
-        } else {
-            for (0..cfg.n_heads) |h|
-                rope_mod.applyRopeFreqsNeox(q[h * hd ..][0..hd], w.rope_freqs, pos);
-            for (0..n_kv_l) |h|
-                rope_mod.applyRopeFreqsNeox(k_cur[h * hd ..][0..hd], w.rope_freqs, pos);
+            if (is_swa) {
+                for (0..cfg.n_heads) |h|
+                    rope_mod.applyRopeNeox(q[h * hd ..][0..hd], pos, cfg.rope_theta_swa);
+                for (0..n_kv_l) |h|
+                    rope_mod.applyRopeNeox(k_cur[h * hd ..][0..hd], pos, cfg.rope_theta_swa);
+            } else {
+                for (0..cfg.n_heads) |h|
+                    rope_mod.applyRopeFreqsNeox(q[h * hd ..][0..hd], w.rope_freqs, pos);
+                for (0..n_kv_l) |h|
+                    rope_mod.applyRopeFreqsNeox(k_cur[h * hd ..][0..hd], w.rope_freqs, pos);
+            }
         }
 
-        // Write K, V into KV cache.
+        // Write K, V into CPU KV cache. (GPU 7l.1 path also wrote into
+        // k_vram[l]/v_vram[l]; the CPU sdpAttn still reads from kv.k[l]/kv.v[l]
+        // until 7l.2/3 puts the attention compute itself on the GPU.)
         const kv_nkv  = nkv_l;
-        const kv_cap  = kv.cap[l];
-        const kv_slot = pos % kv_cap; // circular buffer
-        @memcpy(kv.k[l][kv_slot * kv_nkv ..][0..kv_nkv], k_cur);
-        @memcpy(kv.v[l][kv_slot * kv_nkv ..][0..kv_nkv], v_cur);
+        @memcpy(kv.k[l][kv_slot_l * kv_nkv ..][0..kv_nkv], k_cur);
+        @memcpy(kv.v[l][kv_slot_l * kv_nkv ..][0..kv_nkv], v_cur);
 
         // Determine attended positions.
         const seq     = pos + 1;
@@ -235,7 +254,7 @@ pub fn forwardOne(
             for (0..win_len) |wi| {
                 // wi=0 is the oldest position, wi=win_len-1 is current (pos).
                 const abs_pos = (seq - win_len) + wi;
-                const slot    = abs_pos % kv_cap;
+                const slot    = abs_pos % kv_cap_l;
                 @memcpy(ks[wi * hd ..][0..hd], kv.k[l][slot * kv_nkv + kv_h * hd ..][0..hd]);
                 @memcpy(vs[wi * hd ..][0..hd], kv.v[l][slot * kv_nkv + kv_h * hd ..][0..hd]);
             }

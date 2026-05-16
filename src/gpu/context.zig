@@ -227,6 +227,40 @@ pub const GpuContext = struct {
         );
     }
 
+    // Compute → transfer pipeline barrier.
+    // Ensures all shader writes before this point are visible to vkCmdCopyBuffer
+    // (or any other transfer op) reads after it. Required when a copy reads a
+    // buffer that was just written by a compute dispatch in the same command
+    // buffer (e.g. 7l.1 GPU-rope output → KV cache append copy).
+    pub fn recordShaderToTransferBarrier(cmd: vk.VkCommandBuffer) void {
+        const barrier = vk.VkMemoryBarrier{
+            .sType = vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = null,
+            .srcAccessMask = vk.VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = vk.VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        vk.vkCmdPipelineBarrier(
+            cmd,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 1, &barrier, 0, null, 0, null,
+        );
+    }
+
+    // vkCmdCopyBuffer with explicit offsets, recorded into an existing command
+    // buffer. Use this for in-submit copies (e.g. appending one slot of K/V
+    // into the per-layer VRAM cache). For one-shot copies see copyBufferRegion.
+    pub fn recordCopyRegion(
+        cmd: vk.VkCommandBuffer,
+        src: vk.VkBuffer, dst: vk.VkBuffer,
+        src_offset: vk.VkDeviceSize, dst_offset: vk.VkDeviceSize,
+        size: vk.VkDeviceSize,
+    ) void {
+        const region = vk.VkBufferCopy{
+            .srcOffset = src_offset, .dstOffset = dst_offset, .size = size };
+        vk.vkCmdCopyBuffer(cmd, src, dst, 1, &region);
+    }
+
     // End recording, submit all recorded copies, wait for completion, free command buffer.
     pub fn submitBatchCopy(self: *const GpuContext, cmd: vk.VkCommandBuffer) !void {
         _ = vk.vkEndCommandBuffer(cmd);

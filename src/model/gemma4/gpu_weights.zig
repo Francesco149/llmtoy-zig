@@ -439,9 +439,15 @@ pub const GpuWeights = struct {
             if (l.w_gate) |s| if (s.rows > max_gate_rows) { max_gate_rows = s.rows; };
             if (l.w_up)   |s| if (s.rows > max_up_rows)   { max_up_rows   = s.rows; };
         }
-        gw.q_out_buf    = try GpuBuffer.initHostCoherent(&gw.ctx, max_q_rows    * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        gw.k_out_buf    = try GpuBuffer.initHostCoherent(&gw.ctx, max_k_rows    * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        gw.v_out_buf    = try GpuBuffer.initHostCoherent(&gw.ctx, max_v_rows    * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        // K and V outputs are vkCmdCopyBuffer sources during the 7l.1 GPU
+        // norms+RoPE+KV-append submit, so they need TRANSFER_SRC_BIT in
+        // addition to STORAGE_BUFFER_BIT. Q is included for symmetry/future use.
+        const qkv_out_usage: vk.VkBufferUsageFlags = @intCast(
+            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        gw.q_out_buf    = try GpuBuffer.initHostCoherent(&gw.ctx, max_q_rows    * @sizeOf(f32), qkv_out_usage);
+        gw.k_out_buf    = try GpuBuffer.initHostCoherent(&gw.ctx, max_k_rows    * @sizeOf(f32), qkv_out_usage);
+        gw.v_out_buf    = try GpuBuffer.initHostCoherent(&gw.ctx, max_v_rows    * @sizeOf(f32), qkv_out_usage);
         gw.gate_out_buf = try GpuBuffer.initHostCoherent(&gw.ctx, max_gate_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         gw.up_out_buf   = try GpuBuffer.initHostCoherent(&gw.ctx, max_up_rows   * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         std.debug.print("  batch output bufs: q={} KiB k={} KiB v={} KiB gate={} KiB up={} KiB\n", .{
@@ -893,6 +899,141 @@ pub const GpuWeights = struct {
         try q_buf.download(std.mem.sliceAsBytes(q_out));
         try k_buf.download(std.mem.sliceAsBytes(k_out));
         if (v_out) |v| try self.v_out_buf.?.download(std.mem.sliceAsBytes(v));
+    }
+
+    // 7l.1c — full attention front-end on the GPU in one submit.
+    //
+    // Same chain as runLayerAttnQ8_1 plus:
+    //   - per-head Q rmsnorm  (q_norm, Gemma 1+w convention) in-place on q_out_buf
+    //   - per-head K rmsnorm  (k_norm, Gemma 1+w convention) in-place on k_out_buf
+    //   - per-head V rmsnormRaw                              in-place on v_out_buf
+    //   - RoPE on Q (table for global, theta for SWA)
+    //   - RoPE on K
+    //   - vkCmdCopyBuffer K and V into the per-layer VRAM KV cache at slot offset
+    //
+    // The caller still receives Q, K, V on the CPU (q_out/k_out/v_out) because
+    // 7l.2/3 (GPU Q·K^T+softmax / attn·V) aren't here yet — the CPU sdpAttn
+    // still drives attention compute. Once those land, the CPU downloads
+    // disappear and Q stays in VRAM too.
+    //
+    // Requires wv (V projection). Layers without wv (Gemma4 global layers
+    // share V from K) fall back to runLayerAttnQ8_1 in forward.zig.
+    pub fn runLayerAttnQ8_1KvVram(
+        self: *const GpuWeights,
+        layer: usize,
+        eps: f32,
+        wq_pl: *const MatvecPipeline,
+        wk_pl: *const MatvecPipeline,
+        wv_pl: *const MatvecPipeline,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        pos: u32,
+        is_swa: bool,
+        rope_theta_swa: f32,
+        kv_slot: u32,
+        x: []const f32,
+        q_out: []f32,
+        k_out: []f32,
+        v_out: []f32,
+    ) !void {
+        const lw   = &self.layers[layer];
+        const wq   = lw.wq orelse return error.NotOnGpu;
+        const wk   = lw.wk orelse return error.NotOnGpu;
+        const wv   = lw.wv orelse return error.NotOnGpu;
+        const attn_norm_buf = &(lw.attn_norm_buf orelse return error.NotOnGpu);
+        const q_norm_buf    = &(lw.q_norm_buf    orelse return error.NotOnGpu);
+        const k_norm_buf    = &(lw.k_norm_buf    orelse return error.NotOnGpu);
+        std.debug.assert(wq.cols % 256 == 0);
+        std.debug.assert(wq.cols == wk.cols);
+        std.debug.assert(wq.cols == wv.cols);
+        std.debug.assert(wq.cols == x.len);
+        std.debug.assert(head_dim % 256 == 0);
+
+        const vec_buf  = &self.shared_vec.?;
+        const xb_buf   = &(self.xb_vram orelse return error.NotOnGpu);
+        const acts_buf = &self.shared_acts_q8_1.?;
+        const q_buf    = &(self.q_out_buf orelse return error.NotOnGpu);
+        const k_buf    = &(self.k_out_buf orelse return error.NotOnGpu);
+        const v_buf    = &(self.v_out_buf orelse return error.NotOnGpu);
+        const k_cache  = &((self.k_vram orelse return error.NotOnGpu)[layer]);
+        const v_cache  = &((self.v_vram orelse return error.NotOnGpu)[layer]);
+        const rope_freqs_buf = &(self.rope_freqs_buf orelse return error.NotOnGpu);
+
+        const nkv = @as(u32, @intCast(n_kv_heads * head_dim));
+        const slot_bytes:  vk.VkDeviceSize = @as(vk.VkDeviceSize, nkv) * @sizeOf(f32);
+        const slot_offset: vk.VkDeviceSize = @as(vk.VkDeviceSize, kv_slot) * slot_bytes;
+
+        try vec_buf.upload(std.mem.sliceAsBytes(x));
+
+        const cmd = try self.ctx.beginBatch();
+
+        // ── 1. attn_norm(x) → xb_vram
+        const norm_dset = try self.pl_rmsnorm.record(
+            cmd, vec_buf, attn_norm_buf, xb_buf, @intCast(x.len), eps, false);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        // ── 2. quantize(xb_vram) → acts
+        const quant_dset = try self.pl_quantize_q8_1.record(
+            cmd, xb_buf, acts_buf, wq.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        // ── 3. QKV matvecs (parallel; share acts read)
+        const q_mv_dset = try wq_pl.record(cmd, &wq.mat_buf, acts_buf, q_buf, wq.rows, wq.cols);
+        const k_mv_dset = try wk_pl.record(cmd, &wk.mat_buf, acts_buf, k_buf, wk.rows, wk.cols);
+        const v_mv_dset = try wv_pl.record(cmd, &wv.mat_buf, acts_buf, v_buf, wv.rows, wv.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        // ── 4. Per-head normalization in-place
+        //   Q: rmsnorm with q_norm,    Gemma (1+w) convention
+        //   K: rmsnorm with k_norm,    Gemma (1+w) convention
+        //   V: rmsnormRaw (no weight). v_buf is bound to the W slot too —
+        //      the shader doesn't read it when use_weight==0, so any valid
+        //      buffer works.
+        const qn_dset = try self.pl_rmsnorm_perhead.record(
+            cmd, q_buf, q_norm_buf, q_buf, n_heads,    head_dim, eps, true,  true);
+        const kn_dset = try self.pl_rmsnorm_perhead.record(
+            cmd, k_buf, k_norm_buf, k_buf, n_kv_heads, head_dim, eps, true,  true);
+        const vn_dset = try self.pl_rmsnorm_perhead.record(
+            cmd, v_buf, v_buf,      v_buf, n_kv_heads, head_dim, eps, false, false);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        // ── 5. RoPE on Q and K (V isn't rotated)
+        var qr_dset: vk.VkDescriptorSet = null;
+        var kr_dset: vk.VkDescriptorSet = null;
+        var rope_pool: vk.VkDescriptorPool = undefined;
+        if (is_swa) {
+            qr_dset = try self.pl_rope_theta.record(cmd, q_buf, pos, head_dim, rope_theta_swa, n_heads);
+            kr_dset = try self.pl_rope_theta.record(cmd, k_buf, pos, head_dim, rope_theta_swa, n_kv_heads);
+            rope_pool = self.pl_rope_theta.desc_pool;
+        } else {
+            qr_dset = try self.pl_rope_table.record(cmd, q_buf, rope_freqs_buf, pos, head_dim, n_heads);
+            kr_dset = try self.pl_rope_table.record(cmd, k_buf, rope_freqs_buf, pos, head_dim, n_kv_heads);
+            rope_pool = self.pl_rope_table.desc_pool;
+        }
+        GpuCtx.recordShaderToTransferBarrier(cmd);
+
+        // ── 6. Append K, V to the per-layer VRAM cache at this slot
+        GpuCtx.recordCopyRegion(cmd, k_buf.handle, k_cache.handle, 0, slot_offset, slot_bytes);
+        GpuCtx.recordCopyRegion(cmd, v_buf.handle, v_cache.handle, 0, slot_offset, slot_bytes);
+
+        try self.ctx.submitBatch(cmd);
+
+        const dev = self.ctx.device;
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool,        1, &norm_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_quantize_q8_1.desc_pool,  1, &quant_dset);
+        _ = vk.vkFreeDescriptorSets(dev, wq_pl.desc_pool,                  1, &q_mv_dset);
+        _ = vk.vkFreeDescriptorSets(dev, wk_pl.desc_pool,                  1, &k_mv_dset);
+        _ = vk.vkFreeDescriptorSets(dev, wv_pl.desc_pool,                  1, &v_mv_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm_perhead.desc_pool, 1, &qn_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm_perhead.desc_pool, 1, &kn_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm_perhead.desc_pool, 1, &vn_dset);
+        _ = vk.vkFreeDescriptorSets(dev, rope_pool, 1, &qr_dset);
+        _ = vk.vkFreeDescriptorSets(dev, rope_pool, 1, &kr_dset);
+
+        try q_buf.download(std.mem.sliceAsBytes(q_out));
+        try k_buf.download(std.mem.sliceAsBytes(k_out));
+        try v_buf.download(std.mem.sliceAsBytes(v_out));
     }
 
     // Pipeline for the Q8_1-activation integer-dot path. Returns null when
