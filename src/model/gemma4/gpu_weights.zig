@@ -172,6 +172,19 @@ pub const GpuWeights = struct {
     v_out_buf:    ?GpuBuffer,
     gate_out_buf: ?GpuBuffer,
     up_out_buf:   ?GpuBuffer,
+    // 7l.1 — per-layer KV cache in VRAM. Mirrors Gemma4KvCache layout:
+    //   k_vram[l] / v_vram[l]: device-local, stride = cap[l] * nkv(l) floats.
+    //   kv_cap[l]: per-layer capacity (positions stored). SWA layers cap to
+    //              min(max_seq, sliding_window); global layers cap to max_seq.
+    //   kv_stage: persistent host-coherent staging buffer used to write one
+    //             slot's K or V into k_vram/v_vram via vkCmdCopyBuffer.
+    //             Sized to max(nkv(l)) * sizeof(f32).
+    // Allocated lazily via initKvVram(cfg, max_seq) once max_seq is known
+    // (GpuWeights.init runs before the KV cache is created).
+    k_vram:   ?[]GpuBuffer,
+    v_vram:   ?[]GpuBuffer,
+    kv_cap:   ?[]usize,
+    kv_stage: ?GpuBuffer,
     allocator:   std.mem.Allocator,
 
     pub fn init(g4w: *const Gemma4Weights, g4cfg: Gemma4Config, allocator: std.mem.Allocator) !GpuWeights {
@@ -289,6 +302,7 @@ pub const GpuWeights = struct {
             .expert_in_slice = null, .expert_scales_slice = null, .moe_gpu_slice = null,
             .q_out_buf = null, .k_out_buf = null, .v_out_buf = null,
             .gate_out_buf = null, .up_out_buf = null,
+            .k_vram = null, .v_vram = null, .kv_cap = null, .kv_stage = null,
             .allocator = allocator,
         };
         errdefer gw.deinit();
@@ -501,7 +515,106 @@ pub const GpuWeights = struct {
         return gw;
     }
 
+    // 7l.1 — allocate per-layer device-local K/V cache buffers.
+    // Sizing mirrors Gemma4KvCache: SWA layers cap to min(max_seq, sliding_window);
+    // global layers cap to max_seq. The staging buffer is sized to the largest
+    // per-position slot across layers (max nkv(l) * sizeof(f32)).
+    //
+    // This is the foundation step for Phase 7l (attention on GPU). After
+    // initKvVram returns, the buffers exist but are not yet referenced by any
+    // forward pass — 7l.1c wires them in.
+    pub fn initKvVram(self: *GpuWeights, cfg: Gemma4Config, max_seq: usize) !void {
+        if (self.k_vram != null) return error.AlreadyInitialized;
+        const n_layers = cfg.n_layers;
+
+        var k = try self.allocator.alloc(GpuBuffer, n_layers);
+        errdefer self.allocator.free(k);
+        var ki: usize = 0;
+        errdefer for (k[0..ki]) |*b| b.deinit();
+
+        var v = try self.allocator.alloc(GpuBuffer, n_layers);
+        errdefer self.allocator.free(v);
+        var vi: usize = 0;
+        errdefer for (v[0..vi]) |*b| b.deinit();
+
+        const cap = try self.allocator.alloc(usize, n_layers);
+        errdefer self.allocator.free(cap);
+
+        var max_nkv: usize = 0;
+        var total_bytes: usize = 0;
+        for (0..n_layers) |l| {
+            const seq_cap = if (cfg.is_swa[l]) @min(max_seq, cfg.sliding_window) else max_seq;
+            const nkv = cfg.nkv(l);
+            const bytes = seq_cap * nkv * @sizeOf(f32);
+            cap[l] = seq_cap;
+            k[l] = try GpuBuffer.initDeviceLocal(&self.ctx, bytes,
+                vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            ki = l + 1;
+            v[l] = try GpuBuffer.initDeviceLocal(&self.ctx, bytes,
+                vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            vi = l + 1;
+            if (nkv > max_nkv) max_nkv = nkv;
+            total_bytes += 2 * bytes;
+        }
+
+        const stage = try GpuBuffer.initStaging(&self.ctx, max_nkv * @sizeOf(f32));
+
+        self.k_vram = k;
+        self.v_vram = v;
+        self.kv_cap = cap;
+        self.kv_stage = stage;
+
+        std.debug.print("  KV VRAM: total={} MiB, stage={} KiB\n",
+            .{ total_bytes / (1024 * 1024), (max_nkv * @sizeOf(f32)) / 1024 });
+    }
+
+    // Upload one position's K or V row into the per-layer VRAM cache at slot.
+    // Used during 7l.1 bring-up when the CPU still computes K/V; replaced in
+    // 7l.1c by an in-submit `vkCmdCopyBuffer` from the matvec output buffer.
+    pub fn uploadKvSlotK(self: *const GpuWeights, layer: usize, slot: usize, k: []const f32) !void {
+        const k_vram = self.k_vram orelse return error.NotOnGpu;
+        const stage  = &(self.kv_stage orelse return error.NotOnGpu);
+        const bytes  = k.len * @sizeOf(f32);
+        try stage.upload(std.mem.sliceAsBytes(k));
+        try self.ctx.copyBufferRegion(stage.handle, k_vram[layer].handle, 0, slot * bytes, bytes);
+    }
+    pub fn uploadKvSlotV(self: *const GpuWeights, layer: usize, slot: usize, v: []const f32) !void {
+        const v_vram = self.v_vram orelse return error.NotOnGpu;
+        const stage  = &(self.kv_stage orelse return error.NotOnGpu);
+        const bytes  = v.len * @sizeOf(f32);
+        try stage.upload(std.mem.sliceAsBytes(v));
+        try self.ctx.copyBufferRegion(stage.handle, v_vram[layer].handle, 0, slot * bytes, bytes);
+    }
+
+    // Download one position's K or V row from the per-layer VRAM cache. For
+    // testing / verification — production paths read the cache directly from
+    // attention shaders.
+    pub fn downloadKvSlotK(self: *const GpuWeights, layer: usize, slot: usize, k: []f32) !void {
+        const k_vram = self.k_vram orelse return error.NotOnGpu;
+        const stage  = &(self.kv_stage orelse return error.NotOnGpu);
+        const bytes  = k.len * @sizeOf(f32);
+        try self.ctx.copyBufferRegion(k_vram[layer].handle, stage.handle, slot * bytes, 0, bytes);
+        try stage.download(std.mem.sliceAsBytes(k));
+    }
+    pub fn downloadKvSlotV(self: *const GpuWeights, layer: usize, slot: usize, v: []f32) !void {
+        const v_vram = self.v_vram orelse return error.NotOnGpu;
+        const stage  = &(self.kv_stage orelse return error.NotOnGpu);
+        const bytes  = v.len * @sizeOf(f32);
+        try self.ctx.copyBufferRegion(v_vram[layer].handle, stage.handle, slot * bytes, 0, bytes);
+        try stage.download(std.mem.sliceAsBytes(v));
+    }
+
     pub fn deinit(self: *GpuWeights) void {
+        if (self.kv_stage) |*b| b.deinit();
+        if (self.kv_cap)   |c| self.allocator.free(c);
+        if (self.v_vram) |bs| {
+            for (bs) |*b| b.deinit();
+            self.allocator.free(bs);
+        }
+        if (self.k_vram) |bs| {
+            for (bs) |*b| b.deinit();
+            self.allocator.free(bs);
+        }
         if (self.moe_gpu_buf)       |*b| { b.unmap(); b.deinit(); }
         if (self.expert_scales_buf) |*b| { b.unmap(); b.deinit(); }
         if (self.expert_all_out_buf)|*b| b.deinit();

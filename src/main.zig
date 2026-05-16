@@ -411,9 +411,13 @@ fn cmdGenerate(
             }
         }
         defer if (gpu_weights) |*gw| gw.deinit();
-        const gpu_ptr: ?*const g4_gpu.GpuWeights = if (gpu_weights != null) &gpu_weights.? else null;
 
         const max_seq: usize = @min(g4cfg.max_seq_len, 4096);
+        if (gpu_weights) |*gw| gw.initKvVram(g4cfg, max_seq) catch |e| {
+            std.debug.print("KV VRAM alloc failed ({s}), continuing without GPU KV cache\n",
+                .{@errorName(e)});
+        };
+        const gpu_ptr: ?*const g4_gpu.GpuWeights = if (gpu_weights != null) &gpu_weights.? else null;
         var kv = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
         defer kv.deinit();
         const t_prefill_start = clk.now(io);
@@ -602,6 +606,10 @@ fn cmdCompare(
 
     const cmp_token = prompt_ids[0];
     const max_seq: usize = @min(g4cfg.max_seq_len, 4096);
+    gpu_weights.initKvVram(g4cfg, max_seq) catch |e| {
+        std.debug.print("KV VRAM alloc failed ({s}), continuing without GPU KV cache\n",
+            .{@errorName(e)});
+    };
 
     std.debug.print("running CPU forward pass (token={})...\n", .{cmp_token});
     var kv_cpu = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);

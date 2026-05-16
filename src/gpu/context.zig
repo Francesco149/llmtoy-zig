@@ -243,6 +243,52 @@ pub const GpuContext = struct {
         _ = vk.vkQueueWaitIdle(self.queue);
     }
 
+    // Copy `size` bytes from src[src_offset..] to dst[dst_offset..] in a
+    // one-shot command buffer. Blocks until complete. Use this when the source
+    // or destination is a region inside a larger buffer (e.g. a per-position
+    // slot in a KV cache buffer).
+    pub fn copyBufferRegion(
+        self: *const GpuContext,
+        src: vk.VkBuffer, dst: vk.VkBuffer,
+        src_offset: vk.VkDeviceSize, dst_offset: vk.VkDeviceSize,
+        size: vk.VkDeviceSize,
+    ) !void {
+        const alloc_ci = vk.VkCommandBufferAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .pNext = null,
+            .commandPool = self.cmd_pool,
+            .level = vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        var cmd: vk.VkCommandBuffer = undefined;
+        if (vk.vkAllocateCommandBuffers(self.device, &alloc_ci, &cmd) != vk.VK_SUCCESS)
+            return error.VkCommandBufferAllocFailed;
+        defer vk.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, &cmd);
+
+        const begin_ci = vk.VkCommandBufferBeginInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = null,
+            .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = null,
+        };
+        _ = vk.vkBeginCommandBuffer(cmd, &begin_ci);
+        const region = vk.VkBufferCopy{
+            .srcOffset = src_offset, .dstOffset = dst_offset, .size = size };
+        vk.vkCmdCopyBuffer(cmd, src, dst, 1, &region);
+        _ = vk.vkEndCommandBuffer(cmd);
+
+        const submit = vk.VkSubmitInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext = null,
+            .waitSemaphoreCount = 0, .pWaitSemaphores = null, .pWaitDstStageMask = null,
+            .commandBufferCount = 1, .pCommandBuffers = &cmd,
+            .signalSemaphoreCount = 0, .pSignalSemaphores = null,
+        };
+        if (vk.vkQueueSubmit(self.queue, 1, &submit, null) != vk.VK_SUCCESS)
+            return error.VkQueueSubmitFailed;
+        _ = vk.vkQueueWaitIdle(self.queue);
+    }
+
     // Copy `size` bytes from src to dst using a one-shot command buffer.
     // Blocks until the transfer completes. Used for staging uploads/downloads.
     pub fn copyBuffer(self: *const GpuContext, src: vk.VkBuffer, dst: vk.VkBuffer, size: vk.VkDeviceSize) !void {
