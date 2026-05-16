@@ -293,6 +293,49 @@ are mostly `ops.math.dequantRow` with Q3_K/Q5_K frames and
 `quant.dequant.dotIQ4NL`, which should be mapped to exact tensors before adding
 more shader formats.
 
+## Phase 7m/IQ4_NL — Expert-down fallback removed
+
+`llmtoy info` now prints unsupported GPU quant tensors. For this model, after
+Q6_K support, the remaining unsupported hot tensors were:
+
+- `blk.3.attn_v.weight` and `blk.4.attn_v.weight` in Q5_K.
+- `blk.10` through `blk.19` `ffn_down_exps.weight` in IQ4_NL.
+
+The IQ4_NL tensors were the larger CPU hotspot (`quant.dequant.dotIQ4NL`), and
+because a missing expert-down session makes the whole layer's expert batch fall
+back to CPU, those ten layers were losing all MoE GPU work. Added
+`matvec_iq4_nl_q8_1.glsl`, a simple lookup-table Q8_1 path for IQ4_NL expert
+down. This is not the final MMVQ design, but it removes a measured fallback.
+
+Verification:
+
+- `zig build test`: IQ4_NL x Q8_1 fuzz passes at `rel=2.027e-7` small and
+  `rel=1.886e-7` for expert-down-shaped `64x704`.
+- Full `llmtoy compare`: all layer argmaxes match; final argmax token `1852`
+  matches. Worst layer was L28 at `rel=5.862%`, argmax ok.
+
+Same short prompt as above:
+
+| Metric | Q6_K only | + IQ4_NL expert down |
+|--------|-----------|----------------------|
+| Prefill | 10.14 tok/s | 15.23 tok/s |
+| Decode | 10.16 tok/s | 15.05 tok/s |
+| Expert GPU layers | 20/30 | 30/30 |
+
+Hot timestamp rows after IQ4_NL:
+
+| Label | Count | Total ms | Avg us | Share |
+|-------|------:|---------:|-------:|------:|
+| `dense_ffn.down` | 840 | 86.435 | 102.90 | 24.2% |
+| `matvec_q8_1.single.262144x2816` | 28 | 47.288 | 1688.87 | 13.2% |
+| `moe.fused_gate_up` | 6720 | 44.522 | 6.63 | 12.5% |
+| `moe.down` | 6720 | 28.344 | 4.22 | 7.9% |
+| `attention.qk_softmax` | 644 | 25.217 | 39.16 | 7.1% |
+
+CPU `perf` after IQ4_NL no longer shows `dotIQ4NL`. Remaining model-side CPU
+fallback is primarily `dequantQ5K`, which maps to the two Q5_K attention-V
+tensors in layers 3 and 4.
+
 The submit-count reductions buy ~150–300 µs/token in saved overhead. On
 RX 7800 XT with our shaders the absolute per-submit cost (~150 µs) is
 small relative to the 220 ms of GPU matmul work per token, so each saved

@@ -91,6 +91,7 @@ pub const GpuWeights = struct {
     pl_q5_0_q8_1:    MatvecPipeline,
     pl_q5_1_q8_1:    MatvecPipeline,
     pl_q6_k_q8_1:    MatvecPipeline,
+    pl_iq4_nl_q8_1:  MatvecPipeline,
     pl_quantize_q8_1: QuantizeQ8_1Pipeline,
     pl_q5_1:    MatvecPipeline,
     pl_q5_0:    MatvecPipeline,
@@ -244,6 +245,9 @@ pub const GpuWeights = struct {
         var pl_q6_k_q8_1 = try MatvecPipeline.initQ6KQ8_1(&ctx);
         errdefer pl_q6_k_q8_1.deinit();
         std.debug.print("  init: pl_q6_k_q8_1 ok\n", .{});
+        var pl_iq4_nl_q8_1 = try MatvecPipeline.initIQ4NLQ8_1(&ctx);
+        errdefer pl_iq4_nl_q8_1.deinit();
+        std.debug.print("  init: pl_iq4_nl_q8_1 ok\n", .{});
         var pl_quantize_q8_1 = try QuantizeQ8_1Pipeline.init(&ctx);
         errdefer pl_quantize_q8_1.deinit();
         std.debug.print("  init: pl_quantize_q8_1 ok\n", .{});
@@ -304,6 +308,7 @@ pub const GpuWeights = struct {
             .pl_q5_0_q8_1 = pl_q5_0_q8_1,
             .pl_q5_1_q8_1 = pl_q5_1_q8_1,
             .pl_q6_k_q8_1 = pl_q6_k_q8_1,
+            .pl_iq4_nl_q8_1 = pl_iq4_nl_q8_1,
             .pl_quantize_q8_1 = pl_quantize_q8_1,
             .pl_q5_1 = pl_q5_1, .pl_q5_0 = pl_q5_0,
             .pl_fused_gu = pl_fused_gu, .pl_fused_gu_q8_1 = pl_fused_gu_q8_1,
@@ -721,6 +726,7 @@ pub const GpuWeights = struct {
         self.pl_q5_1_q8_1.deinit();
         self.pl_q5_0_q8_1.deinit();
         self.pl_q6_k_q8_1.deinit();
+        self.pl_iq4_nl_q8_1.deinit();
         self.pl_q4_k_q8_1.deinit();
         self.pl_q3_k_q8_1.deinit();
         self.pl_q4_k.deinit();
@@ -1187,6 +1193,7 @@ pub const GpuWeights = struct {
             .q5_0 => &self.pl_q5_0_q8_1,
             .q5_1 => &self.pl_q5_1_q8_1,
             .q6_k => &self.pl_q6_k_q8_1,
+            .iq4_nl => &self.pl_iq4_nl_q8_1,
             else  => null,
         };
     }
@@ -1673,12 +1680,12 @@ pub const GpuWeights = struct {
                 return error.ExpertNotOnGpu;
         }
 
-        const pl_dn_f32 = self.pipelineFor(down_type);
         // Optional Q8_1-acts pipeline for down. When non-null, each expert's
         // f32 mid_buf gets quantized to its own Q8_1 mid_q8_1_buf between
         // phases, and down reads that instead of the raw f32 mid_buf.
         const pl_dn_q8_1 = self.q8_1PipelineFor(down_type);
         const use_q8_1_dn = pl_dn_q8_1 != null;
+        const pl_dn_f32 = if (use_q8_1_dn) null else self.pipelineFor(down_type);
         const mid_q8_1_bufs = self.expert_mid_q8_1_bufs;
 
         // Use the Q8_1 fused gate+up shader when gate/up are Q3_K.  Both fused
@@ -1752,7 +1759,7 @@ pub const GpuWeights = struct {
             const out_sz  = d_model * @sizeOf(f32);
             const dn_in_buf: *const GpuBuffer = if (use_q8_1_dn)
                 &mid_q8_1_bufs.?[k] else &mid_bufs[k];
-            const pl_dn = if (use_q8_1_dn) pl_dn_q8_1.? else pl_dn_f32;
+            const pl_dn = if (use_q8_1_dn) pl_dn_q8_1.? else pl_dn_f32.?;
             const p_down = self.ctx.profileBegin(cmd, "moe.down");
             down_dsets[k] = try pl_dn.recordToRange(
                 cmd, &sd.mat_buf, dn_in_buf,
@@ -1771,7 +1778,7 @@ pub const GpuWeights = struct {
 
         try self.ctx.submitBatch(cmd);
 
-        const pl_dn_used = if (use_q8_1_dn) pl_dn_q8_1.? else pl_dn_f32;
+        const pl_dn_used = if (use_q8_1_dn) pl_dn_q8_1.? else pl_dn_f32.?;
         for (fused_dsets[0..n]) |*ds|
             _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_gu.desc_pool, 1, ds);
         for (down_dsets[0..n]) |*ds|
@@ -1794,7 +1801,7 @@ pub const GpuWeights = struct {
 
 fn isGpuSupported(t: GgmlType) bool {
     return switch (t) {
-        .f32, .q8_0, .q3_k, .q4_k, .q5_1, .q5_0, .q6_k => true,
+        .f32, .q8_0, .q3_k, .q4_k, .q5_1, .q5_0, .q6_k, .iq4_nl => true,
         else => false,
     };
 }

@@ -266,6 +266,20 @@ fn cmdInfo(out: *std.Io.Writer, path: []const u8, io: std.Io, gpa: std.mem.Alloc
         try out.print("  {s}: {}\n", .{ gtype.label(), entry.value_ptr.* });
     }
 
+    try out.print("\nunsupported GPU quant tensors:\n", .{});
+    var unsupported_count: usize = 0;
+    for (reader.data.tensors) |tensor| {
+        if (isGpuQuantSupported(tensor.type_)) continue;
+        if (tensor.type_ == .f32) continue;
+        unsupported_count += 1;
+        try out.print("  [{s}] {s}  dims={any}\n", .{
+            tensor.type_.label(), tensor.name, tensor.dims,
+        });
+    }
+    if (unsupported_count == 0) {
+        try out.print("  none\n", .{});
+    }
+
     try out.print("\nfirst 16 tensors:\n", .{});
     for (reader.data.tensors[0..@min(16, reader.data.tensors.len)]) |tensor| {
         try out.print("  [{s}] {s}  dims={any}\n", .{
@@ -283,6 +297,13 @@ fn cmdInfo(out: *std.Io.Writer, path: []const u8, io: std.Io, gpa: std.mem.Alloc
             }
         }
     }
+}
+
+fn isGpuQuantSupported(t: @import("gguf/types.zig").GgmlType) bool {
+    return switch (t) {
+        .f32, .q8_0, .q3_k, .q4_k, .q5_0, .q5_1, .q6_k => true,
+        else => false,
+    };
 }
 
 fn cmdTokenize(out: *std.Io.Writer, path: []const u8, text: []const u8, io: std.Io, gpa: std.mem.Allocator) !void {

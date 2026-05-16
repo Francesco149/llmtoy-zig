@@ -90,6 +90,11 @@ pub const MatvecPipeline = struct {
         return initFromSpv(ctx, &shaders.matvec_q6_k_q8_1, 1);
     }
 
+    pub fn initIQ4NLQ8_1(ctx: *const GpuContext) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_iq4_nl_q8_1.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.matvec_iq4_nl_q8_1, 1);
+    }
+
     fn initFromSpv(ctx: *const GpuContext, spv: anytype, rows_per_workgroup: u32) !MatvecPipeline {
         // align(4) on the const in shaders.zig should guarantee this, but
         // assert the actual runtime address in case @embedFile doesn't honour it.
@@ -424,6 +429,13 @@ pub const MatvecSession = struct {
         return initBytes(ctx, mat_bytes, rows, cols);
     }
 
+    // Upload an IQ4_NL quantized matrix (raw GGUF bytes) to VRAM.
+    pub fn initIQ4NL(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
+        std.debug.assert(cols % 32 == 0);
+        std.debug.assert(mat_bytes.len == rows * (cols / 32) * 18);
+        return initBytes(ctx, mat_bytes, rows, cols);
+    }
+
     // Upload any GPU-supported quant type. Returns null for unsupported types.
     pub fn initFromRaw(ctx: *const GpuContext, mat_data: []const u8, mat_type: GgmlType, rows: u32, cols: u32) !?MatvecSession {
         return switch (mat_type) {
@@ -434,6 +446,7 @@ pub const MatvecSession = struct {
             .q5_1 => try initQ5_1(ctx, mat_data, rows, cols),
             .q5_0 => try initQ5_0(ctx, mat_data, rows, cols),
             .q6_k => try initQ6K(ctx, mat_data, rows, cols),
+            .iq4_nl => try initIQ4NL(ctx, mat_data, rows, cols),
             else  => null,
         };
     }
@@ -2955,6 +2968,16 @@ test "gpu matvec Q6_K × Q8_1 fuzz small" {
 test "gpu matvec Q6_K × Q8_1 fuzz lm-head-shaped cols" {
     try fuzzQuantQ8_1(.q6_k, 210, 256,
         MatvecPipeline.initQ6KQ8_1, MatvecSession.initQ6K, 64, 2816, 61);
+}
+
+test "gpu matvec IQ4_NL × Q8_1 fuzz small" {
+    try fuzzQuantQ8_1(.iq4_nl, 18, 32,
+        MatvecPipeline.initIQ4NLQ8_1, MatvecSession.initIQ4NL, 32, 256, 67);
+}
+
+test "gpu matvec IQ4_NL × Q8_1 fuzz expert-down-shaped" {
+    try fuzzQuantQ8_1(.iq4_nl, 18, 32,
+        MatvecPipeline.initIQ4NLQ8_1, MatvecSession.initIQ4NL, 64, 704, 71);
 }
 
 // ── rmsnorm fuzz test ─────────────────────────────────────────────────────────
