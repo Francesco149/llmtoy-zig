@@ -245,15 +245,16 @@ pub fn forwardOne(
 
         // Compute attention. 7l.2/3 GPU path is taken when the 7l.1c QKV+norm
         // chain ran (so Q is in q_out_buf and K/V live in k_vram/v_vram).
-        // Attention output is written to attn_in_buf on the GPU side; we
-        // download to attn_concat so the non-full-fused wo path can read it,
-        // and pass skip_attn_upload=true to the full-fused path below.
+        // Attention output is written to attn_in_buf on the GPU side; the
+        // full-fused wo+dense-FFN path reads it directly. Only download to
+        // attn_concat when the non-full-fused wo fallback needs it on CPU.
         const use_gpu_attn = gpu_did_norms_and_rope;
         if (use_gpu_attn) {
+            const dst: ?[]f32 = if (can_full_fused) null else attn_concat[0..nq_l];
             try gpu.?.runLayerAttention(l,
                 @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd),
                 @intCast(pos), @intCast(win_len), @intCast(kv_cap_l), 1.0,
-                attn_concat[0..nq_l]);
+                dst);
         } else {
             @memset(attn_concat[0..nq_l], 0.0);
             for (0..cfg.n_heads) |h| {
