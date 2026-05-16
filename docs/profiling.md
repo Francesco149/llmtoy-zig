@@ -49,6 +49,27 @@ us, min/max us, and percentage by dispatch label. Use this before shader work;
 wall-clock tok/s alone is too coarse to distinguish matvec throughput from
 attention, MoE, or submit overhead.
 
+## Matvec Microbench
+
+Use this before comparing shader variants:
+
+```sh
+nix develop --command ./zig-out/bin/llmtoy bench-matvec "$MODEL" --iters 64
+```
+
+To focus on one real tensor shape:
+
+```sh
+nix develop --command ./zig-out/bin/llmtoy bench-matvec "$MODEL" \
+  --iters 256 --target L0.attn_q
+```
+
+The current harness measures one Q8_1-activation matvec dispatch at a time on
+representative Gemma4 tensors. It quantizes the activation once before timing,
+then includes the current descriptor, command-buffer, submit, wait, and cleanup
+overhead in each measured iteration. Use it to choose between matvec kernels;
+use full `generate --gpu` only after the microbench shows a real win.
+
 ## Sampling Profile
 
 ```sh

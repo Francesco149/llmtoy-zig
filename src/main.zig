@@ -12,8 +12,13 @@ const g4_loader   = @import("model/gemma4/loader.zig");
 const g4_fwd      = @import("model/gemma4/forward.zig");
 const g4_kv       = @import("model/gemma4/kv_cache.zig");
 const g4_gpu      = @import("model/gemma4/gpu_weights.zig");
+const g4_weights  = @import("model/gemma4/weights.zig");
 const gpu_ctx     = @import("gpu/context.zig");
 const gpu_matvec  = @import("gpu/matvec.zig");
+const gpu_buffer  = @import("gpu/buffer.zig");
+const vk          = @import("gpu/vk.zig").vk;
+const math_mod    = @import("ops/math.zig");
+const gguf_types  = @import("gguf/types.zig");
 
 // Pull tests from sub-modules into the test binary.
 comptime {
@@ -63,6 +68,22 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingArg;
         }
         try cmdTokenize(out, args[2], args[3], io, gpa);
+    } else if (std.mem.eql(u8, args[1], "bench-matvec")) {
+        if (args.len < 3) {
+            std.debug.print("usage: llmtoy bench-matvec <model.gguf> [--iters N] [--target NAME]\n", .{});
+            return error.MissingArg;
+        }
+        var opts = MatvecBenchOptions{};
+        var i: usize = 3;
+        while (i < args.len) {
+            if (i + 1 >= args.len) break;
+            const flag = args[i];
+            const val = args[i + 1];
+            if (std.mem.eql(u8, flag, "--iters")) opts.iters = try std.fmt.parseInt(u32, val, 10);
+            if (std.mem.eql(u8, flag, "--target")) opts.target = val;
+            i += 2;
+        }
+        try cmdBenchMatvec(out, args[2], opts, io, gpa);
     } else if (std.mem.eql(u8, args[1], "generate")) {
         if (args.len < 4) {
             std.debug.print(
@@ -167,6 +188,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\  llmtoy gpu-info                        list Vulkan device and run a matvec smoke test
         \\  llmtoy info <model.gguf>               print model metadata and tensor summary
         \\  llmtoy tokenize <model.gguf> <text>    BPE-encode text, print IDs and decoded tokens
+        \\  llmtoy bench-matvec <model.gguf> [--iters N] [--target NAME]
         \\  llmtoy generate <model.gguf> <prompt> [--chat] [--gpu] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N] [--stop-token TOKEN] [--gpu-layers L0:L1]
         \\  llmtoy compare  <model.gguf> <prompt> [--chat] [--threads N] [--gpu-layers L0:L1]
         \\
@@ -174,6 +196,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\  --stop-token: stop generation when this token is sampled (default: auto-detect from vocab)
         \\  --gpu-layers: restrict GPU to layers L0..L1 inclusive (e.g. 0:14); others use CPU
         \\  compare:      run one CPU and one GPU forward pass, print per-layer residual divergence
+        \\  bench-matvec: benchmark current Q8_1 matvec kernels on representative real tensors
         \\
     );
 }
@@ -304,6 +327,235 @@ fn isGpuQuantSupported(t: @import("gguf/types.zig").GgmlType) bool {
         .f32, .q8_0, .q3_k, .q4_k, .q5_0, .q5_1, .q6_k, .q5_k, .iq4_nl => true,
         else => false,
     };
+}
+
+const MatvecBenchOptions = struct {
+    iters: u32 = 64,
+    target: ?[]const u8 = null,
+};
+
+const BenchPipelines = struct {
+    q3_k: gpu_matvec.MatvecPipeline,
+    q4_k: gpu_matvec.MatvecPipeline,
+    q5_0: gpu_matvec.MatvecPipeline,
+    q5_1: gpu_matvec.MatvecPipeline,
+    q5_k: gpu_matvec.MatvecPipeline,
+    q6_k: gpu_matvec.MatvecPipeline,
+    iq4_nl: gpu_matvec.MatvecPipeline,
+    quant: gpu_matvec.QuantizeQ8_1Pipeline,
+
+    fn init(ctx: *const gpu_ctx.GpuContext) !BenchPipelines {
+        var q3_k = try gpu_matvec.MatvecPipeline.initQ3KQ8_1(ctx);
+        errdefer q3_k.deinit();
+        var q4_k = try gpu_matvec.MatvecPipeline.initQ4KQ8_1(ctx);
+        errdefer q4_k.deinit();
+        var q5_0 = try gpu_matvec.MatvecPipeline.initQ5_0Q8_1(ctx);
+        errdefer q5_0.deinit();
+        var q5_1 = try gpu_matvec.MatvecPipeline.initQ5_1Q8_1(ctx);
+        errdefer q5_1.deinit();
+        var q5_k = try gpu_matvec.MatvecPipeline.initQ5KQ8_1(ctx);
+        errdefer q5_k.deinit();
+        var q6_k = try gpu_matvec.MatvecPipeline.initQ6KQ8_1(ctx);
+        errdefer q6_k.deinit();
+        var iq4_nl = try gpu_matvec.MatvecPipeline.initIQ4NLQ8_1(ctx);
+        errdefer iq4_nl.deinit();
+        var quant = try gpu_matvec.QuantizeQ8_1Pipeline.init(ctx);
+        errdefer quant.deinit();
+        return .{
+            .q3_k = q3_k, .q4_k = q4_k,
+            .q5_0 = q5_0, .q5_1 = q5_1,
+            .q5_k = q5_k, .q6_k = q6_k,
+            .iq4_nl = iq4_nl, .quant = quant,
+        };
+    }
+
+    fn deinit(self: *BenchPipelines) void {
+        self.quant.deinit();
+        self.iq4_nl.deinit();
+        self.q6_k.deinit();
+        self.q5_k.deinit();
+        self.q5_1.deinit();
+        self.q5_0.deinit();
+        self.q4_k.deinit();
+        self.q3_k.deinit();
+    }
+
+    fn pipelineFor(self: *const BenchPipelines, t: gguf_types.GgmlType) ?*const gpu_matvec.MatvecPipeline {
+        return switch (t) {
+            .q3_k => &self.q3_k,
+            .q4_k => &self.q4_k,
+            .q5_0 => &self.q5_0,
+            .q5_1 => &self.q5_1,
+            .q5_k => &self.q5_k,
+            .q6_k => &self.q6_k,
+            .iq4_nl => &self.iq4_nl,
+            else => null,
+        };
+    }
+};
+
+fn cmdBenchMatvec(
+    out: *std.Io.Writer,
+    path: []const u8,
+    opts: MatvecBenchOptions,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+) !void {
+    var reader = try gguf_reader.GgufReader.open(path, io, gpa);
+    defer reader.deinit();
+    if (!g4_loader.isGemma4(&reader)) return error.UnsupportedModel;
+
+    const cfg = try g4_loader.configFromGguf(&reader, gpa);
+    var weights = try g4_loader.loadWeights(&reader, cfg, gpa);
+    defer weights.deinit();
+
+    var ctx = try gpu_ctx.GpuContext.init();
+    defer ctx.deinit();
+    var pipes = try BenchPipelines.init(&ctx);
+    defer pipes.deinit();
+
+    try out.print("GPU matvec microbench: iters={} target={s}\n", .{
+        opts.iters, opts.target orelse "all",
+    });
+    try out.print("{s:32} {s:7} {s:>9} {s:>9} {s:>10} {s:>10}\n", .{
+        "name", "type", "rows", "cols", "avg_us", "GB/s",
+    });
+
+    var ran: usize = 0;
+    try benchIfSelected(out, &ctx, &pipes, opts, &ran, "lm_head", weights.lm_head, gpa, io);
+    try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L0.attn_q", weights.layers[0].wq, gpa, io);
+    try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L0.attn_v", weights.layers[0].wv.?, gpa, io);
+    try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L3.attn_v", weights.layers[3].wv.?, gpa, io);
+    try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L5.attn_q", weights.layers[5].wq, gpa, io);
+    try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L0.dense_down", weights.layers[0].w_down, gpa, io);
+    try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L5.dense_down", weights.layers[5].w_down, gpa, io);
+    try benchExpertDownIfSelected(out, &ctx, &pipes, opts, &ran, "L0.expert_down", weights.layers[0].down_exps, 0, cfg.d_model, cfg.d_expert, gpa, io);
+    try benchExpertDownIfSelected(out, &ctx, &pipes, opts, &ran, "L10.expert_down", weights.layers[10].down_exps, 0, cfg.d_model, cfg.d_expert, gpa, io);
+
+    if (ran == 0) {
+        try out.print("no matching benchmark target\n", .{});
+    }
+}
+
+fn benchIfSelected(
+    out: *std.Io.Writer,
+    ctx: *const gpu_ctx.GpuContext,
+    pipes: *const BenchPipelines,
+    opts: MatvecBenchOptions,
+    ran: *usize,
+    name: []const u8,
+    mat: g4_weights.RawMatrix,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+) !void {
+    if (opts.target) |t| if (!std.mem.eql(u8, t, name) and !std.mem.eql(u8, t, "all")) return;
+    try benchOneMatvec(out, ctx, pipes, name, mat, opts.iters, gpa, io);
+    ran.* += 1;
+}
+
+fn benchExpertDownIfSelected(
+    out: *std.Io.Writer,
+    ctx: *const gpu_ctx.GpuContext,
+    pipes: *const BenchPipelines,
+    opts: MatvecBenchOptions,
+    ran: *usize,
+    name: []const u8,
+    flat: g4_weights.RawMatrix,
+    expert: usize,
+    rows: usize,
+    cols: usize,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+) !void {
+    if (opts.target) |t| if (!std.mem.eql(u8, t, name) and !std.mem.eql(u8, t, "all")) return;
+    const row_bytes = math_mod.rowBytes(flat.type_, cols);
+    const per_expert = rows * row_bytes;
+    const mat = g4_weights.RawMatrix{
+        .data = flat.data[expert * per_expert ..][0..per_expert],
+        .type_ = flat.type_,
+        .rows = rows,
+        .cols = cols,
+    };
+    try benchOneMatvec(out, ctx, pipes, name, mat, opts.iters, gpa, io);
+    ran.* += 1;
+}
+
+fn benchOneMatvec(
+    out: *std.Io.Writer,
+    ctx: *const gpu_ctx.GpuContext,
+    pipes: *const BenchPipelines,
+    name: []const u8,
+    mat: g4_weights.RawMatrix,
+    iters: u32,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+) !void {
+    const pl = pipes.pipelineFor(mat.type_) orelse {
+        try out.print("{s:32} {s:7} unsupported\n", .{ name, mat.type_.label() });
+        return;
+    };
+    if (mat.cols % 32 != 0) return error.InvalidMatvecShape;
+
+    const session_opt = try gpu_matvec.MatvecSession.initFromRaw(
+        ctx, mat.data, mat.type_, @intCast(mat.rows), @intCast(mat.cols));
+    var session = session_opt orelse return error.UnsupportedModel;
+    defer session.deinit();
+
+    const vec = try gpa.alloc(f32, mat.cols);
+    defer gpa.free(vec);
+    for (vec, 0..) |*v, i| {
+        const x = @as(f32, @floatFromInt((i % 31) + 1));
+        v.* = (x - 16.0) / 16.0;
+    }
+
+    var vec_buf = try gpu_buffer.GpuBuffer.initHostCoherent(ctx,
+        mat.cols * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer vec_buf.deinit();
+    var acts_buf = try gpu_buffer.GpuBuffer.initDeviceLocal(ctx,
+        gpu_matvec.q8_1OutBytes(@intCast(mat.cols)), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer acts_buf.deinit();
+    var out_buf = try gpu_buffer.GpuBuffer.initHostCoherent(ctx,
+        mat.rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer out_buf.deinit();
+
+    try vec_buf.upload(std.mem.sliceAsBytes(vec));
+
+    {
+        const cmd = try ctx.beginBatch();
+        const q_ds = try pipes.quant.record(cmd, &vec_buf, &acts_buf, @intCast(mat.cols));
+        gpu_ctx.GpuContext.recordShaderBarrier(cmd);
+        try ctx.submitBatch(cmd);
+        var ds = q_ds;
+        _ = vk.vkFreeDescriptorSets(ctx.device, pipes.quant.desc_pool, 1, &ds);
+    }
+
+    {
+        const cmd = try ctx.beginBatch();
+        const ds = try pl.record(cmd, &session.mat_buf, &acts_buf, &out_buf,
+            @intCast(mat.rows), @intCast(mat.cols));
+        try ctx.submitBatch(cmd);
+        var ds_mut = ds;
+        _ = vk.vkFreeDescriptorSets(ctx.device, pl.desc_pool, 1, &ds_mut);
+    }
+
+    const clk = std.Io.Clock.real;
+    const t0 = clk.now(io);
+    for (0..iters) |_| {
+        const cmd = try ctx.beginBatch();
+        const ds = try pl.record(cmd, &session.mat_buf, &acts_buf, &out_buf,
+            @intCast(mat.rows), @intCast(mat.cols));
+        try ctx.submitBatch(cmd);
+        var ds_mut = ds;
+        _ = vk.vkFreeDescriptorSets(ctx.device, pl.desc_pool, 1, &ds_mut);
+    }
+    const t1 = clk.now(io);
+    const ns = t0.durationTo(t1).nanoseconds;
+    const avg_us = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters)) / 1000.0;
+    const total_bytes = @as(f64, @floatFromInt(mat.data.len)) * @as(f64, @floatFromInt(iters));
+    const gbps = total_bytes / (@as(f64, @floatFromInt(ns)) / 1_000_000_000.0) / 1_000_000_000.0;
+    try out.print("{s:32} {s:7} {d:9} {d:9} {d:10.2} {d:10.2}\n", .{
+        name, mat.type_.label(), mat.rows, mat.cols, avg_us, gbps,
+    });
 }
 
 fn cmdTokenize(out: *std.Io.Writer, path: []const u8, text: []const u8, io: std.Io, gpa: std.mem.Allocator) !void {

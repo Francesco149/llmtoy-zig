@@ -273,7 +273,30 @@ Expected result:
 
 ## Phase 7n - Matvec Microbenchmark Harness
 
-Status: TODO. This should land immediately after timestamps.
+Status: STARTED. `llmtoy bench-matvec` now loads representative real tensors
+from the Gemma4 target GGUF, uploads one tensor at a time, quantizes a
+deterministic f32 activation vector to Q8_1 once, then repeatedly dispatches
+the current Q8_1 matvec path with the same descriptor/command/submit/wait
+overhead used by generation.
+
+Usage:
+
+```sh
+nix develop --command ./zig-out/bin/llmtoy bench-matvec <model.gguf> \
+  --iters 64 --target all
+```
+
+To isolate one shape:
+
+```sh
+nix develop --command ./zig-out/bin/llmtoy bench-matvec <model.gguf> \
+  --iters 256 --target L0.attn_q
+```
+
+Current targets are `lm_head`, `L0.attn_q`, `L0.attn_v`, `L3.attn_v`,
+`L5.attn_q`, `L0.dense_down`, `L5.dense_down`, `L0.expert_down`, and
+`L10.expert_down`. They cover Q3_K, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, and
+IQ4_NL with the target model's actual row/column sizes.
 
 End-to-end tok/s is too noisy for shader iteration. Add a command or test-only
 binary that runs one GPU kernel shape thousands of times with fixed buffers.
@@ -295,8 +318,34 @@ The harness should report:
 - effective integer dot operations/s where meaningful
 - CPU-side dispatch overhead separately from GPU elapsed time
 
+The first landed version reports wall-clock average per current matvec call and
+effective weight bandwidth. This intentionally includes the current
+descriptor/update/submit/wait path because that is what decode pays today.
+Next increments should split GPU timestamp elapsed from CPU dispatch overhead
+and add integer-dot throughput where the quant format makes the count useful.
+
 This harness is where shader variants compete. Do not use full generation to
 decide between two matvec kernels unless the microbench result is inconclusive.
+
+First measurement with `--iters 8` on the target model:
+
+| Target | Type | rows x cols | avg us | effective GB/s |
+|--------|------|-------------|--------|----------------|
+| `lm_head` | Q6_K | 262144 x 2816 | 2043.03 | 296.40 |
+| `L0.attn_q` | Q4_K | 4096 x 2816 | 47.80 | 135.74 |
+| `L0.attn_v` | Q4_K | 2048 x 2816 | 43.28 | 74.96 |
+| `L3.attn_v` | Q5_K | 2048 x 2816 | 54.54 | 72.70 |
+| `L5.attn_q` | Q3_K | 8192 x 2816 | 83.44 | 118.79 |
+| `L0.dense_down` | Q5_1 | 2816 x 2112 | 55.25 | 80.73 |
+| `L5.dense_down` | Q5_0 | 2816 x 2112 | 51.09 | 80.03 |
+| `L0.expert_down` | Q5_1 | 2816 x 704 | 53.74 | 27.67 |
+| `L10.expert_down` | IQ4_NL | 2816 x 704 | 49.16 | 22.68 |
+
+Interpretation: the small expert-down shapes are dominated by launch/descriptor
+overhead and poor occupancy, while the large lm_head shape reaches much higher
+bandwidth. This points directly at Phase 7o: MMVQ-style multi-row workgroups
+and better shader shape should come before command plumbing, except where the
+microbench proves a shape is launch-bound.
 
 ---
 
@@ -491,7 +540,7 @@ batching/model flags. Future agents need a hard local reference, not folklore.
 |-------|--------|---------|-----------------|
 | 7h-7l | DONE | Correctness, Q8_1, GPU norms/RoPE/KV/attention | 3 tok/s -> ~4 tok/s |
 | 7m | STARTED | GPU timestamp profiler | Blocks informed work |
-| 7n | TODO | Matvec microbench harness | Blocks shader iteration |
+| 7n | STARTED | Matvec microbench harness | Blocks shader iteration |
 | 7o | TODO | Faithful llama.cpp MMVQ-style matvecs | Main 20x lever |
 | 7p | TODO | Real batched prefill / MMQ | Prefill parity |
 | 7q | TODO | Remove proven CPU round trips | Secondary after matvec |

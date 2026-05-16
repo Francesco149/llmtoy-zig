@@ -365,6 +365,45 @@ quantized CPU matvec. The next optimization target should therefore stop adding
 one-off quant fallbacks and move to the planned microbench/MMVQ work or reduce
 known synchronization/download overhead.
 
+## Phase 7n — Matvec microbenchmark harness
+
+Added `llmtoy bench-matvec <model.gguf> [--iters N] [--target NAME]` for
+isolated shader iteration on real Gemma4 tensors. The harness uploads one
+representative tensor at a time, quantizes a deterministic f32 activation vector
+to Q8_1 once, warms the dispatch once, then times repeated matvec submissions.
+The measurement intentionally includes the current descriptor/update,
+command-buffer, submit, wait, and descriptor-free path because generation pays
+that cost today.
+
+Command:
+
+```sh
+nix develop --command ./zig-out/bin/llmtoy bench-matvec \
+  /opt/ai-lab/models/mudler/gemma-4-26B-A4B-it-APEX-GGUF/gemma-4-26B-A4B-APEX-I-Mini.gguf \
+  --iters 8
+```
+
+Result:
+
+| Target | Type | rows | cols | avg us | effective GB/s |
+|--------|------|------|------|--------|----------------|
+| `lm_head` | Q6_K | 262144 | 2816 | 2043.03 | 296.40 |
+| `L0.attn_q` | Q4_K | 4096 | 2816 | 47.80 | 135.74 |
+| `L0.attn_v` | Q4_K | 2048 | 2816 | 43.28 | 74.96 |
+| `L3.attn_v` | Q5_K | 2048 | 2816 | 54.54 | 72.70 |
+| `L5.attn_q` | Q3_K | 8192 | 2816 | 83.44 | 118.79 |
+| `L0.dense_down` | Q5_1 | 2816 | 2112 | 55.25 | 80.73 |
+| `L5.dense_down` | Q5_0 | 2816 | 2112 | 51.09 | 80.03 |
+| `L0.expert_down` | Q5_1 | 2816 | 704 | 53.74 | 27.67 |
+| `L10.expert_down` | IQ4_NL | 2816 | 704 | 49.16 | 22.68 |
+
+The large `lm_head` tensor reaches much higher effective bandwidth than the
+smaller layer and expert projections. That matches the endgame hypothesis:
+current one-row workgroups and per-dispatch overhead leave small matvecs badly
+under-occupied. The next target is an experimental MMVQ-style multi-row kernel,
+starting with Q4_K because it is easiest to compare against llama.cpp's
+`mul_mat_vec_q4_k.comp`.
+
 The submit-count reductions buy ~150–300 µs/token in saved overhead. On
 RX 7800 XT with our shaders the absolute per-submit cost (~150 µs) is
 small relative to the 220 ms of GPU matmul work per token, so each saved
