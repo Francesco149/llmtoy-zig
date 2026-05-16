@@ -14,6 +14,12 @@ const WORKGROUP_SIZE: u32 = 64;
 // Push-constant layout must match the GLSL shaders.
 const PushConst = extern struct { rows: u32, cols: u32 };
 
+pub const MmvqSpec = extern struct {
+    block_size: u32 = 32,
+    num_rows: u32 = 1,
+    num_cols: u32 = 1,
+};
+
 // ── MatvecPipeline ────────────────────────────────────────────────────────────
 
 // Compiled compute pipeline for one matvec shader variant.
@@ -112,6 +118,30 @@ pub const MatvecPipeline = struct {
     }
 
     fn initFromSpv(ctx: *const GpuContext, spv: anytype, rows_per_workgroup: u32) !MatvecPipeline {
+        return initFromSpvSpecialized(ctx, spv, rows_per_workgroup, null);
+    }
+
+    fn initFromSpvMmvq(ctx: *const GpuContext, spv: anytype, spec: MmvqSpec) !MatvecPipeline {
+        const map_entries = [_]vk.VkSpecializationMapEntry{
+            .{ .constantID = 0, .offset = @offsetOf(MmvqSpec, "block_size"), .size = @sizeOf(u32) },
+            .{ .constantID = 1, .offset = @offsetOf(MmvqSpec, "num_rows"),   .size = @sizeOf(u32) },
+            .{ .constantID = 2, .offset = @offsetOf(MmvqSpec, "num_cols"),   .size = @sizeOf(u32) },
+        };
+        const spec_info = vk.VkSpecializationInfo{
+            .mapEntryCount = map_entries.len,
+            .pMapEntries = &map_entries,
+            .dataSize = @sizeOf(MmvqSpec),
+            .pData = &spec,
+        };
+        return initFromSpvSpecialized(ctx, spv, spec.num_rows, &spec_info);
+    }
+
+    fn initFromSpvSpecialized(
+        ctx: *const GpuContext,
+        spv: anytype,
+        rows_per_workgroup: u32,
+        specialization: ?*const vk.VkSpecializationInfo,
+    ) !MatvecPipeline {
         // align(4) on the const in shaders.zig should guarantee this, but
         // assert the actual runtime address in case @embedFile doesn't honour it.
         std.debug.assert(@intFromPtr(spv) % 4 == 0);
@@ -174,7 +204,7 @@ pub const MatvecPipeline = struct {
             .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
             .module = shader_mod,
             .pName = "main",
-            .pSpecializationInfo = null,
+            .pSpecializationInfo = specialization,
         };
         const pipeline_ci = vk.VkComputePipelineCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,

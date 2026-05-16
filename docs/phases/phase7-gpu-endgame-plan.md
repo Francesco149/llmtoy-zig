@@ -389,7 +389,10 @@ First Q6_K packed-decode probe:
 
 ## Phase 7o - Faithful llama.cpp MMVQ Port
 
-Status: TODO. This is the main performance project.
+Status: STARTED. This is the main performance project. The early Q4_K R4 and
+Q6_K packed-decode probes were useful negative results: naive row packing and
+local decode cleanup are not enough. The next work should port the llama.cpp
+framework shape, not keep inventing isolated one-row shaders.
 
 Goal: replace the current one-row Q8_1 matvec shaders with a close port of
 llama.cpp's MMVQ structure, then tune for RX 7800 XT.
@@ -403,32 +406,94 @@ Implementation plan:
    shaders immediately. Keep a runtime or compile-time switch so one command
    can compare old vs new.
 
+   Host-side requirement: `MatvecPipeline` must support Vulkan specialization
+   constants. llama.cpp uses `local_size_x_id = 0` plus constants:
+
+   - constant `0`: `BLOCK_SIZE`, also the compute workgroup X size
+   - constant `1`: `NUM_ROWS`
+   - constant `2`: `NUM_COLS`
+
+   Add experimental init methods such as `initQ6KQ8_1Mmvq(ctx, .{ ... })` and
+   bench-only targets such as `lm_head.mmvq.b64.r1`. Do not replace the
+   current production pipeline until a variant wins in `bench-matvec` and
+   passes fuzz.
+
 2. Port the shared framework shape:
-   - `BLOCK_SIZE` specialization constant, initially 64.
-   - `NUM_ROWS` specialization constant, test 1, 2, 4, 8.
+   - `BLOCK_SIZE` specialization constant, initially 32 and 64. llama.cpp's
+     generated shader defaults to 32; RDNA3 may prefer 64 when full subgroup
+     control is available, but measure both.
+   - `NUM_ROWS` specialization constant, test 1, 2, 4, 8. Avoid the previous
+     `local_size_y` R4 mistake: llama.cpp keeps `local_size_y = 1` and stores
+     per-row accumulators in `temp[NUM_COLS][NUM_ROWS]` inside each invocation.
    - `NUM_COLS` specialization constant, test 1 first; use >1 only for batched
      prefill or grouped expert work where the input has multiple vectors.
    - subgroup size control if exposed; compare subgroup 32 and 64 on RDNA3.
    - shared-memory vs no-shared-memory reduction variants.
 
-3. Match llama.cpp's Q4_K repacking and scale/min handling first. Do not invent
+   Reduction variants matter:
+
+   - `USE_SUBGROUP_ADD_NO_SHMEM`: fastest only when one subgroup covers the
+     whole workgroup; unsafe for multiple subgroups unless full support is
+     guaranteed.
+   - `USE_SUBGROUP_ADD`: subgroup reduction plus shared memory across
+     subgroups. This is the safe first port for `BLOCK_SIZE=64`.
+   - plain shared-memory tree: fallback/reference variant.
+
+3. Port the Q8_1 activation loop from `mul_mat_vecq.comp`, not just the
+   quant-specific decode:
+
+   - define `MMQ` and `B_TYPE block_q8_1_x4`
+   - use `K_PER_ITER = 16` for K-quants (`DATA_A_QUANT_K`)
+   - preload Q8_1 activation words into `cache_b_qs[K_PER_ITER / 4]`
+   - use `b_block_idx_outer = b_block_idx / 4` and `b_block_idx_inner = b_block_idx % 4`
+     to match the x4 activation packing already used by llmtoy
+   - iterate `num_iters = ceil(ncols / (K_PER_ITER * BLOCK_SIZE))`
+   - preserve llama.cpp's 4-then-2 manual unroll structure until a measured
+     local change beats it
+
+4. Port one quant-specific file at a time. For Q6_K, the relevant llama.cpp
+   decode structure is `mul_mat_vec_q6_k.comp`:
+
+   - `shared FLOAT_TYPE sccache[2][BLOCK_SIZE/16][16]`
+   - `itid = tid % 16`, `ix = tid / 16`, so each 16-thread group handles a
+     256-element Q6_K block lane
+   - `v_im = itid / 8`, `v_in = itid - 8*v_im`
+   - `ql_offset = 64*v_im + 4*v_in`
+   - `qh_offset = 32*v_im + 4*v_in`
+   - `s_offset = 8*v_im + v_in/4`
+   - load Q6 low/high pieces with the same `data_a_packed16` pattern before
+     translating to this repo's byte-backed structs
+   - carry `all_threads` handling for tails even if Gemma dimensions are
+     usually friendly; fuzz should include small/tail shapes if the shader
+     supports them
+
+5. Match llama.cpp's Q4_K repacking and scale/min handling first. Do not invent
    a new layout unless the faithful port is already measured.
 
-4. Extend the port to Q3_K. This is likely the highest-impact quant type for
+6. Extend the port to Q3_K. This is likely the highest-impact quant type for
    this model because many attention and FFN gate/up matrices are Q3_K.
 
-5. Extend to Q5_0/Q5_1 for down projections and experts.
+7. Extend to Q5_0/Q5_1 for down projections and experts.
 
-6. Add Q6_K to the MMVQ family after the fallback-removal shader is stable; it
-   should use the same framework as Q3/Q4 rather than remain a bespoke one-row
-   shader.
+8. Add Q6_K to the MMVQ family early for `lm_head`, because timestamped
+   `bench-matvec` shows this large tensor is GPU-kernel dominated. It should
+   use the same framework as Q3/Q4 rather than remain a bespoke one-row shader.
 
-7. Add IQ4_NL to the MMVQ family after the fallback-removal shader is stable.
+9. Add IQ4_NL to the MMVQ family after the fallback-removal shader is stable.
    Its current lookup-table shader is useful, but it is not a faithful
    llama.cpp MMVQ-style kernel.
 
-8. Add Q5_K to the MMVQ family after the fallback-removal shader is stable.
+10. Add Q5_K to the MMVQ family after the fallback-removal shader is stable.
    Correctness first; K-quants are easy to get subtly wrong.
+
+Suggested first implementation slice:
+
+1. Add specialization support to `MatvecPipeline.initFromSpv`.
+2. Add one generated-style Q6_K MMVQ shader with `BLOCK_SIZE=32`,
+   `NUM_ROWS=1`, `NUM_COLS=1`, and the safe shared-memory reduction.
+3. Add fuzz coverage by reusing `fuzzQuantQ8_1(.q6_k, ...)`.
+4. Add `bench-matvec --target lm_head.mmvq.b32.r1`.
+5. Only after it passes, add variants for `BLOCK_SIZE=64` and `NUM_ROWS=2/4`.
 
 Acceptance criteria:
 
