@@ -306,6 +306,64 @@ Verified via `llmtoy compare`: per-layer rel_err identical to 7k* baseline
 VRAM cost: +560 MiB for the KV cache (30 layers × 2 × cap × nkv × 4 bytes,
 with cap=512 for SWA and cap=4096 for global).
 
+## Phase 7l.2/3 — GPU attention (Q·K^T + softmax + attn·V)
+
+Replaces the per-head CPU `sdpAttn` loop with two GPU shaders dispatched
+back-to-back in one submit, reading K/V directly from the 7l.1 VRAM cache.
+
+**Shaders** (both at `src/gpu/shaders/`):
+- `attn_qk_softmax.glsl`: one workgroup per Q head; 256 threads parallel
+  across `win_len` positions; each thread sequentially computes the full
+  head_dim dot product. 3-phase softmax (max → exp+sum → normalize) via
+  subgroupMax/subgroupAdd + shared-memory cross-subgroup reduction.
+  Circular-buffer slot indexing via `(seq - win_len + i) % cap` — SWA
+  mask is implicit in `win_len`.
+- `attn_av.glsl`: one workgroup per Q head; 256 threads parallel across
+  head_dim output dimension; each thread accumulates one output element
+  over all `win_len` positions. Coalesced reads of `v_cache[slot, kv_h, dd]`.
+
+Five fuzz tests cover SWA (n_heads=16, n_kv=4, hd=256: win=1, 128, 1024)
+and global (n_heads=4, n_kv=4, hd=512: win=64, 512) shapes. All pass at
+rel < 2e-6 vs CPU `sdpAttn` reference.
+
+Active on Gemma4's 24 SWA layers (which have `wv`); the 6 global layers
+(share V from K) still use the CPU `sdpAttn` path. Attention output is
+written into the existing `attn_in_buf` (which is `wo`'s input), and the
+full-fused wo+dense-FFN submit skips its own upload — eliminating a PCIe
+round-trip per layer.
+
+Hyperfine 3-run wall-clock for `generate "explain Mixture of Experts in
+64 words" --chat --temperature 0 --max-tokens 64 --gpu`:
+
+| Build                                              | mean ± σ          |
+|----------------------------------------------------|-------------------|
+| `d04bfa7` 7l.2/3 + skip-download polish            | 27.355 ± 0.277 s  |
+| `fbc6a91` 7l.2/3 (with attn_concat download)       | 27.508 ± 0.213 s  |
+| `b234300` 7l.1c baseline                           | 28.121 ± 0.126 s  |
+| `441b17e` 7j baseline (3 submits/layer)            | 28.445 ± 0.178 s  |
+
+Cumulative 7l: **−3.8%** wall-clock vs 7j. Per-token: ~9 ms saved
+(334.8 → 325.7 ms/token).
+
+The win is smaller than the 30–50% the original plan estimated. Why:
+- At typical decode `win_len` (≤ 84 in this bench), CPU `sdpAttn` was
+  ~50 µs/layer × 30 = ~1.5 ms/token. Replacing it with GPU compute
+  recovers ~1 ms/token (GPU isn't free either).
+- 6 global layers still run CPU `sdpAttn` + per-head norms + RoPE.
+- The dominant cost is **GPU matmul throughput** (Q3_K/Q4_K integer-dot
+  on this hardware/driver) — the 220 ms/token of matmul compute is
+  unchanged by 7l. Closing the remaining gap to llama.cpp needs better
+  matmul shaders (subgroup matvec, fp16 coopmat) — Phase 7m+.
+
+The structural value of 7l: K/V cache and attention all live in VRAM,
+the activation no longer round-trips between CPU/GPU per matmul, and
+follow-on optimisations (one-submit per layer, persistent command
+buffers, V-from-K shader for global layers) all become possible.
+
+Verified via `llmtoy compare`: all 30 layer argmaxes match CPU,
+per-layer rel_err identical to 7l.1 baseline, final argmax matches
+(1852 = 1852).
+
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
 Attempted fusing gate-gelu-up + w_down into a single submit (4 submits/layer):

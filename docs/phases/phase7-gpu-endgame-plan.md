@@ -339,18 +339,50 @@ norm/rope savings are roughly cancelled by extra GPU dispatches in the
 same submit. The VRAM-resident K/V cache is dead storage until 7l.2/3
 wire it into the actual attention compute.
 
-### 7l.2  Q·K^T + softmax shader [OPUS]
-One workgroup per attention head. Each thread computes one column of `qk`,
-then subgroup-cooperative softmax (max → exp → sum → divide). Reference
-`soft_max.comp` from llama.cpp. **Most numerically sensitive shader in the
-pipeline** — verify against CPU `attn.zig` before doing anything else.
+### 7l.2  Q·K^T + softmax shader [OPUS, DONE — `fbc6a91`]
+`attn_qk_softmax.glsl`: one workgroup per Q head; 256 threads parallel
+across `win_len` positions (each thread sequentially computes the full
+head_dim dot product); 3-phase softmax via subgroupMax/subgroupAdd. The
+SWA mask is implicit in `win_len` (caller passes
+`min(seq, sliding_window)`). Circular-buffer slot indexing via
+`(seq - win_len + i) % cap`. 5 fuzz tests cover SWA + global shapes;
+all pass rel < 2e-6 vs CPU `sdpAttn`.
 
-### 7l.3  attn_out = softmax_weights · V [SONNET]
-Standard matvec, cols = current seq length (variable, push constant).
+### 7l.3  attn_out = softmax_weights · V [OPUS, DONE — `fbc6a91`]
+`attn_av.glsl`: one workgroup per Q head; 256 threads parallel across
+the head_dim output dimension; each thread accumulates one output
+element over all `win_len` positions. Coalesced reads of
+`v_cache[slot, kv_h, dd]`. Output goes into `attn_in_buf` (wo's input
+buffer); `runLayerAttnResidualDenseFfnQ8_1` gains `skip_attn_upload`
+so the full-fused wo+dense-FFN submit reads it directly — no PCIe
+round-trip.
 
-### 7l.4  Sliding-window mask [OPUS]
-Bake into the softmax shader via push constants `(start_pos, end_pos)`.
-Gemma4 alternates SWA / global per layer.
+### 7l.4  Sliding-window mask [DONE — implicit in 7l.2]
+The SWA mask is implicit in `win_len` + circular slot indexing. No
+extra push-constant range needed.
+
+### 7l result
+
+Active on Gemma4's 24 SWA layers (which have `wv`); the 6 global
+layers (share V from K) still use the CPU `sdpAttn` path. Adding
+support for those layers later is a "V-from-K" copy shader away.
+
+Hyperfine cumulative (3 runs, 64-token generate including ~5.7 s model
+setup):
+
+| Stage    | mean ± σ          | Δ vs prev       |
+|----------|-------------------|-----------------|
+| 7j base  | 28.445 ± 0.178 s  | —               |
+| 7l.1     | 28.121 ± 0.126 s  | **−1.1%**       |
+| 7l.2/3   | 27.355 ± 0.277 s  | **−2.7%** (3.8% total) |
+
+The plan's 30–50% estimate was optimistic. CPU `sdpAttn` at typical
+decode `win_len` was only ~1.5 ms/token, so removing it recovered the
+same order. The remaining ~325 ms/token is dominated by GPU matmul
+throughput (Q3_K/Q4_K integer-dot on this hardware/driver), which 7l
+doesn't change. Closing the rest of the gap to llama.cpp's
+~80–100 tok/s needs matmul-shader work (subgroup matvec, fp16 coopmat)
+or upstream wins in submit pacing (7m, 7n).
 
 After 7l, the only CPU work per token is MoE topK (128 floats → 8 indices —
 small), and the final sample.
@@ -396,14 +428,17 @@ tuning:
 | 7i    | Opus        | PARTIAL     | 0% (two bugs fixed, drift deferred)      |
 | 7k\*  | Opus+Sonnet | **DONE**    | **+38% prefill, +33% decode** (3.10 → 4.28 / 3.07 → 4.07 tok/s) — plus the drift collapsed (all argmaxes match CPU after enough Q8_1 coverage) |
 | 7j    | Sonnet+Opus | **DONE**    | 5 → 3 submits/layer; +0.5% wall-clock (submit overhead was much smaller than estimated) |
-| 7l.1  | Opus        | **DONE**    | KV cache in VRAM + GPU per-head norms + GPU RoPE; −1.1% wall-clock (within σ — structural, sets up 7l.2/3) |
-| 7l.2+ | Sonnet+Opus | next        | +30–50% (Q·K^T+softmax, attn·V, SWA mask) |
+| 7l.1  | Opus        | **DONE**    | KV cache in VRAM + GPU per-head norms + GPU RoPE; −1.1% wall-clock |
+| 7l.2/3 | Opus       | **DONE**    | GPU Q·K^T+softmax + attn·V; **−2.7%** (−3.8% total vs 7j). Estimate was optimistic — CPU sdpAttn was only ~1.5 ms/token at this win_len; the remaining ~325 ms/token is matmul throughput. |
+| 7l.4  | —           | implicit    | SWA mask is implicit in win_len + circular slot indexing — done in 7l.2 |
 | 7m    | Sonnet      | after 7l    | +5%                                      |
 | 7n    | Sonnet      | after 7m    | +5–10%                                   |
 | 7o    | Opus        | last        | +5–10%                                   |
 
-Current standing: **4.28 prefill / 4.07 decode tok/s** vs llama.cpp Vulkan
-~80–100 tok/s on the same hardware. Remaining gap is ~20×.
+Current standing: **~4.3 prefill / ~4.1 decode tok/s** vs llama.cpp Vulkan
+~80–100 tok/s on the same hardware. Remaining gap is ~20×. The next
+structural lever is **matmul-shader throughput**, not attention or submit
+overhead.
 
 Notes from the 7k\* push:
 - Q4_K covered 6/30 attention layers; Q3_K filled the other 24. Plan
