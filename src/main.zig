@@ -337,6 +337,7 @@ const MatvecBenchOptions = struct {
 const BenchPipelines = struct {
     q3_k: gpu_matvec.MatvecPipeline,
     q4_k: gpu_matvec.MatvecPipeline,
+    q4_k_r4: gpu_matvec.MatvecPipeline,
     q5_0: gpu_matvec.MatvecPipeline,
     q5_1: gpu_matvec.MatvecPipeline,
     q5_k: gpu_matvec.MatvecPipeline,
@@ -349,6 +350,8 @@ const BenchPipelines = struct {
         errdefer q3_k.deinit();
         var q4_k = try gpu_matvec.MatvecPipeline.initQ4KQ8_1(ctx);
         errdefer q4_k.deinit();
+        var q4_k_r4 = try gpu_matvec.MatvecPipeline.initQ4KQ8_1R4(ctx);
+        errdefer q4_k_r4.deinit();
         var q5_0 = try gpu_matvec.MatvecPipeline.initQ5_0Q8_1(ctx);
         errdefer q5_0.deinit();
         var q5_1 = try gpu_matvec.MatvecPipeline.initQ5_1Q8_1(ctx);
@@ -363,6 +366,7 @@ const BenchPipelines = struct {
         errdefer quant.deinit();
         return .{
             .q3_k = q3_k, .q4_k = q4_k,
+            .q4_k_r4 = q4_k_r4,
             .q5_0 = q5_0, .q5_1 = q5_1,
             .q5_k = q5_k, .q6_k = q6_k,
             .iq4_nl = iq4_nl, .quant = quant,
@@ -376,6 +380,7 @@ const BenchPipelines = struct {
         self.q5_k.deinit();
         self.q5_1.deinit();
         self.q5_0.deinit();
+        self.q4_k_r4.deinit();
         self.q4_k.deinit();
         self.q3_k.deinit();
     }
@@ -424,7 +429,9 @@ fn cmdBenchMatvec(
     var ran: usize = 0;
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "lm_head", weights.lm_head, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L0.attn_q", weights.layers[0].wq, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_r4, &pipes.quant, opts, &ran, "L0.attn_q.r4", weights.layers[0].wq, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L0.attn_v", weights.layers[0].wv.?, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_r4, &pipes.quant, opts, &ran, "L0.attn_v.r4", weights.layers[0].wv.?, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L3.attn_v", weights.layers[3].wv.?, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L5.attn_q", weights.layers[5].wq, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L0.dense_down", weights.layers[0].w_down, gpa, io);
@@ -450,6 +457,24 @@ fn benchIfSelected(
 ) !void {
     if (opts.target) |t| if (!std.mem.eql(u8, t, name) and !std.mem.eql(u8, t, "all")) return;
     try benchOneMatvec(out, ctx, pipes, name, mat, opts.iters, gpa, io);
+    ran.* += 1;
+}
+
+fn benchWithPipelineIfSelected(
+    out: *std.Io.Writer,
+    ctx: *const gpu_ctx.GpuContext,
+    pipeline: *const gpu_matvec.MatvecPipeline,
+    quant: *const gpu_matvec.QuantizeQ8_1Pipeline,
+    opts: MatvecBenchOptions,
+    ran: *usize,
+    name: []const u8,
+    mat: g4_weights.RawMatrix,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+) !void {
+    if (mat.type_ != .q4_k) return;
+    if (opts.target) |t| if (!std.mem.eql(u8, t, name) and !std.mem.eql(u8, t, "all")) return;
+    try benchOneMatvecWithPipeline(out, ctx, pipeline, quant, name, mat, opts.iters, gpa, io);
     ran.* += 1;
 }
 
@@ -494,6 +519,20 @@ fn benchOneMatvec(
         try out.print("{s:32} {s:7} unsupported\n", .{ name, mat.type_.label() });
         return;
     };
+    try benchOneMatvecWithPipeline(out, ctx, pl, &pipes.quant, name, mat, iters, gpa, io);
+}
+
+fn benchOneMatvecWithPipeline(
+    out: *std.Io.Writer,
+    ctx: *const gpu_ctx.GpuContext,
+    pl: *const gpu_matvec.MatvecPipeline,
+    quant: *const gpu_matvec.QuantizeQ8_1Pipeline,
+    name: []const u8,
+    mat: g4_weights.RawMatrix,
+    iters: u32,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+) !void {
     if (mat.cols % 32 != 0) return error.InvalidMatvecShape;
 
     const session_opt = try gpu_matvec.MatvecSession.initFromRaw(
@@ -522,11 +561,11 @@ fn benchOneMatvec(
 
     {
         const cmd = try ctx.beginBatch();
-        const q_ds = try pipes.quant.record(cmd, &vec_buf, &acts_buf, @intCast(mat.cols));
+        const q_ds = try quant.record(cmd, &vec_buf, &acts_buf, @intCast(mat.cols));
         gpu_ctx.GpuContext.recordShaderBarrier(cmd);
         try ctx.submitBatch(cmd);
         var ds = q_ds;
-        _ = vk.vkFreeDescriptorSets(ctx.device, pipes.quant.desc_pool, 1, &ds);
+        _ = vk.vkFreeDescriptorSets(ctx.device, quant.desc_pool, 1, &ds);
     }
 
     {

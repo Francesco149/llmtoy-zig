@@ -69,6 +69,12 @@ pub const MatvecPipeline = struct {
         return initFromSpv(ctx, &shaders.matvec_q4_k_q8_1, 1);
     }
 
+    // Experimental Q4_K × Q8_1 variant: 4 rows per workgroup.
+    pub fn initQ4KQ8_1R4(ctx: *const GpuContext) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_q4_k_q8_1_r4.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.matvec_q4_k_q8_1_r4, 4);
+    }
+
     // Q3_K weights × Q8_1 activations, subgroup-cooperative (1 workgroup/row).
     pub fn initQ3KQ8_1(ctx: *const GpuContext) !MatvecPipeline {
         comptime std.debug.assert(shaders.matvec_q3_k_q8_1.len % 4 == 0);
@@ -2651,7 +2657,13 @@ test "gpu quantize_q8_1 round-trip" {
 //      to within float-reduction-order noise (~1e-5 relative).
 //   3. GPU: upload Q8_1 x4 buffer + Q4_K matrix → run matvec_q4_k_q8_1.
 //   4. Assert rel < 1e-3 (loose to absorb f16 ds + per-row float order).
-fn fuzzQ4KQ8_1(rows: usize, cols: usize, seed: u64) !void {
+fn fuzzQ4KQ8_1(
+    rows: usize,
+    cols: usize,
+    seed: u64,
+    comptime initPipeline: fn (*const GpuContext) anyerror!MatvecPipeline,
+    comptime label: []const u8,
+) !void {
     const ctx = GpuContext.init() catch |e| {
         std.debug.print("gpu init failed: {}\n", .{e});
         return;
@@ -2705,7 +2717,7 @@ fn fuzzQ4KQ8_1(rows: usize, cols: usize, seed: u64) !void {
     dq.packQ8_1_x4(q8_1_basic, q8_1_x4);
 
     // GPU side: device-local Q4_K weights, host-coherent Q8_1 acts + output.
-    var pipeline = try MatvecPipeline.initQ4KQ8_1(&gpu);
+    var pipeline = try initPipeline(&gpu);
     defer pipeline.deinit();
     var session = try MatvecSession.initQ4K(&gpu, mat, @intCast(rows), @intCast(cols));
     defer session.deinit();
@@ -2736,18 +2748,26 @@ fn fuzzQ4KQ8_1(rows: usize, cols: usize, seed: u64) !void {
         if (@abs(c) > max_ref) max_ref = @abs(c);
     }
     const rel = max_abs / (max_ref + 1e-6);
-    std.debug.print("Q4_K×Q8_1 fuzz rows={} cols={}  max|D|={d:.6}  rel={e:.3}\n",
-        .{ rows, cols, max_abs, rel });
+    std.debug.print("{s} fuzz rows={} cols={}  max|D|={d:.6}  rel={e:.3}\n",
+        .{ label, rows, cols, max_abs, rel });
     try std.testing.expect(rel < 1e-3);
 }
 
 test "gpu matvec Q4_K × Q8_1 fuzz small" {
-    try fuzzQ4KQ8_1(32, 256, 11);
+    try fuzzQ4KQ8_1(32, 256, 11, MatvecPipeline.initQ4KQ8_1, "Q4_K×Q8_1");
 }
 
 test "gpu matvec Q4_K × Q8_1 fuzz model-sized" {
     // Closest analogue to a Gemma4 attention matmul: cols = d_model = 2304.
-    try fuzzQ4KQ8_1(64, 2304, 13);
+    try fuzzQ4KQ8_1(64, 2304, 13, MatvecPipeline.initQ4KQ8_1, "Q4_K×Q8_1");
+}
+
+test "gpu matvec Q4_K × Q8_1 R4 fuzz small" {
+    try fuzzQ4KQ8_1(32, 256, 17, MatvecPipeline.initQ4KQ8_1R4, "Q4_K×Q8_1.r4");
+}
+
+test "gpu matvec Q4_K × Q8_1 R4 fuzz model-sized" {
+    try fuzzQ4KQ8_1(64, 2304, 19, MatvecPipeline.initQ4KQ8_1R4, "Q4_K×Q8_1.r4");
 }
 
 // Q3_K × Q8_1 fuzz: same structure as fuzzQ4KQ8_1 but with Q3_K weight bytes.

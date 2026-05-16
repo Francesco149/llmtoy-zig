@@ -404,6 +404,27 @@ under-occupied. The next target is an experimental MMVQ-style multi-row kernel,
 starting with Q4_K because it is easiest to compare against llama.cpp's
 `mul_mat_vec_q4_k.comp`.
 
+### Q4_K R4 shape probe
+
+Added an experimental `matvec_q4_k_q8_1_r4.glsl` bench-only pipeline that maps
+four rows into one workgroup. A first version using `subgroupAdd` was wrong on
+this device because the hardware subgroup can span more than one logical row;
+the correct version uses `subgroupClusteredAdd(..., 32)` so each row reduces
+independently.
+
+The corrected shader passes the Q4_K x Q8_1 fuzz tests, but it is not faster
+enough to route into generation:
+
+| Target | Baseline avg us | R4 avg us | Result |
+|--------|------------------|-----------|--------|
+| `L0.attn_q` | 59.37 | 61.25 | -3.2% |
+| `L0.attn_v` | 57.38 | 58.22 | -1.5% |
+
+Conclusion: simple row packing is not the missing llama.cpp optimization by
+itself. The real MMVQ port needs the rest of llama.cpp's structure: subgroup
+size control, tuned `NUM_ROWS`, shared helper layout, and format-specific
+unpack scheduling. Keep the R4 path as a microbench comparison target only.
+
 The submit-count reductions buy ~150–300 µs/token in saved overhead. On
 RX 7800 XT with our shaders the absolute per-submit cost (~150 µs) is
 small relative to the 220 ms of GPU matmul work per token, so each saved

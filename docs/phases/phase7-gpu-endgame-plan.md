@@ -293,10 +293,12 @@ nix develop --command ./zig-out/bin/llmtoy bench-matvec <model.gguf> \
   --iters 256 --target L0.attn_q
 ```
 
-Current targets are `lm_head`, `L0.attn_q`, `L0.attn_v`, `L3.attn_v`,
-`L5.attn_q`, `L0.dense_down`, `L5.dense_down`, `L0.expert_down`, and
-`L10.expert_down`. They cover Q3_K, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, and
-IQ4_NL with the target model's actual row/column sizes.
+Current targets are `lm_head`, `L0.attn_q`, `L0.attn_q.r4`, `L0.attn_v`,
+`L0.attn_v.r4`, `L3.attn_v`, `L5.attn_q`, `L0.dense_down`,
+`L5.dense_down`, `L0.expert_down`, and `L10.expert_down`. They cover Q3_K,
+Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, and IQ4_NL with the target model's actual
+row/column sizes. The `.r4` targets are experimental Q4_K row-batching probes,
+not production routes.
 
 End-to-end tok/s is too noisy for shader iteration. Add a command or test-only
 binary that runs one GPU kernel shape thousands of times with fixed buffers.
@@ -346,6 +348,19 @@ overhead and poor occupancy, while the large lm_head shape reaches much higher
 bandwidth. This points directly at Phase 7o: MMVQ-style multi-row workgroups
 and better shader shape should come before command plumbing, except where the
 microbench proves a shape is launch-bound.
+
+First Q4_K row-batching probe:
+
+- `matvec_q4_k_q8_1_r4.glsl` maps four output rows into one workgroup.
+- Correctness requires row-local reduction. Plain `subgroupAdd` is wrong when a
+  hardware subgroup spans multiple logical rows; the current shader uses
+  `subgroupClusteredAdd(..., 32)`.
+- Bench result with 128 iterations: `L0.attn_q` baseline 59.37 us vs `.r4`
+  61.25 us; `L0.attn_v` baseline 57.38 us vs `.r4` 58.22 us.
+- Conclusion: naive row packing is not enough. Keep this as a comparison
+  target, but do not route generation through it. The next MMVQ attempt should
+  port llama.cpp's framework more faithfully rather than only changing
+  `local_size_y`.
 
 ---
 
