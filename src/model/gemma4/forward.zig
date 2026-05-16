@@ -115,16 +115,15 @@ pub fn forwardOne(
 
         // ── Attention ─────────────────────────────────────────────────────────
 
-        math.rmsnorm(xb, x, lw.attn_norm, cfg.eps);
-
         // Three QKV dispatch paths, in priority order:
         //   1. Q8_1 path:  wq+wk+(wv) are all on GPU with a Q8_1 pipeline
-        //      (currently Q3_K or Q4_K) → quantize xb once to device-local
-        //      Q8_1 then run integer-dot matvecs.
+        //      (currently Q3_K or Q4_K) → GPU rmsnorm(x, attn_norm) +
+        //      quantize + matvecs all in one command-buffer submit
+        //      (runLayerAttnQ8_1). CPU never touches xb on this path.
         //   2. f32 batch:  all on GPU but some lack a Q8_1 pipeline (e.g. wv
-        //      is Q5_K at L3) → existing parallel f32-activation matvecs.
-        //   3. Per-call:   some session is missing / CPU-only → independent
-        //      mv() calls so each can take its own (GPU or CPU) path.
+        //      is Q5_K at L3) → CPU rmsnorm + parallel f32-activation matvecs.
+        //   3. Per-call:   some session is missing / CPU-only → CPU rmsnorm +
+        //      independent mv() calls so each can take its own path.
         const wv_present = lw.wv != null;
         const wv_on_gpu  = wv_present and (if (glw) |g| g.wv != null else false);
         const wq_q8_1 = gpu != null and glw != null and glw.?.wq != null
@@ -143,11 +142,12 @@ pub fn forwardOne(
             const wk_q8_pl = g.q8_1PipelineFor(lw.wk.type_).?;
             const wv_q8_pl: ?*const MatvecPipeline = if (wv_present)
                 g.q8_1PipelineFor(lw.wv.?.type_) else null;
-            try g.runLayerQKVQ8_1(l, wq_q8_pl, wk_q8_pl, wv_q8_pl,
-                xb[0..d], q[0..nq_l], k_cur,
+            try g.runLayerAttnQ8_1(l, cfg.eps, wq_q8_pl, wk_q8_pl, wv_q8_pl,
+                x, q[0..nq_l], k_cur,
                 if (wv_present) v_cur else null);
             if (!wv_present) @memcpy(v_cur, k_cur);
         } else if (can_batch_qkv) {
+            math.rmsnorm(xb, x, lw.attn_norm, cfg.eps);
             const g = gpu.?;
             const wv_pl: ?*const MatvecPipeline = if (wv_on_gpu)
                 g.pipelineFor(lw.wv.?.type_) else null;
@@ -156,6 +156,7 @@ pub fn forwardOne(
                 xb[0..d], q[0..nq_l], k_cur, v_cur);
             if (!wv_present) @memcpy(v_cur, k_cur);
         } else {
+            math.rmsnorm(xb, x, lw.attn_norm, cfg.eps);
             try mv(q[0..nq_l], lw.wq, xb[0..d], scratch, pool, if (glw) |g| g.wq else null, gpu);
             try mv(k_cur,      lw.wk, xb[0..d], scratch, pool, if (glw) |g| g.wk else null, gpu);
             if (lw.wv) |wv| {
@@ -235,14 +236,15 @@ pub fn forwardOne(
 
         // ── Dense FFN path ────────────────────────────────────────────────────
 
-        math.rmsnorm(xb, x, lw.ffn_norm, cfg.eps);
-
-        // Three FFN-gate+up dispatch paths, mirroring the QKV logic:
-        //   1. Q8_1 path:  both gate+up have Q8_1 pipelines + aligned cols
-        //                   → quantize xb once then 2 parallel integer-dot matmuls
-        //   2. f32 batch:  both on GPU but at least one has no Q8_1 shader
-        //                   → existing batched f32-acts path
-        //   3. Per-call:   one or both sessions missing → mv() per matrix
+        // Four FFN dispatch paths, in priority order:
+        //   0. Full Q8_1 fused chain: gate+up have Q8_1, w_down is on GPU →
+        //      runLayerDenseFfnQ8_1 does rmsnorm + quantize + gate + up +
+        //      gelu*up + w_down + post_ffw_norm_1 in ONE submit. Eliminates
+        //      one CPU GELU step and one entire submit (the prior w_down).
+        //   1. Q8_1 gate+up only: w_down not on GPU → fused gate+up GPU,
+        //      then CPU GELU + CPU/GPU w_down + CPU post_ffw_norm_1.
+        //   2. f32 batch:  both on GPU but at least one has no Q8_1 shader.
+        //   3. Per-call:   one or both sessions missing.
         const gate_q8_pl: ?*const MatvecPipeline = if (gpu) |g|
             (if (glw != null and glw.?.w_gate != null) g.q8_1PipelineFor(lw.w_gate.type_) else null)
         else null;
@@ -254,21 +256,34 @@ pub fn forwardOne(
             and (lw.w_up.type_   != .q3_k or d % 256 == 0);
         const can_batch_ffn = !can_q8_1_ffn and gpu != null and glw != null and
             glw.?.w_gate != null and glw.?.w_up != null;
-        if (can_q8_1_ffn) {
-            try gpu.?.runLayerGateUpQ8_1(l, gate_q8_pl.?, up_q8_pl.?,
-                xb[0..d], gate_buf, up_buf);
-        } else if (can_batch_ffn) {
+        const w_down_on_gpu = gpu != null and glw != null and glw.?.w_down != null;
+        const can_fused_dense = can_q8_1_ffn and w_down_on_gpu;
+
+        if (can_fused_dense) {
             const g = gpu.?;
-            try g.runLayerGateUp(l,
-                g.pipelineFor(lw.w_gate.type_), g.pipelineFor(lw.w_up.type_),
-                xb[0..d], gate_buf, up_buf);
+            try g.runLayerDenseFfnQ8_1(l, cfg.eps,
+                gate_q8_pl.?, up_q8_pl.?, g.pipelineFor(lw.w_down.type_),
+                x, ffn_buf);
+            // ffn_buf already holds post_ffw_norm_1(w_down(gelu(gate)*up))
         } else {
-            try mv(gate_buf, lw.w_gate, xb[0..d], scratch, pool, if (glw) |g| g.w_gate else null, gpu);
-            try mv(up_buf,   lw.w_up,   xb[0..d], scratch, pool, if (glw) |g| g.w_up   else null, gpu);
+            if (can_q8_1_ffn) {
+                try gpu.?.runLayerFfnGateUpQ8_1(l, cfg.eps, gate_q8_pl.?, up_q8_pl.?,
+                    x, gate_buf, up_buf);
+            } else if (can_batch_ffn) {
+                math.rmsnorm(xb, x, lw.ffn_norm, cfg.eps);
+                const g = gpu.?;
+                try g.runLayerGateUp(l,
+                    g.pipelineFor(lw.w_gate.type_), g.pipelineFor(lw.w_up.type_),
+                    xb[0..d], gate_buf, up_buf);
+            } else {
+                math.rmsnorm(xb, x, lw.ffn_norm, cfg.eps);
+                try mv(gate_buf, lw.w_gate, xb[0..d], scratch, pool, if (glw) |g| g.w_gate else null, gpu);
+                try mv(up_buf,   lw.w_up,   xb[0..d], scratch, pool, if (glw) |g| g.w_up   else null, gpu);
+            }
+            for (gate_buf, up_buf) |*g, u| g.* = math.gelu(g.*) * u;
+            try mv(ffn_buf, lw.w_down, gate_buf, scratch, pool, if (glw) |g| g.w_down else null, gpu);
+            math.rmsnorm(ffn_buf, ffn_buf, lw.post_ffw_norm_1, cfg.eps);
         }
-        for (gate_buf, up_buf) |*g, u| g.* = math.gelu(g.*) * u;
-        try mv(ffn_buf, lw.w_down, gate_buf, scratch, pool, if (glw) |g| g.w_down else null, gpu);
-        math.rmsnorm(ffn_buf, ffn_buf, lw.post_ffw_norm_1, cfg.eps);
 
         // ── MoE FFN path ──────────────────────────────────────────────────────
 

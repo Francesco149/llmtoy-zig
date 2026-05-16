@@ -45,6 +45,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(elem_add_spv, "elem_add.spv");
     const elem_scale_spv = compileShader(b, "src/gpu/shaders/elem_scale.glsl");
     _ = wf.addCopyFile(elem_scale_spv, "elem_scale.spv");
+    const gelu_mul_spv = compileShader(b, "src/gpu/shaders/gelu_mul.glsl");
+    _ = wf.addCopyFile(gelu_mul_spv, "gelu_mul.spv");
     const rope_table_spv = compileShader(b, "src/gpu/shaders/rope_neox_table.glsl");
     _ = wf.addCopyFile(rope_table_spv, "rope_neox_table.spv");
     const rope_theta_spv = compileShader(b, "src/gpu/shaders/rope_neox_theta.glsl");
@@ -70,6 +72,7 @@ pub fn build(b: *std.Build) void {
         \\pub const rmsnorm             align(4) = @embedFile("rmsnorm.spv").*;
         \\pub const elem_add            align(4) = @embedFile("elem_add.spv").*;
         \\pub const elem_scale          align(4) = @embedFile("elem_scale.spv").*;
+        \\pub const gelu_mul            align(4) = @embedFile("gelu_mul.spv").*;
         \\pub const rope_neox_table     align(4) = @embedFile("rope_neox_table.spv").*;
         \\pub const rope_neox_theta     align(4) = @embedFile("rope_neox_theta.spv").*;
     );

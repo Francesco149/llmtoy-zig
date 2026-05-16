@@ -26,6 +26,7 @@ const QuantizeQ8_1Pipeline = mv_mod.QuantizeQ8_1Pipeline;
 const RmsnormPipeline     = mv_mod.RmsnormPipeline;
 const ElemAddPipeline     = mv_mod.ElemAddPipeline;
 const ElemScalePipeline   = mv_mod.ElemScalePipeline;
+const GeluMulPipeline     = mv_mod.GeluMulPipeline;
 const RopeNeoxTablePipeline = mv_mod.RopeNeoxTablePipeline;
 const RopeNeoxThetaPipeline = mv_mod.RopeNeoxThetaPipeline;
 const wt_                = @import("weights.zig");
@@ -96,6 +97,7 @@ pub const GpuWeights = struct {
     pl_rmsnorm:      RmsnormPipeline,
     pl_elem_add:     ElemAddPipeline,
     pl_elem_scale:   ElemScalePipeline,
+    pl_gelu_mul:     GeluMulPipeline,
     pl_rope_table:   RopeNeoxTablePipeline,
     pl_rope_theta:   RopeNeoxThetaPipeline,
     layers:     []GpuLayerWeights,
@@ -113,6 +115,15 @@ pub const GpuWeights = struct {
     // norm outputs and other transient f32 vectors.
     x_vram:   ?GpuBuffer,
     xb_vram:  ?GpuBuffer,
+    // Dense FFN VRAM staging — buffers consumed within a single command
+    // submit by the fused gate→up→gelu*up→w_down→post_ffw_norm_1 chain.
+    // Sized to d_ffn (gate/up/gelu_mul output) and d_model (w_down output).
+    gate_vram: ?GpuBuffer,
+    up_vram:   ?GpuBuffer,
+    ffn_vram:  ?GpuBuffer,
+    // Host-coherent download buffer for the final post_ffw_norm_1 result of
+    // the fused dense FFN chain.  d_model floats.
+    dense_ffn_out_buf: ?GpuBuffer,
     // Persistent host-coherent staging buffer for x_vram uploads/downloads —
     // sized to max_cols. Avoids re-allocating a staging buffer per upload.
     stage_buf: ?GpuBuffer,
@@ -222,6 +233,8 @@ pub const GpuWeights = struct {
         errdefer pl_elem_add.deinit();
         var pl_elem_scale = try ElemScalePipeline.init(&ctx);
         errdefer pl_elem_scale.deinit();
+        var pl_gelu_mul = try GeluMulPipeline.init(&ctx);
+        errdefer pl_gelu_mul.deinit();
         var pl_rope_table = try RopeNeoxTablePipeline.init(&ctx);
         errdefer pl_rope_table.deinit();
         var pl_rope_theta = try RopeNeoxThetaPipeline.init(&ctx);
@@ -252,12 +265,14 @@ pub const GpuWeights = struct {
             .pl_fused_gu = pl_fused_gu, .pl_fused_gu_q8_1 = pl_fused_gu_q8_1,
             .pl_accum = pl_accum,
             .pl_rmsnorm = pl_rmsnorm, .pl_elem_add = pl_elem_add,
-            .pl_elem_scale = pl_elem_scale,
+            .pl_elem_scale = pl_elem_scale, .pl_gelu_mul = pl_gelu_mul,
             .pl_rope_table = pl_rope_table, .pl_rope_theta = pl_rope_theta,
             .layers = layers, .lm_head = null,
             .shared_vec = null, .shared_out = null,
             .shared_acts_q8_1 = null,
             .x_vram = null, .xb_vram = null, .stage_buf = null,
+            .gate_vram = null, .up_vram = null, .ffn_vram = null,
+            .dense_ffn_out_buf = null,
             .out_norm_buf = null, .rope_freqs_buf = null,
             .expert_gate = null, .expert_up = null, .expert_down = null,
             .n_experts = g4cfg.n_experts, .n_experts_used = g4cfg.n_experts_used,
@@ -351,6 +366,25 @@ pub const GpuWeights = struct {
         std.debug.print("  7j VRAM bufs: x={} KiB xb={} KiB stage={} KiB\n",
             .{ max_cols * @sizeOf(f32) / 1024, max_cols * @sizeOf(f32) / 1024,
                max_cols * @sizeOf(f32) / 1024 });
+
+        // Dense FFN fused-chain buffers.  gate/up_vram hold the gate+up matvec
+        // outputs (d_ffn floats); the fused gelu_mul rewrites gate_vram in place
+        // as gelu(gate)*up before w_down reads it.  ffn_vram holds the w_down
+        // output (d_model floats) before the in-place post_ffw_norm_1 rmsnorm
+        // copies into dense_ffn_out_buf for download.
+        const dffn_bytes = g4cfg.d_ffn * @sizeOf(f32);
+        gw.gate_vram = try GpuBuffer.initDeviceLocal(&gw.ctx,
+            dffn_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.up_vram   = try GpuBuffer.initDeviceLocal(&gw.ctx,
+            dffn_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.ffn_vram  = try GpuBuffer.initDeviceLocal(&gw.ctx,
+            g4cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.dense_ffn_out_buf = try GpuBuffer.initHostCoherent(&gw.ctx,
+            g4cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std.debug.print("  dense FFN VRAM: gate={} KiB up={} KiB ffn={} KiB out={} KiB\n",
+            .{ dffn_bytes / 1024, dffn_bytes / 1024,
+               g4cfg.d_model * @sizeOf(f32) / 1024,
+               g4cfg.d_model * @sizeOf(f32) / 1024 });
 
         // Per-projection output buffers for batched QKV and gate+up dispatch.
         // Sized per-projection so all three (or two) can be in-flight simultaneously.
@@ -467,6 +501,10 @@ pub const GpuWeights = struct {
         if (self.q_out_buf)    |*b| b.deinit();
         if (self.rope_freqs_buf) |*b| b.deinit();
         if (self.out_norm_buf)   |*b| b.deinit();
+        if (self.dense_ffn_out_buf) |*b| b.deinit();
+        if (self.ffn_vram)  |*b| b.deinit();
+        if (self.up_vram)   |*b| b.deinit();
+        if (self.gate_vram) |*b| b.deinit();
         if (self.stage_buf) |*b| b.deinit();
         if (self.xb_vram)   |*b| b.deinit();
         if (self.x_vram)    |*b| b.deinit();
@@ -483,6 +521,7 @@ pub const GpuWeights = struct {
         self.pl_q5_1.deinit();
         self.pl_rope_theta.deinit();
         self.pl_rope_table.deinit();
+        self.pl_gelu_mul.deinit();
         self.pl_elem_scale.deinit();
         self.pl_elem_add.deinit();
         self.pl_rmsnorm.deinit();
@@ -641,6 +680,77 @@ pub const GpuWeights = struct {
         if (v_out) |v| try self.v_out_buf.?.download(std.mem.sliceAsBytes(v));
     }
 
+    // 7j-integrated attention path: same as runLayerQKVQ8_1 but with attn_norm
+    // folded into the same submit. Caller passes the unnormalized residual `x`;
+    // the GPU runs rmsnorm(x, attn_norm) → xb_vram, then quantize → shared_acts_q8_1,
+    // then 2–3 QKV matvecs. One submit replaces the CPU rmsnorm + the existing
+    // QKV submit. Saves one xb upload and 30 × ~10 µs of CPU work per token.
+    pub fn runLayerAttnQ8_1(
+        self: *const GpuWeights,
+        layer: usize,
+        eps: f32,
+        wq_pl: *const MatvecPipeline,
+        wk_pl: *const MatvecPipeline,
+        wv_pl: ?*const MatvecPipeline,    // null when wv is shared (caller @memcpy k → v)
+        x: []const f32,                   // unnormalized residual
+        q_out: []f32,
+        k_out: []f32,
+        v_out: ?[]f32,
+    ) !void {
+        const lw   = &self.layers[layer];
+        const wq   = lw.wq orelse return error.NotOnGpu;
+        const wk   = lw.wk orelse return error.NotOnGpu;
+        const attn_norm_buf = &(lw.attn_norm_buf orelse return error.NotOnGpu);
+        std.debug.assert(wq.cols % 256 == 0);   // rmsnorm shader requires n % 256 == 0
+        std.debug.assert(wq.cols == wk.cols);
+        std.debug.assert(wq.cols == x.len);
+
+        const vec_buf  = &self.shared_vec.?;          // x lives here (HOST_COHERENT)
+        const xb_buf   = &(self.xb_vram orelse return error.NotOnGpu);  // rmsnorm output (VRAM)
+        const acts_buf = &self.shared_acts_q8_1.?;    // quantize output (VRAM)
+        const q_buf    = &(self.q_out_buf orelse return error.NotOnGpu);
+        const k_buf    = &(self.k_out_buf orelse return error.NotOnGpu);
+
+        try vec_buf.upload(std.mem.sliceAsBytes(x));
+
+        const cmd = try self.ctx.beginBatch();
+        const norm_dset = try self.pl_rmsnorm.record(
+            cmd, vec_buf, attn_norm_buf, xb_buf, @intCast(x.len), eps, false);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const quant_dset = try self.pl_quantize_q8_1.record(
+            cmd, xb_buf, acts_buf, wq.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const q_mv_dset = try wq_pl.record(
+            cmd, &wq.mat_buf, acts_buf, q_buf, wq.rows, wq.cols);
+        const k_mv_dset = try wk_pl.record(
+            cmd, &wk.mat_buf, acts_buf, k_buf, wk.rows, wk.cols);
+
+        var v_mv_dset: ?vk.VkDescriptorSet = null;
+        if (v_out != null) {
+            const wv    = lw.wv orelse return error.NotOnGpu;
+            const v_buf = &(self.v_out_buf orelse return error.NotOnGpu);
+            const v_pl  = wv_pl orelse return error.NoQ8_1Pipeline;
+            std.debug.assert(wv.cols == wq.cols);
+            v_mv_dset = try v_pl.record(
+                cmd, &wv.mat_buf, acts_buf, v_buf, wv.rows, wv.cols);
+        }
+
+        try self.ctx.submitBatch(cmd);
+
+        const dev = self.ctx.device;
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &norm_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_quantize_q8_1.desc_pool, 1, &quant_dset);
+        _ = vk.vkFreeDescriptorSets(dev, wq_pl.desc_pool, 1, &q_mv_dset);
+        _ = vk.vkFreeDescriptorSets(dev, wk_pl.desc_pool, 1, &k_mv_dset);
+        if (v_mv_dset) |*ds| _ = vk.vkFreeDescriptorSets(dev, wv_pl.?.desc_pool, 1, ds);
+
+        try q_buf.download(std.mem.sliceAsBytes(q_out));
+        try k_buf.download(std.mem.sliceAsBytes(k_out));
+        if (v_out) |v| try self.v_out_buf.?.download(std.mem.sliceAsBytes(v));
+    }
+
     // Pipeline for the Q8_1-activation integer-dot path. Returns null when
     // the weight type has no Q8_1 shader yet (Q5_K, Q5_0, Q5_1, Q8_0, IQ4_NL,
     // F32 — these would either fall back to the f32-activation path or run
@@ -698,6 +808,159 @@ pub const GpuWeights = struct {
 
         try gate_buf.download(std.mem.sliceAsBytes(gate_out));
         try up_buf.download(std.mem.sliceAsBytes(up_out));
+    }
+
+    // 7j-integrated dense FFN gate+up path. Caller passes the unnormalized
+    // residual `x`; GPU runs rmsnorm(x, ffn_norm) → xb_vram, quantize →
+    // shared_acts_q8_1, then gate + up matvecs. Replaces CPU rmsnorm + the
+    // existing gate+up submit with one combined submit.
+    pub fn runLayerFfnGateUpQ8_1(
+        self: *const GpuWeights,
+        layer: usize,
+        eps: f32,
+        gate_pl: *const MatvecPipeline,
+        up_pl:   *const MatvecPipeline,
+        x: []const f32,                   // unnormalized residual
+        gate_out: []f32,
+        up_out:   []f32,
+    ) !void {
+        const lw     = &self.layers[layer];
+        const w_gate = lw.w_gate orelse return error.NotOnGpu;
+        const w_up   = lw.w_up   orelse return error.NotOnGpu;
+        const ffn_norm_buf = &(lw.ffn_norm_buf orelse return error.NotOnGpu);
+        std.debug.assert(w_gate.cols % 256 == 0);
+        std.debug.assert(w_gate.cols == w_up.cols);
+        std.debug.assert(w_gate.cols == x.len);
+
+        const vec_buf  = &self.shared_vec.?;
+        const xb_buf   = &(self.xb_vram orelse return error.NotOnGpu);
+        const acts_buf = &self.shared_acts_q8_1.?;
+        const gate_buf = &(self.gate_out_buf orelse return error.NotOnGpu);
+        const up_buf   = &(self.up_out_buf   orelse return error.NotOnGpu);
+
+        try vec_buf.upload(std.mem.sliceAsBytes(x));
+
+        const cmd = try self.ctx.beginBatch();
+        const norm_dset = try self.pl_rmsnorm.record(
+            cmd, vec_buf, ffn_norm_buf, xb_buf, @intCast(x.len), eps, false);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const quant_dset = try self.pl_quantize_q8_1.record(
+            cmd, xb_buf, acts_buf, w_gate.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const gate_dset = try gate_pl.record(
+            cmd, &w_gate.mat_buf, acts_buf, gate_buf, w_gate.rows, w_gate.cols);
+        const up_dset = try up_pl.record(
+            cmd, &w_up.mat_buf, acts_buf, up_buf, w_up.rows, w_up.cols);
+
+        try self.ctx.submitBatch(cmd);
+
+        const dev = self.ctx.device;
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &norm_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_quantize_q8_1.desc_pool, 1, &quant_dset);
+        _ = vk.vkFreeDescriptorSets(dev, gate_pl.desc_pool, 1, &gate_dset);
+        _ = vk.vkFreeDescriptorSets(dev, up_pl.desc_pool, 1, &up_dset);
+
+        try gate_buf.download(std.mem.sliceAsBytes(gate_out));
+        try up_buf.download(std.mem.sliceAsBytes(up_out));
+    }
+
+    // 7j integrated dense FFN — the BIG submit-count saver for Gemma4.
+    // One command-buffer submission does:
+    //   1. rmsnorm(x, ffn_norm)              → xb_vram        (GPU)
+    //   2. quantize_q8_1(xb_vram)             → shared_acts_q8_1
+    //   3. gate matvec (Q8_1)                 → gate_vram
+    //   4. up   matvec (Q8_1)                 → up_vram
+    //   5. gelu_mul: gate_vram = gelu(g) * u  (in-place)
+    //   6. w_down matvec (f32-acts pl_q3_k)   → ffn_vram
+    //   7. rmsnorm(ffn_vram, post_ffw_norm_1) → dense_ffn_out_buf
+    // Then a single download of dense_ffn_out_buf into ffn_out.
+    //
+    // Replaces 2 prior submits (gate+up, then w_down) with 1, and eliminates
+    // 2 PCIe round-trips per layer (gate/up download + gelu_buf upload).
+    //
+    // Requirements:
+    //   - w_gate/w_up have Q8_1 pipelines (caller passes gate_pl/up_pl).
+    //   - w_down has a regular (f32-acts) pipeline (caller passes down_pl).
+    //   - x.len = d_model is a multiple of 256 (rmsnorm), of 32 (quantize),
+    //     and of 256 (Q8_1 matvec for Q3_K/Q4_K weights).
+    //   - d_ffn (gate/up output) need not be 256-aligned — the gelu_mul +
+    //     w_down (f32-acts) dispatches handle any width.
+    pub fn runLayerDenseFfnQ8_1(
+        self: *const GpuWeights,
+        layer: usize,
+        eps: f32,
+        gate_pl: *const MatvecPipeline,    // Q8_1 pipeline for w_gate
+        up_pl:   *const MatvecPipeline,    // Q8_1 pipeline for w_up
+        down_pl: *const MatvecPipeline,    // f32-acts pipeline for w_down
+        x: []const f32,                    // unnormalized residual (d_model)
+        ffn_out: []f32,                    // post_ffw_norm_1 result (d_model)
+    ) !void {
+        const lw     = &self.layers[layer];
+        const w_gate = lw.w_gate orelse return error.NotOnGpu;
+        const w_up   = lw.w_up   orelse return error.NotOnGpu;
+        const w_down = lw.w_down orelse return error.NotOnGpu;
+        const ffn_norm_buf        = &(lw.ffn_norm_buf        orelse return error.NotOnGpu);
+        const post_ffw_norm_1_buf = &(lw.post_ffw_norm_1_buf orelse return error.NotOnGpu);
+        std.debug.assert(w_gate.cols % 256 == 0);
+        std.debug.assert(w_gate.cols == w_up.cols);
+        std.debug.assert(w_gate.cols == x.len);
+        std.debug.assert(w_gate.rows == w_up.rows);
+        std.debug.assert(w_down.cols == w_gate.rows);   // d_ffn
+        std.debug.assert(w_down.rows == x.len);         // d_model
+        std.debug.assert(w_down.rows == ffn_out.len);
+
+        const vec_buf  = &self.shared_vec.?;                            // host-coherent x
+        const xb_buf   = &(self.xb_vram         orelse return error.NotOnGpu);
+        const acts_buf = &self.shared_acts_q8_1.?;
+        const gate_buf = &(self.gate_vram       orelse return error.NotOnGpu);
+        const up_buf   = &(self.up_vram         orelse return error.NotOnGpu);
+        const ffn_buf  = &(self.ffn_vram        orelse return error.NotOnGpu);
+        const out_buf  = &(self.dense_ffn_out_buf orelse return error.NotOnGpu);
+
+        try vec_buf.upload(std.mem.sliceAsBytes(x));
+
+        const cmd = try self.ctx.beginBatch();
+        const norm_dset = try self.pl_rmsnorm.record(
+            cmd, vec_buf, ffn_norm_buf, xb_buf, @intCast(x.len), eps, false);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const quant_dset = try self.pl_quantize_q8_1.record(
+            cmd, xb_buf, acts_buf, w_gate.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const gate_dset = try gate_pl.record(
+            cmd, &w_gate.mat_buf, acts_buf, gate_buf, w_gate.rows, w_gate.cols);
+        const up_dset = try up_pl.record(
+            cmd, &w_up.mat_buf, acts_buf, up_buf, w_up.rows, w_up.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const gelu_dset = try self.pl_gelu_mul.record(
+            cmd, gate_buf, up_buf, w_gate.rows);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        // w_down: rows = d_model, cols = d_ffn (not 256-aligned for d_ffn=2112,
+        // so we deliberately run this on the f32-acts shader, not Q8_1).
+        const down_dset = try down_pl.record(
+            cmd, &w_down.mat_buf, gate_buf, ffn_buf, w_down.rows, w_down.cols);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const norm2_dset = try self.pl_rmsnorm.record(
+            cmd, ffn_buf, post_ffw_norm_1_buf, out_buf, @intCast(w_down.rows), eps, false);
+
+        try self.ctx.submitBatch(cmd);
+
+        const dev = self.ctx.device;
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &norm_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_quantize_q8_1.desc_pool, 1, &quant_dset);
+        _ = vk.vkFreeDescriptorSets(dev, gate_pl.desc_pool, 1, &gate_dset);
+        _ = vk.vkFreeDescriptorSets(dev, up_pl.desc_pool, 1, &up_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_gelu_mul.desc_pool, 1, &gelu_dset);
+        _ = vk.vkFreeDescriptorSets(dev, down_pl.desc_pool, 1, &down_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &norm2_dset);
+
+        try out_buf.download(std.mem.sliceAsBytes(ffn_out));
     }
 
     // Dispatch w_gate and w_up in one command buffer (both read the same FFN-norm xb).

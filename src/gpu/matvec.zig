@@ -1352,6 +1352,76 @@ pub const ElemScalePipeline = struct {
     }
 };
 
+// ── GeluMulPipeline ───────────────────────────────────────────────────────────
+//
+// In-place GELU + elementwise multiply: a[i] = gelu(a[i]) * b[i].
+// Used to fuse the dense-FFN "gelu(gate) * up" step into the GPU command buffer
+// so we don't have to round-trip gate/up through CPU between the gate+up
+// matvecs and the w_down matvec.
+
+pub const GeluMulPipeline = struct {
+    pipeline:    vk.VkPipeline,
+    layout:      vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool:   vk.VkDescriptorPool,
+    device:      vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !GeluMulPipeline {
+        comptime std.debug.assert(shaders.gelu_mul.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.gelu_mul, 2, @sizeOf(ElemPushConst), 32);
+        return .{
+            .pipeline = built.pipeline, .layout = built.layout,
+            .dset_layout = built.dset_layout, .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn record(
+        self: *const GeluMulPipeline,
+        cmd: vk.VkCommandBuffer,
+        a_buf: *const GpuBuffer,
+        b_buf: *const GpuBuffer,
+        n: u32,
+    ) !vk.VkDescriptorSet {
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null, .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [2]vk.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = b_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [2]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+        };
+        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            self.layout, 0, 1, &dset, 0, null);
+        const pc = ElemPushConst{ .n = n };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            0, @sizeOf(ElemPushConst), &pc);
+        const groups = (n + 255) / 256;
+        vk.vkCmdDispatch(cmd, groups, 1, 1);
+        return dset;
+    }
+
+    pub fn deinit(self: *GeluMulPipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
 // ── RopeNeox pipelines ────────────────────────────────────────────────────────
 //
 // Two variants: `Table` reads a precomputed inverse-frequency table (Gemma4
@@ -2792,6 +2862,57 @@ test "gpu rope_neox_table fuzz" {
     std.debug.print("rope_neox_table fuzz n_heads={} hd={} pos={} max|D|={d:.6} rel={e:.3}\n",
         .{ n_heads, head_dim, pos, max_abs, rel });
     try std.testing.expect(rel < 1e-5);
+}
+
+test "gpu gelu_mul fuzz" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    const math_ref = @import("../ops/math.zig");
+    const al = std.testing.allocator;
+    const n: usize = 2112;  // dense FFN dim in Gemma4
+    const a = try al.alloc(f32, n); defer al.free(a);
+    const b = try al.alloc(f32, n); defer al.free(b);
+    const expected = try al.alloc(f32, n); defer al.free(expected);
+    var prng = std.Random.DefaultPrng.init(84);
+    const r = prng.random();
+    for (a, b, expected) |*ai, *bi, *ei| {
+        ai.* = (r.float(f32) - 0.5) * 10.0;
+        bi.* = (r.float(f32) - 0.5) * 10.0;
+        ei.* = math_ref.gelu(ai.*) * bi.*;
+    }
+
+    var pl = try GeluMulPipeline.init(&gpu);
+    defer pl.deinit();
+    var a_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer a_buf.deinit();
+    var b_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32),
+        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer b_buf.deinit();
+    try a_buf.upload(std.mem.sliceAsBytes(a));
+    try b_buf.upload(std.mem.sliceAsBytes(b));
+
+    const cmd = try gpu.beginBatch();
+    _ = try pl.record(cmd, &a_buf, &b_buf, @intCast(n));
+    try gpu.submitBatch(cmd);
+
+    const got = try al.alloc(f32, n); defer al.free(got);
+    try a_buf.download(std.mem.sliceAsBytes(got));
+    // GELU * mul can produce near-zero outputs (gelu(x) ≈ 0 for x ∈ [-2, 0]),
+    // so a strict relative check is dominated by floor noise.  Use absolute
+    // tolerance, which is f32 precision (~7 decimal digits) on bounded inputs.
+    var max_abs: f32 = 0;
+    for (got, expected) |g, e| {
+        const d = @abs(g - e);
+        if (d > max_abs) max_abs = d;
+    }
+    std.debug.print("gelu_mul fuzz n={} max|D|={d:.6}\n", .{ n, max_abs });
+    try std.testing.expect(max_abs < 1e-4);
 }
 
 test "gpu elem_scale fuzz" {
