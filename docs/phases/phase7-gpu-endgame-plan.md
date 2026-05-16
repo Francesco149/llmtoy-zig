@@ -293,13 +293,15 @@ nix develop --command ./zig-out/bin/llmtoy bench-matvec <model.gguf> \
   --iters 256 --target L0.attn_q
 ```
 
-Current targets are `lm_head`, `lm_head.fast`, `L0.attn_q`, `L0.attn_q.r4`,
-`L0.attn_v`, `L0.attn_v.r4`, `L3.attn_v`, `L5.attn_q`, `L0.dense_down`,
+Current targets are `lm_head`, `lm_head.fast`, `lm_head.mmvq.b32.r1`,
+`lm_head.mmvq.b64.r1`, `L0.attn_q`, `L0.attn_q.r4`, `L0.attn_v`,
+`L0.attn_v.r4`, `L3.attn_v`, `L5.attn_q`, `L0.dense_down`,
 `L5.dense_down`, `L0.expert_down`, and `L10.expert_down`. They cover Q3_K,
 Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, and IQ4_NL with the target model's actual
 row/column sizes. The `.r4` targets are experimental Q4_K row-batching probes,
-and `lm_head.fast` is an experimental Q6_K packed-decode probe; neither is a
-production route.
+`lm_head.fast` is an experimental Q6_K packed-decode probe, and the
+`lm_head.mmvq.*` targets are early Q6_K MMVQ ports; none is a production route
+until it beats the current path.
 
 End-to-end tok/s is too noisy for shader iteration. Add a command or test-only
 binary that runs one GPU kernel shape thousands of times with fixed buffers.
@@ -384,6 +386,29 @@ First Q6_K packed-decode probe:
   port llama.cpp's `mul_mat_vecq.comp`/`mul_mat_vec_q6_k.comp` loop structure
   more directly, including `K_PER_ITER`, `BLOCK_SIZE`, and specialization
   variants.
+
+First Q6_K MMVQ port slice:
+
+- Host-side `MatvecPipeline` now supports Vulkan specialization constants.
+- `matvec_q6_k_q8_1_mmvq.glsl` uses `local_size_x_id = 0`, `BLOCK_SIZE`,
+  `NUM_ROWS`, and `NUM_COLS` specialization constants. The first variants are
+  `lm_head.mmvq.b32.r1` and `lm_head.mmvq.b64.r1`.
+- The shader uses the first llama-shaped loop: `K_PER_ITER=16`, per-invocation
+  `temp[NUM_ROWS]`, and shared-memory reduction across `BLOCK_SIZE`. It still
+  uses llmtoy's byte-backed Q6_K layout rather than a repacked
+  `data_a_packed16` view.
+- Correctness:
+  - b32/r1 small `rel=7.312e-8`, lm-head-shaped `rel=2.140e-7`
+  - b64/r1 small `rel=1.314e-7`, lm-head-shaped `rel=1.557e-7`
+- Bench result with GPU timestamps:
+  - current `lm_head`: about 1034 us GPU
+  - `lm_head.fast`: about 994 us GPU
+  - `lm_head.mmvq.b32.r1`: about 1156 us GPU
+  - `lm_head.mmvq.b64.r1`: about 1133 us GPU
+- Conclusion: the scaffolding is correct, but this first direct shape is slower
+  because it has not yet ported llama.cpp's packed16 views, scale cache, and
+  exact Q6_K per-thread offsets. Next work should close that gap before trying
+  `NUM_ROWS > 1`.
 
 ---
 

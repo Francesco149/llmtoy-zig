@@ -483,6 +483,39 @@ routing into generation as-is. It remains useful as a correctness-checked
 comparison target while the real Q6_K MMVQ port moves toward llama.cpp's
 `K_PER_ITER`/`NUM_ROWS` framework rather than another local decode tweak.
 
+### Q6_K MMVQ scaffold
+
+Started the real MMVQ refactor:
+
+- `MatvecPipeline` can now create compute pipelines with Vulkan specialization
+  constants.
+- Added `matvec_q6_k_q8_1_mmvq.glsl`, a standalone first Q6_K MMVQ-style
+  shader with `local_size_x_id=0`, `BLOCK_SIZE`, `NUM_ROWS`, `NUM_COLS`,
+  `K_PER_ITER=16`, and shared-memory reduction.
+- Added bench targets `lm_head.mmvq.b32.r1` and `lm_head.mmvq.b64.r1`.
+
+Correctness:
+
+| Variant | small rel | lm-head-shaped rel |
+|---------|-----------|--------------------|
+| b32/r1 | `7.312e-8` | `2.140e-7` |
+| b64/r1 | `1.314e-7` | `1.557e-7` |
+
+Bench snapshot:
+
+| Target | GPU us, profiler | wall us, no profiler |
+|--------|------------------|----------------------|
+| `lm_head` | 1033.89 | 3184.65 |
+| `lm_head.fast` | 994.01 | 3172.00 |
+| `lm_head.mmvq.b32.r1` | 1156.13 | 3164.37 |
+| `lm_head.mmvq.b64.r1` | 1132.67 | 2256.79 |
+
+The wall numbers are noisy, but GPU timestamps are consistent enough: the first
+MMVQ-shaped shader is correct but slower than the current Q6_K kernel. The next
+step is not `NUM_ROWS > 1`; it is closing the structural gap with llama.cpp's
+Q6_K port by adding packed16-style views / repacking, the `sccache` scale cache,
+and the exact `itid`/`ix` offset schedule from `mul_mat_vec_q6_k.comp`.
+
 The submit-count reductions buy ~150–300 µs/token in saved overhead. On
 RX 7800 XT with our shaders the absolute per-submit cost (~150 µs) is
 small relative to the 220 ms of GPU matmul work per token, so each saved
