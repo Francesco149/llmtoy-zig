@@ -271,6 +271,41 @@ All 30 layer argmaxes still match CPU; final lm_head argmax still
 matches CPU on the "explain MoE" prompt. Per-layer rel\_err is comparable
 to baseline (layer 28 worst case 4.83% vs baseline 5.59%).
 
+## Phase 7l.1 — KV cache in VRAM + GPU per-head norms + GPU RoPE
+
+Moves the entire attention front-end into the existing Q8_1 attention submit:
+per-head Q/K rmsnorm + V rmsnormRaw + RoPE on Q,K + vkCmdCopyBuffer K/V into
+per-layer device-local `k_vram[l]/v_vram[l]` cache. Per-token CPU work drops
+by 30 layers × (n_heads + 2·n_kv) per-head rmsnorm + rope loops.
+
+Path used: `runLayerAttnQ8_1KvVram` for the 24 SWA layers (which have `wv`);
+the 6 global layers (which share V from K) fall through to `runLayerAttnQ8_1`
++ CPU per-head norms/rope.
+
+Hyperfine 3-run wall-clock for `generate "explain Mixture of Experts in 64
+words" --chat --temperature 0 --max-tokens 64 --gpu` (includes ~5.7 s model
+setup):
+
+| Build                                        | mean ± σ          |
+|----------------------------------------------|-------------------|
+| `b234300` 7l.1 KV-VRAM + GPU norms + RoPE    | 28.121 ± 0.126 s  |
+| 7j baseline (3 submits/layer)                | 28.445 ± 0.178 s  |
+
+That's −1.1% wall-clock — within 1σ of each other. As predicted by the
+plan, 7l.1 alone is mostly a structural change: the CPU savings (~5 µs/layer
+of per-head norm + rope work) are roughly cancelled by the additional GPU
+dispatches per submit (5 extra: Q-norm, K-norm, V-norm, RoPE-Q, RoPE-K).
+The VRAM-resident K/V cache is dead storage until 7l.2 (GPU Q·K^T+softmax)
+and 7l.3 (GPU attn·V) wire it into the attention compute.
+
+Verified via `llmtoy compare`: per-layer rel_err identical to 7k* baseline
+(layer 28 worst-case 4.83%), all 30 argmaxes match CPU, final argmax matches
+(1852 = 1852). End-to-end generate produces identical output to the
+`runLayerAttnQ8_1` path at T=0.
+
+VRAM cost: +560 MiB for the KV cache (30 layers × 2 × cap × nkv × 4 bytes,
+with cap=512 for SWA and cap=4096 for global).
+
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
 Attempted fusing gate-gelu-up + w_down into a single submit (4 submits/layer):

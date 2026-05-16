@@ -306,10 +306,38 @@ these are exact rather than quantized).
 Same scope as the original plan, but now the matvecs and norms it needs
 already exist (from 7k\* and 7j). What's left:
 
-### 7l.1  KV cache in VRAM [SONNET]
-Allocate device-local `k_cache[layer][max_seq × n_kv_heads × d_head]` and
-`v_cache[…]` per layer. After `wk`/`wv` matvec, append to the cache via a
-small `kv_append` shader (or `vkCmdCopyBuffer` if alignment permits).
+### 7l.1  KV cache in VRAM [OPUS, DONE]
+
+Three sub-commits:
+
+- **7l.1a** (`7255747`) — allocate device-local `k_vram[l]/v_vram[l]` per
+  layer in `GpuWeights`, sized to match the existing `Gemma4KvCache`. Lazy
+  init via `initKvVram(cfg, max_seq)`. Total ~560 MiB on Gemma4 26B A4B at
+  `max_seq=4096`. Plus `GpuContext.copyBufferRegion` for offset-aware
+  one-shot transfers, and slot upload/download helpers.
+
+- **7l.1b** (`c317c42`) — `rmsnorm_perhead.glsl` + `RmsnormPerHeadPipeline`.
+  One workgroup per head, 256 threads cooperate over `head_dim` via
+  subgroup reduction. Handles Q-norm (1+w, with weight), K-norm
+  (1+w, with weight), and V's rmsnormRaw (no weight at all) via push
+  constants. Three fuzz tests, all rel < 1e-6.
+
+- **7l.1c** (`b234300`) — `runLayerAttnQ8_1KvVram` extends the existing
+  Q8_1 attention submit with: per-head Q/K rmsnorm + V rmsnormRaw + RoPE
+  on Q,K + `vkCmdCopyBuffer` K/V into the per-layer cache, all in one
+  command-buffer submit. `forward.zig` skips the CPU per-head norm + RoPE
+  + `@memcpy` for the 24 SWA layers (which have `wv`); the 6 global layers
+  (which share V from K) fall back to `runLayerAttnQ8_1` + the CPU chain.
+
+**Verified**: per-layer rel_err identical to 7k\* baseline (layer 28
+worst-case 4.83%), all 30 argmaxes match CPU, final argmax matches.
+
+**Measured wall-clock** (3-run hyperfine, 64-token generate including
+~5.7 s model setup): **28.121 ± 0.126 s** vs 28.445 ± 0.178 s baseline,
+**−1.1% (within σ)**. As expected, 7l.1 alone is structural — the CPU
+norm/rope savings are roughly cancelled by extra GPU dispatches in the
+same submit. The VRAM-resident K/V cache is dead storage until 7l.2/3
+wire it into the actual attention compute.
 
 ### 7l.2  Q·K^T + softmax shader [OPUS]
 One workgroup per attention head. Each thread computes one column of `qk`,
@@ -368,7 +396,8 @@ tuning:
 | 7i    | Opus        | PARTIAL     | 0% (two bugs fixed, drift deferred)      |
 | 7k\*  | Opus+Sonnet | **DONE**    | **+38% prefill, +33% decode** (3.10 → 4.28 / 3.07 → 4.07 tok/s) — plus the drift collapsed (all argmaxes match CPU after enough Q8_1 coverage) |
 | 7j    | Sonnet+Opus | **DONE**    | 5 → 3 submits/layer; +0.5% wall-clock (submit overhead was much smaller than estimated) |
-| 7l    | Sonnet+Opus | after 7j    | +30–50% (attention to GPU)               |
+| 7l.1  | Opus        | **DONE**    | KV cache in VRAM + GPU per-head norms + GPU RoPE; −1.1% wall-clock (within σ — structural, sets up 7l.2/3) |
+| 7l.2+ | Sonnet+Opus | next        | +30–50% (Q·K^T+softmax, attn·V, SWA mask) |
 | 7m    | Sonnet      | after 7l    | +5%                                      |
 | 7n    | Sonnet      | after 7m    | +5–10%                                   |
 | 7o    | Opus        | last        | +5–10%                                   |
