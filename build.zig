@@ -41,6 +41,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(matvec_q5_1_q8_1_spv, "matvec_q5_1_q8_1.spv");
     const rmsnorm_spv = compileShader(b, "src/gpu/shaders/rmsnorm.glsl");
     _ = wf.addCopyFile(rmsnorm_spv, "rmsnorm.spv");
+    const rmsnorm_perhead_spv = compileShader(b, "src/gpu/shaders/rmsnorm_perhead.glsl");
+    _ = wf.addCopyFile(rmsnorm_perhead_spv, "rmsnorm_perhead.spv");
     const elem_add_spv = compileShader(b, "src/gpu/shaders/elem_add.glsl");
     _ = wf.addCopyFile(elem_add_spv, "elem_add.spv");
     const elem_scale_spv = compileShader(b, "src/gpu/shaders/elem_scale.glsl");
@@ -70,6 +72,7 @@ pub fn build(b: *std.Build) void {
         \\pub const matvec_q5_0_q8_1    align(4) = @embedFile("matvec_q5_0_q8_1.spv").*;
         \\pub const matvec_q5_1_q8_1    align(4) = @embedFile("matvec_q5_1_q8_1.spv").*;
         \\pub const rmsnorm             align(4) = @embedFile("rmsnorm.spv").*;
+        \\pub const rmsnorm_perhead     align(4) = @embedFile("rmsnorm_perhead.spv").*;
         \\pub const elem_add            align(4) = @embedFile("elem_add.spv").*;
         \\pub const elem_scale          align(4) = @embedFile("elem_scale.spv").*;
         \\pub const gelu_mul            align(4) = @embedFile("gelu_mul.spv").*;

@@ -23,7 +23,8 @@ const MatvecSession       = mv_mod.MatvecSession;
 const FusedGateUpPipeline = mv_mod.FusedGateUpPipeline;
 const AccumPipeline       = mv_mod.AccumPipeline;
 const QuantizeQ8_1Pipeline = mv_mod.QuantizeQ8_1Pipeline;
-const RmsnormPipeline     = mv_mod.RmsnormPipeline;
+const RmsnormPipeline       = mv_mod.RmsnormPipeline;
+const RmsnormPerHeadPipeline = mv_mod.RmsnormPerHeadPipeline;
 const ElemAddPipeline     = mv_mod.ElemAddPipeline;
 const ElemScalePipeline   = mv_mod.ElemScalePipeline;
 const GeluMulPipeline     = mv_mod.GeluMulPipeline;
@@ -95,6 +96,7 @@ pub const GpuWeights = struct {
     pl_accum:    AccumPipeline,
     // 7j primitives — per-token f32 ops on VRAM residual stream.
     pl_rmsnorm:      RmsnormPipeline,
+    pl_rmsnorm_perhead: RmsnormPerHeadPipeline,
     pl_elem_add:     ElemAddPipeline,
     pl_elem_scale:   ElemScalePipeline,
     pl_gelu_mul:     GeluMulPipeline,
@@ -249,6 +251,8 @@ pub const GpuWeights = struct {
         std.debug.print("  init: pl_accum ok\n", .{});
         var pl_rmsnorm = try RmsnormPipeline.init(&ctx);
         errdefer pl_rmsnorm.deinit();
+        var pl_rmsnorm_perhead = try RmsnormPerHeadPipeline.init(&ctx);
+        errdefer pl_rmsnorm_perhead.deinit();
         var pl_elem_add = try ElemAddPipeline.init(&ctx);
         errdefer pl_elem_add.deinit();
         var pl_elem_scale = try ElemScalePipeline.init(&ctx);
@@ -284,7 +288,8 @@ pub const GpuWeights = struct {
             .pl_q5_1 = pl_q5_1, .pl_q5_0 = pl_q5_0,
             .pl_fused_gu = pl_fused_gu, .pl_fused_gu_q8_1 = pl_fused_gu_q8_1,
             .pl_accum = pl_accum,
-            .pl_rmsnorm = pl_rmsnorm, .pl_elem_add = pl_elem_add,
+            .pl_rmsnorm = pl_rmsnorm, .pl_rmsnorm_perhead = pl_rmsnorm_perhead,
+            .pl_elem_add = pl_elem_add,
             .pl_elem_scale = pl_elem_scale, .pl_gelu_mul = pl_gelu_mul,
             .pl_rope_table = pl_rope_table, .pl_rope_theta = pl_rope_theta,
             .layers = layers, .lm_head = null,
@@ -662,6 +667,7 @@ pub const GpuWeights = struct {
         self.pl_gelu_mul.deinit();
         self.pl_elem_scale.deinit();
         self.pl_elem_add.deinit();
+        self.pl_rmsnorm_perhead.deinit();
         self.pl_rmsnorm.deinit();
         self.pl_quantize_q8_1.deinit();
         self.pl_q5_1_q8_1.deinit();
