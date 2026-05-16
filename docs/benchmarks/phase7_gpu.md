@@ -425,6 +425,36 @@ itself. The real MMVQ port needs the rest of llama.cpp's structure: subgroup
 size control, tuned `NUM_ROWS`, shared helper layout, and format-specific
 unpack scheduling. Keep the R4 path as a microbench comparison target only.
 
+### Timestamp split and descriptor-reuse probe
+
+Extended `bench-matvec` so `LLMTOY_GPU_PROFILE=1` reports GPU timestamp time
+beside wall-clock time. Added `--reuse-descriptor` to allocate/update one
+stable descriptor set before the timed loop, then bind it repeatedly.
+
+Measured with 128 iterations for Q4_K and 32 for `lm_head`:
+
+| Target | Mode | wall us | GPU us | residual CPU us |
+|--------|------|---------|--------|-----------------|
+| `L0.attn_q` | current | 69.86 | 14.75 | 55.11 |
+| `L0.attn_q` | reuse descriptor | 64.94 | 12.37 | 52.57 |
+| `L0.attn_v` | current | 70.72 | 8.29 | 62.43 |
+| `L0.attn_v` | reuse descriptor | 70.41 | 7.65 | 62.77 |
+| `lm_head` | current | 1508.35 | 1445.79 | 62.57 |
+| `lm_head` | reuse descriptor | 1521.29 | 1459.57 | 61.72 |
+
+Interpretation:
+
+- Large matvecs are GPU-kernel dominated. `lm_head` still needs better Q6_K
+  kernel shape/MMVQ work.
+- Small decode matvecs are mostly CPU/submit overhead in this one-dispatch
+  microbench. Descriptor reuse alone does not materially reduce it, so the
+  remaining overhead is likely command buffer allocation/free, queue submit,
+  and `vkQueueWaitIdle`.
+- Production work should avoid a broad descriptor-only refactor. The next
+  plumbing experiment should reuse command buffers/fences or batch more fixed
+  per-layer dispatches, while the shader track continues with a faithful MMVQ
+  port for large tensors.
+
 The submit-count reductions buy ~150–300 µs/token in saved overhead. On
 RX 7800 XT with our shaders the absolute per-submit cost (~150 µs) is
 small relative to the 220 ms of GPU matmul work per token, so each saved

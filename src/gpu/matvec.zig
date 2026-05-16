@@ -225,8 +225,13 @@ pub const MatvecPipeline = struct {
         rows: u32,
         cols: u32,
     ) !vk.VkDescriptorSet {
-        const dev = self.device;
+        const dset = try self.allocDescriptorSet();
+        self.updateDescriptorSet(dset, mat_buf, vec_buf, out_buf);
+        self.recordDescriptor(cmd, dset, rows, cols);
+        return dset;
+    }
 
+    pub fn allocDescriptorSet(self: *const MatvecPipeline) !vk.VkDescriptorSet {
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .pNext = null,
@@ -235,9 +240,18 @@ pub const MatvecPipeline = struct {
             .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
-        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
+        return dset;
+    }
 
+    pub fn updateDescriptorSet(
+        self: *const MatvecPipeline,
+        dset: vk.VkDescriptorSet,
+        mat_buf: *const GpuBuffer,
+        vec_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+    ) void {
         const buf_infos = [3]vk.VkDescriptorBufferInfo{
             .{ .buffer = mat_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
             .{ .buffer = vec_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -248,8 +262,16 @@ pub const MatvecPipeline = struct {
             mkWrite(dset, 1, &buf_infos[1]),
             mkWrite(dset, 2, &buf_infos[2]),
         };
-        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+        vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+    }
 
+    pub fn recordDescriptor(
+        self: *const MatvecPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        rows: u32,
+        cols: u32,
+    ) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
             self.layout, 0, 1, &dset, 0, null);
@@ -260,8 +282,10 @@ pub const MatvecPipeline = struct {
 
         const groups = (rows + self.rows_per_workgroup - 1) / self.rows_per_workgroup;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
+    }
 
-        return dset;
+    pub fn freeDescriptorSet(self: *const MatvecPipeline, dset: *vk.VkDescriptorSet) void {
+        _ = vk.vkFreeDescriptorSets(self.device, self.desc_pool, 1, dset);
     }
 
     // Like record(), but the output sub-range is specified by byte offset+size into

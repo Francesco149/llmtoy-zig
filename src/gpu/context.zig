@@ -21,6 +21,13 @@ const ProfileAggregate = struct {
     max_ns: u64 = 0,
 };
 
+pub const ProfileStats = struct {
+    count: u64 = 0,
+    total_ns: u64 = 0,
+    min_ns: u64 = 0,
+    max_ns: u64 = 0,
+};
+
 pub const GpuProfiler = struct {
     query_pool: vk.VkQueryPool,
     timestamp_period: f32,
@@ -155,6 +162,22 @@ pub const GpuProfiler = struct {
         agg.total_ns = ns;
         agg.min_ns = ns;
         agg.max_ns = ns;
+    }
+
+    pub fn statsFor(self: *const GpuProfiler, label: []const u8) ProfileStats {
+        for (self.aggregates[0..self.aggregate_count]) |agg| {
+            if (agg.label_len == label.len and
+                std.mem.eql(u8, agg.label[0..agg.label_len], label))
+            {
+                return .{
+                    .count = agg.count,
+                    .total_ns = agg.total_ns,
+                    .min_ns = agg.min_ns,
+                    .max_ns = agg.max_ns,
+                };
+            }
+        }
+        return .{};
     }
 
     pub fn print(self: *const GpuProfiler) void {
@@ -413,6 +436,11 @@ pub const GpuContext = struct {
 
     pub fn profileEnd(self: *const GpuContext, cmd: vk.VkCommandBuffer, event_id: u32) void {
         if (self.profiler) |p| p.end(cmd, event_id);
+    }
+
+    pub fn profileStats(self: *const GpuContext, label: []const u8) ProfileStats {
+        if (self.profiler) |p| return p.statsFor(label);
+        return .{};
     }
 
     pub fn recordCopy(cmd: vk.VkCommandBuffer, src: vk.VkBuffer, dst: vk.VkBuffer, size: vk.VkDeviceSize) void {

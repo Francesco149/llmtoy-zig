@@ -70,6 +70,18 @@ then includes the current descriptor, command-buffer, submit, wait, and cleanup
 overhead in each measured iteration. Use it to choose between matvec kernels;
 use full `generate --gpu` only after the microbench shows a real win.
 
+With `LLMTOY_GPU_PROFILE=1`, the table also prints per-dispatch GPU timestamp
+time and the remaining CPU/submit overhead:
+
+```sh
+nix develop --command env LLMTOY_GPU_PROFILE=1 ./zig-out/bin/llmtoy bench-matvec "$MODEL" \
+  --iters 128 --target L0.attn_q
+```
+
+Use `--reuse-descriptor` to measure the ceiling from reusing a descriptor set
+for one stable matvec binding. This is a bench probe; production routing still
+uses the normal path unless explicitly changed.
+
 ## Sampling Profile
 
 ```sh

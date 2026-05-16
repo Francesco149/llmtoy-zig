@@ -70,14 +70,19 @@ pub fn main(init: std.process.Init) !void {
         try cmdTokenize(out, args[2], args[3], io, gpa);
     } else if (std.mem.eql(u8, args[1], "bench-matvec")) {
         if (args.len < 3) {
-            std.debug.print("usage: llmtoy bench-matvec <model.gguf> [--iters N] [--target NAME]\n", .{});
+            std.debug.print("usage: llmtoy bench-matvec <model.gguf> [--iters N] [--target NAME] [--reuse-descriptor]\n", .{});
             return error.MissingArg;
         }
         var opts = MatvecBenchOptions{};
         var i: usize = 3;
         while (i < args.len) {
-            if (i + 1 >= args.len) break;
             const flag = args[i];
+            if (std.mem.eql(u8, flag, "--reuse-descriptor")) {
+                opts.reuse_descriptor = true;
+                i += 1;
+                continue;
+            }
+            if (i + 1 >= args.len) break;
             const val = args[i + 1];
             if (std.mem.eql(u8, flag, "--iters")) opts.iters = try std.fmt.parseInt(u32, val, 10);
             if (std.mem.eql(u8, flag, "--target")) opts.target = val;
@@ -188,7 +193,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\  llmtoy gpu-info                        list Vulkan device and run a matvec smoke test
         \\  llmtoy info <model.gguf>               print model metadata and tensor summary
         \\  llmtoy tokenize <model.gguf> <text>    BPE-encode text, print IDs and decoded tokens
-        \\  llmtoy bench-matvec <model.gguf> [--iters N] [--target NAME]
+        \\  llmtoy bench-matvec <model.gguf> [--iters N] [--target NAME] [--reuse-descriptor]
         \\  llmtoy generate <model.gguf> <prompt> [--chat] [--gpu] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N] [--stop-token TOKEN] [--gpu-layers L0:L1]
         \\  llmtoy compare  <model.gguf> <prompt> [--chat] [--threads N] [--gpu-layers L0:L1]
         \\
@@ -332,6 +337,7 @@ fn isGpuQuantSupported(t: @import("gguf/types.zig").GgmlType) bool {
 const MatvecBenchOptions = struct {
     iters: u32 = 64,
     target: ?[]const u8 = null,
+    reuse_descriptor: bool = false,
 };
 
 const BenchPipelines = struct {
@@ -419,11 +425,11 @@ fn cmdBenchMatvec(
     var pipes = try BenchPipelines.init(&ctx);
     defer pipes.deinit();
 
-    try out.print("GPU matvec microbench: iters={} target={s}\n", .{
-        opts.iters, opts.target orelse "all",
+    try out.print("GPU matvec microbench: iters={} target={s} reuse_descriptor={}\n", .{
+        opts.iters, opts.target orelse "all", opts.reuse_descriptor,
     });
-    try out.print("{s:32} {s:7} {s:>9} {s:>9} {s:>10} {s:>10}\n", .{
-        "name", "type", "rows", "cols", "avg_us", "GB/s",
+    try out.print("{s:32} {s:7} {s:>9} {s:>9} {s:>10} {s:>10} {s:>10} {s:>10}\n", .{
+        "name", "type", "rows", "cols", "wall_us", "gpu_us", "cpu_us", "GB/s",
     });
 
     var ran: usize = 0;
@@ -456,7 +462,7 @@ fn benchIfSelected(
     io: std.Io,
 ) !void {
     if (opts.target) |t| if (!std.mem.eql(u8, t, name) and !std.mem.eql(u8, t, "all")) return;
-    try benchOneMatvec(out, ctx, pipes, name, mat, opts.iters, gpa, io);
+    try benchOneMatvec(out, ctx, pipes, name, mat, opts.iters, opts.reuse_descriptor, gpa, io);
     ran.* += 1;
 }
 
@@ -474,7 +480,7 @@ fn benchWithPipelineIfSelected(
 ) !void {
     if (mat.type_ != .q4_k) return;
     if (opts.target) |t| if (!std.mem.eql(u8, t, name) and !std.mem.eql(u8, t, "all")) return;
-    try benchOneMatvecWithPipeline(out, ctx, pipeline, quant, name, mat, opts.iters, gpa, io);
+    try benchOneMatvecWithPipeline(out, ctx, pipeline, quant, name, mat, opts.iters, opts.reuse_descriptor, gpa, io);
     ran.* += 1;
 }
 
@@ -501,7 +507,7 @@ fn benchExpertDownIfSelected(
         .rows = rows,
         .cols = cols,
     };
-    try benchOneMatvec(out, ctx, pipes, name, mat, opts.iters, gpa, io);
+    try benchOneMatvec(out, ctx, pipes, name, mat, opts.iters, opts.reuse_descriptor, gpa, io);
     ran.* += 1;
 }
 
@@ -512,6 +518,7 @@ fn benchOneMatvec(
     name: []const u8,
     mat: g4_weights.RawMatrix,
     iters: u32,
+    reuse_descriptor: bool,
     gpa: std.mem.Allocator,
     io: std.Io,
 ) !void {
@@ -519,7 +526,7 @@ fn benchOneMatvec(
         try out.print("{s:32} {s:7} unsupported\n", .{ name, mat.type_.label() });
         return;
     };
-    try benchOneMatvecWithPipeline(out, ctx, pl, &pipes.quant, name, mat, iters, gpa, io);
+    try benchOneMatvecWithPipeline(out, ctx, pl, &pipes.quant, name, mat, iters, reuse_descriptor, gpa, io);
 }
 
 fn benchOneMatvecWithPipeline(
@@ -530,6 +537,7 @@ fn benchOneMatvecWithPipeline(
     name: []const u8,
     mat: g4_weights.RawMatrix,
     iters: u32,
+    reuse_descriptor: bool,
     gpa: std.mem.Allocator,
     io: std.Io,
 ) !void {
@@ -578,22 +586,45 @@ fn benchOneMatvecWithPipeline(
     }
 
     const clk = std.Io.Clock.real;
+    const profile_before = ctx.profileStats(name);
     const t0 = clk.now(io);
+    var persistent_dset: ?vk.VkDescriptorSet = null;
+    defer if (persistent_dset) |*ds| pl.freeDescriptorSet(ds);
+    if (iters > 0 and reuse_descriptor) {
+        const ds = try pl.allocDescriptorSet();
+        pl.updateDescriptorSet(ds, &session.mat_buf, &acts_buf, &out_buf);
+        persistent_dset = ds;
+    }
     for (0..iters) |_| {
         const cmd = try ctx.beginBatch();
-        const ds = try pl.record(cmd, &session.mat_buf, &acts_buf, &out_buf,
+        const p_mv = ctx.profileBegin(cmd, name);
+        const ds = if (persistent_dset) |dset| blk: {
+            pl.recordDescriptor(cmd, dset, @intCast(mat.rows), @intCast(mat.cols));
+            break :blk dset;
+        } else try pl.record(cmd, &session.mat_buf, &acts_buf, &out_buf,
             @intCast(mat.rows), @intCast(mat.cols));
+        ctx.profileEnd(cmd, p_mv);
         try ctx.submitBatch(cmd);
-        var ds_mut = ds;
-        _ = vk.vkFreeDescriptorSets(ctx.device, pl.desc_pool, 1, &ds_mut);
+        if (persistent_dset == null) {
+            var ds_mut = ds;
+            pl.freeDescriptorSet(&ds_mut);
+        }
     }
     const t1 = clk.now(io);
+    const profile_after = ctx.profileStats(name);
     const ns = t0.durationTo(t1).nanoseconds;
     const avg_us = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(iters)) / 1000.0;
+    const gpu_count_delta = profile_after.count - profile_before.count;
+    const gpu_ns_delta = profile_after.total_ns - profile_before.total_ns;
+    const gpu_us = if (gpu_count_delta == 0)
+        0.0
+    else
+        @as(f64, @floatFromInt(gpu_ns_delta)) / @as(f64, @floatFromInt(gpu_count_delta)) / 1000.0;
+    const cpu_us = if (gpu_count_delta == 0) 0.0 else @max(0.0, avg_us - gpu_us);
     const total_bytes = @as(f64, @floatFromInt(mat.data.len)) * @as(f64, @floatFromInt(iters));
     const gbps = total_bytes / (@as(f64, @floatFromInt(ns)) / 1_000_000_000.0) / 1_000_000_000.0;
-    try out.print("{s:32} {s:7} {d:9} {d:9} {d:10.2} {d:10.2}\n", .{
-        name, mat.type_.label(), mat.rows, mat.cols, avg_us, gbps,
+    try out.print("{s:32} {s:7} {d:9} {d:9} {d:10.2} {d:10.2} {d:10.2} {d:10.2}\n", .{
+        name, mat.type_.label(), mat.rows, mat.cols, avg_us, gpu_us, cpu_us, gbps,
     });
 }
 

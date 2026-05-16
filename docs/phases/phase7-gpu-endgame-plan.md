@@ -323,8 +323,15 @@ The harness should report:
 The first landed version reports wall-clock average per current matvec call and
 effective weight bandwidth. This intentionally includes the current
 descriptor/update/submit/wait path because that is what decode pays today.
-Next increments should split GPU timestamp elapsed from CPU dispatch overhead
-and add integer-dot throughput where the quant format makes the count useful.
+With `LLMTOY_GPU_PROFILE=1`, it now also reports GPU timestamp elapsed and the
+residual CPU/submit overhead. Next increments should add integer-dot throughput
+where the quant format makes the count useful.
+
+Use `--reuse-descriptor` to test a persistent descriptor-set ceiling for one
+stable binding. Current measurements show descriptor reuse alone does not
+materially reduce the 50-60 us residual CPU overhead on small matvecs, so broad
+production descriptor churn is lower priority than command-buffer/fence reuse
+and submit batching.
 
 This harness is where shader variants compete. Do not use full generation to
 decide between two matvec kernels unless the microbench result is inconclusive.
