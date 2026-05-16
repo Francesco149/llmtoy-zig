@@ -259,6 +259,40 @@ history of Rome." --chat --temperature 0 --max-tokens 64 --gpu` (includes
 | Fused dense FFN (4 submits/layer)             | 28.394 ± 0.191 s  |
 | Full fused attn-residual + dense FFN (3 sub.) | 28.445 ± 0.178 s  |
 
+## Phase 7m/Q6_K — Timestamp profiling exposes lm_head fallback
+
+Prompt: `"explain Mixture of Experts in one sentence"` with `--chat
+--temperature 0 --max-tokens 8 --threads 12 --gpu`.
+
+Before Q6_K GPU support, `LLMTOY_GPU_PROFILE=1` showed only about 307 ms of
+timestamped GPU dispatches across 28 forwarded tokens while wall-clock compute
+was about 6.2 s. CPU `perf` showed the missing time: roughly 67% of samples in
+`quant.dequant.dequantQ6K`. That made the first blocker a CPU fallback, not
+one of the already-profiled Q3/Q4/Q5 GPU shaders.
+
+After adding `matvec_q6_k_q8_1.glsl` and routing Q6_K through the Q8_1 path:
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Prefill | ~4.50 tok/s | 10.14 tok/s |
+| Decode | ~4.52 tok/s | 10.16 tok/s |
+| GPU upload/setup | ~5.8-6.2 s | ~6.0-6.3 s |
+
+Hot timestamp rows after the fix:
+
+| Label | Count | Total ms | Avg us | Share |
+|-------|------:|---------:|-------:|------:|
+| `dense_ffn.down` | 840 | 86.402 | 102.86 | 26.3% |
+| `matvec_q8_1.single.262144x2816` | 28 | 47.367 | 1691.69 | 14.4% |
+| `moe.fused_gate_up` | 4480 | 29.621 | 6.61 | 9.0% |
+| `attention.qk_softmax` | 644 | 25.136 | 39.03 | 7.7% |
+| `moe.down` | 4480 | 16.724 | 3.73 | 5.1% |
+
+CPU `perf` after the fix no longer shows Q6_K. The remaining CPU-side samples
+are mostly `ops.math.dequantRow` with Q3_K/Q5_K frames and
+`quant.dequant.dotIQ4NL`, which should be mapped to exact tensors before adding
+more shader formats.
+
 The submit-count reductions buy ~150–300 µs/token in saved overhead. On
 RX 7800 XT with our shaders the absolute per-submit cost (~150 µs) is
 small relative to the 220 ms of GPU matmul work per token, so each saved

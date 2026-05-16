@@ -9,26 +9,24 @@ Model: gemma-4-26B-A4B-APEX-I-Mini.gguf
 Run:   32 generated tokens, 12 threads, temperature 0.1, top-k 40, top-p 0.9
 ```
 
-The rule for this phase is simple: make one meaningful change at a time, run the
-Gemma4 llama.cpp comparison, and write down what changed. A faster number is not
-enough; the goal is to understand why the change helped or why it did not.
+The rule for this phase was simple: make one meaningful change at a time, run a
+Gemma4 reference comparison, and write down what changed. A faster number was not
+enough; the goal was to understand why the change helped or why it did not.
 
 ## Baseline
 
-Command:
+Historical command note: these numbers were originally captured with the old
+`scripts/regression_compare.py` helper, which has since been removed. Recreate
+future CPU comparisons with direct `llmtoy generate` and explicit llama.cpp
+commands instead of reviving that fixture.
+
+Original command shape:
 
 ```sh
-nix develop --command python3 scripts/regression_compare.py \
-  --model /opt/ai-lab/models/mudler/gemma-4-26B-A4B-it-APEX-GGUF/gemma-4-26B-A4B-APEX-I-Mini.gguf \
-  --prompt "Briefly explain the full forward pass of a MoE model" \
-  --chat \
-  --max-tokens 32 \
-  --threads 12 \
-  --temperature 0.1 \
-  --top-k 40 \
-  --top-p 0.9 \
-  --expect-substring MoE \
-  --timeout-s 240
+./zig-out/bin/llmtoy generate \
+  /opt/ai-lab/models/mudler/gemma-4-26B-A4B-it-APEX-GGUF/gemma-4-26B-A4B-APEX-I-Mini.gguf \
+  "Briefly explain the full forward pass of a MoE model" \
+  --chat --max-tokens 32 --threads 12 --temperature 0.1 --top-k 40 --top-p 0.9
 ```
 
 Initial measured result after the NeoX RoPE correctness fix:
@@ -42,10 +40,10 @@ The current CLI reports setup, prefill, and generation separately. Older notes
 below list total harness wall time because they were captured before that split.
 Use the split timings for future comparisons, especially `generation tok/s`.
 Before recording numbers, run `scripts/check_benchmark_noise.sh` on the host and
-make sure no stray `llama-cli`, `llmtoy generate`, `regression_compare.py`,
-`profile_gemma4.sh`, or `perf` process is still active. Some earlier numbers in
-this addendum were taken while stray llama.cpp processes were running, so the
-quiet-system reruns are the authoritative scores.
+make sure no stray `llama-cli`, `llmtoy generate`, `profile_gemma4.sh`, or
+`perf` process is still active. Some earlier numbers in this addendum were taken
+while stray llama.cpp processes were running, so the quiet-system reruns are the
+authoritative scores.
 
 Profiling workflow lives in [profiling.md](/opt/ai-lab/llmtoy-zig/docs/profiling.md).
 Run `scripts/profile_gemma4.sh stat` for counters and

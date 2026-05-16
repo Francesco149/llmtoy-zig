@@ -14,9 +14,9 @@ scripts/check_benchmark_noise.sh
 
 Do not record benchmark/profile results while unrelated high-CPU work is active.
 In particular, kill or wait for stray `llama-cli`, `llmtoy generate`,
-`regression_compare.py`, `profile_gemma4.sh`, or `perf` processes from earlier
-runs. Idle `llama-server` processes are less damaging to CPU timings, but they
-can still matter if memory pressure or swapping shows up.
+`profile_gemma4.sh`, or `perf` processes from earlier runs. Idle `llama-server`
+processes are less damaging to CPU timings, but they can still matter if memory
+pressure or swapping shows up.
 
 ## Quick Counter Run
 
@@ -33,6 +33,21 @@ perf stat -d -d -d -- ./zig-out/bin/llmtoy generate ... --threads 12
 Use this for high-level counters: cycles, instructions, cache misses, branch
 misses, and elapsed time. It is the first check after an optimization that
 claims to reduce memory traffic or instruction count.
+
+## Vulkan Timestamp Profile
+
+GPU dispatch timing is env-gated:
+
+```sh
+systemd-run --user --scope -p MemoryMax=40G --quiet -- \
+  nix develop --command env LLMTOY_GPU_PROFILE=1 ./zig-out/bin/llmtoy generate "$MODEL" "$PROMPT" \
+  --chat --gpu --temperature 0 --max-tokens 8
+```
+
+The profiler prints an aggregate table at shutdown with count, total ms, avg
+us, min/max us, and percentage by dispatch label. Use this before shader work;
+wall-clock tok/s alone is too coarse to distinguish matvec throughput from
+attention, MoE, or submit overhead.
 
 ## Sampling Profile
 

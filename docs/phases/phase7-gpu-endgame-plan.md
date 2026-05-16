@@ -1,502 +1,523 @@
-# Phase 7 GPU — Path to Endgame
+# Phase 7 GPU Endgame Plan
 
-Where we are: Phase 7f/g landed. ~3.10–3.17 prefill / ~3.06–3.09 decode tok/s on
-Gemma4 26B A4B / RX 7800 XT (+37–56% vs 12-thread CPU). 7h harness exposed two
-real correctness bugs (Q5_1 nibble ordering, V silently skipped in batched QKV),
-both fixed.
+Current status as of 2026-05-16: the Vulkan path is correct enough to optimize,
+but still well behind llama.cpp Vulkan on the same Gemma4 26B A4B / RX 7800 XT
+class setup. The earlier plan correctly pushed us toward Q8_1 activations and
+more GPU-resident state, but the code has moved on: Q8_1 matvecs, GPU
+RMSNorm/RoPE, VRAM KV cache, decode attention, GPU timestamp profiling, and
+Q6_K x Q8_1 lm_head/token-embedding coverage now exist.
 
-Where we want to land: **match or beat llama.cpp's Vulkan backend** for the same
-model + GPU combo. llama.cpp Vulkan runs Gemma4 26B A4B at **80–100 tok/s** on
-this hardware. We're at ~3 tok/s. The gap is not 2× — it's 30×. Closing it
-requires a structural rewrite of the matmul + activation flow, not incremental
-shader tuning.
+The ground truth now is simple:
 
-The single biggest lever is **Q8_1 quantized activations + integer dot
-product**. Everything else in this plan flows from that decision.
+- End-to-end decode was about 4 tok/s before the Q6_K fallback fix and is about
+  10 tok/s after it. llama.cpp is reported around 80-100 tok/s on this hardware,
+  but Phase 7t must turn that into a local apples-to-apples reference run.
+- Submit count and CPU attention were secondary effects before profiling.
+- Initial timestamp profiling showed only about 307 ms of measured GPU dispatch
+  time across a 28-token short run while wall time was about 6.2 s. CPU `perf`
+  then showed most samples in `quant.dequant.dequantQ6K`, meaning an unprofiled
+  CPU Q6_K fallback, not the existing GPU shaders, was the first blocker.
+- The repo now has early opt-in GPU timestamp profiling. It is sufficient to
+  catch large blind spots, but still needs per-layer/per-shape detail before
+  shader work can move fast.
+- After Q6_K fallback removal, the expected dominant bottleneck is cumulative
+  GPU layer work, remaining unsupported CPU fallbacks, and synchronization
+  around many small dispatch batches.
+
+The target is not "make one more fused shader." The target is to either port
+llama.cpp's actual Vulkan MMVQ/MMQ strategy faithfully enough to match it, or
+prove with per-dispatch timings why this model/hardware path needs a different
+specialized kernel.
 
 ---
 
-## Verification protocol (READ BEFORE ANY OPTIMIZATION)
+## Verification Gate
 
-Every GPU change — shader port, batching tweak, fused kernel, anything — must
-clear this gate before commit. **No exceptions.** Phase 7g shipped a "fused"
-shader that was actually slower; Phase 7e shipped a Q5_1 shader with wrong
-nibble ordering that wasn't user-visible until Phase 7h's harness landed three
-commits later. Both would have been caught at commit time by the protocol below.
+Every GPU change must clear this gate before commit.
 
-### 1. Per-shader fuzz test (`zig build test`)
-
-Every new shader needs a randomized fuzz test alongside the hand-crafted
-single-block tests. Pattern is established in `src/gpu/matvec.zig`'s
-`fuzzQuantMatvec` helper:
-
-1. Generate random block bytes (clamp the f16 scale to ~0.012 to avoid
-   NaN/Inf — the CPU dequant is the reference, so we don't care about
-   reproducing real model weight statistics).
-2. Run the existing CPU dequant + dot path (`math.quantMatvec` + the
-   relevant `dq.dequantQ*`) as ground truth.
-3. Run the GPU shader on the same bytes via `MatvecSession.runOwned`.
-4. Assert `max |Δ| / max |out_cpu| < 1e-4`.
-
-The current Q5_1 bug got past the existing single-block tests because they
-only set `qs[0]=0x01` (element 0), where the buggy "interleaved" ordering and
-the correct "low-then-high" ordering happen to agree. Random data exercises
-every nibble pair and would have caught it on the first run.
-
-### 2. Per-layer compare against CPU (`llmtoy compare`)
+1. Run shader/unit tests:
 
 ```sh
-systemd-run --user --scope -p MemoryMax=40G --quiet -- nix develop --command \
-  ./zig-out/bin/llmtoy compare <model> "explain MoE" --chat
+nix develop --command zig build test
 ```
 
-Prints per-layer `max |Δ|` between the CPU and GPU residual streams plus the
-final top-5 logit comparison. After the 7h fixes the baseline is:
+Every new shader needs a fuzz test against the CPU reference. For quantized
+matvecs, keep the existing pattern in `src/gpu/matvec.zig`: random block bytes,
+CPU dequant/dot reference, GPU dispatch, and relative-error assertion. Do not
+trust hand-authored single-block cases alone.
 
-- L0–L12: < 1.5% rel_err (numerical noise floor for f32 matvec without Q8_1
-  activations; see Q8_1 milestone below)
-- L13–L29: 1.5–55% rel_err drifting upward, **L28 argmax FAIL**, final token
-  mismatch in some prompts
-
-That drift is the unfixed-but-deferred amplification problem. It is **expected
-to disappear** when we adopt Q8_1 activations (see milestone below); do not
-spend more than an hour chasing it before then. What you ARE checking with
-`compare` after every change is **regression**: does the change make any layer
-that was passing before now fail, or push a per-layer rel_err meaningfully
-higher than the baseline above?
-
-### 3. Tensor-level bisect (`--gpu-layers L0:L1`)
-
-When `compare` shows a regression, narrow it:
-
-- `--gpu-layers L:L` runs only layer L on GPU; everything else CPU. Tells you
-  whether the bug is in layer L specifically.
-- For tensor-level bisect within a layer (which matmul or which expert), the
-  cleanest pattern is to add a temporary `const DBG_NO_GPU_X = true` constant
-  at the top of `forwardOne` and gate the relevant `mv()` call on it. Flip one
-  toggle at a time, rebuild, re-run `compare`. **Remove all toggles before
-  commit** — they're scratch debugging, not shipped configuration.
-
-### 4. End-to-end generation parity
+2. Run per-layer CPU/GPU compare:
 
 ```sh
-./llmtoy generate <model> "what is 1+1?" --chat --temperature 0 --max-tokens 30
-./llmtoy generate <model> "what is 1+1?" --chat --temperature 0 --max-tokens 30 --gpu
+systemd-run --user --scope -p MemoryMax=40G --quiet -- \
+  nix develop --command ./zig-out/bin/llmtoy compare <model> "explain MoE" --chat
 ```
 
-At T=0 the two should produce **identical** output once Q8_1 activations land.
-Until then, they should at minimum produce coherent (not glitched) text and
-diverge only on the last few tokens of long generations.
+Expected current behavior: all layer argmaxes and final argmax should match on
+the standard prompts. Small rel_err differences are expected because the GPU
+path uses Q8_1 activations where the CPU reference still uses f32 dots.
 
-### 5. Benchmark before / after
+3. Bisect regressions with `--gpu-layers L0:L1`.
 
-If a change is supposed to make things faster, prove it:
+If a regression appears, first isolate the layer. For tensor-level isolation,
+temporary local toggles inside `forwardOne` are acceptable, but remove them
+before commit.
+
+4. Check deterministic generation:
 
 ```sh
+./zig-out/bin/llmtoy generate <model> "what is 1+1?" --chat --temperature 0 --max-tokens 30
+./zig-out/bin/llmtoy generate <model> "what is 1+1?" --chat --temperature 0 --max-tokens 30 --gpu
+```
+
+5. Benchmark only on a quiet host:
+
+```sh
+scripts/check_benchmark_noise.sh
 hyperfine --warmup 1 --runs 3 \
-  'systemd-run … ./zig-out/bin/llmtoy generate <model> "<long prompt>" --chat --max-tokens 64 --gpu'
+  'systemd-run --user --scope -p MemoryMax=40G --quiet -- nix develop --command ./zig-out/bin/llmtoy generate <model> "<prompt>" --chat --temperature 0 --max-tokens 64 --gpu'
 ```
 
-Record both prefill and decode tok/s. Store the delta in `docs/benchmarks/`.
-If it regresses by >5% and the cause isn't obvious, revert and reopen.
+Store meaningful benchmark results in `docs/benchmarks/phase7_gpu.md`. If a
+performance patch regresses by more than 5% and the cause is not understood,
+revert or park it behind an explicit experiment branch.
 
 ---
 
-## Phase 7h — Correctness harness [SONNET, DONE]
+## Current GPU Path, From Code
 
-Delivered:
+Relevant files:
 
-- `llmtoy compare <model> <prompt>` with per-layer residual diff + final top-5
-- `--gpu-layers L0:L1` flag on `compare` and `generate` for per-layer bisect
-- Optional `layer_taps: ?[][]f32` parameter on `forwardOne` for residual capture
-- Randomized fuzz tests for every active shader (Q8_0, Q5_0, Q5_1, Q4_K, Q3_K)
-  via `fuzzQuantMatvec` helper in `src/gpu/matvec.zig`. All pass at rel < 1e-4.
+- `src/model/gemma4/forward.zig`: layer orchestration and CPU/GPU fallbacks.
+- `src/model/gemma4/gpu_weights.zig`: GPU-resident weights, dispatch chains,
+  KV VRAM, Q8_1 paths, expert batch path.
+- `src/gpu/matvec.zig`: Vulkan pipeline wrappers and fuzz tests.
+- `src/gpu/context.zig`: command buffers, submits, barriers, buffer copies.
+- `src/gpu/shaders/*.glsl`: actual kernels.
 
-The harness immediately found two bugs (see 7i). Future agents extend this
-infrastructure rather than rebuilding it.
+What is already done:
 
----
+- Q8_1 activation quantization via `quantize_q8_1.glsl`.
+- Q3_K/Q4_K/Q5_0/Q5_1 Q8_1 matvec shaders.
+- Q8_1 attention QKV, output projection, dense FFN gate/up, dense FFN down
+  where supported, MoE gate/up/down.
+- GPU RMSNorm, element add/scale, GELU multiply, per-head norms, RoPE.
+- VRAM KV cache and GPU decode attention for the 24 SWA layers with explicit V.
+- Dense FFN and attention/FFN submit fusion down to roughly 3 submits per layer
+  on the fast path.
 
-## Phase 7i — Numerical bugs found by 7h [OPUS, PARTIALLY DONE]
+Important remaining fallbacks and caveats:
 
-### Fixed
-
-1. **Q5_1 nibble ordering** (`matvec_q5_1.glsl`): shader walked `i = 0..31` and
-   pulled `(qs[i/2] >> (4*(i%2))) & 0xF`, producing an interleaved
-   `(low, high, low, high, …)` pairing. GGML packs Q5_1 as
-   `(qs[0..15] low → elements 0..15; qs[0..15] high → elements 16..31)`,
-   matching `dequantQ5_1`. Fixed by mirroring the (already correct) Q5_0
-   shader's loop. Layer 0 rel_err: 98.7% → 0.82%. Commit `87a0f25`.
-
-2. **V silently skipped in batched QKV** (`forward.zig`): `runLayerQKV` was
-   entered whenever wq+wk had GPU sessions, but if `wv` existed and was
-   CPU-only (e.g. Gemma4 L3 attn_v is Q5_K, not in `isGpuSupported`), the V
-   dispatch was skipped without a CPU fallback and `v_cur` carried stale
-   data from the previous layer. Tightened the batch condition so a CPU-only
-   V drops to the per-call branch. Commit `e72aa4e`.
-
-### Deferred to "Q8_1 milestone" below
-
-Per-layer rel_err still drifts up to ~55% by L28 with a final-argmax mismatch
-on some prompts. Bisect localizes this to **per-matmul precision noise (~1e-7
-per output element) being amplified through `post_attention_norm`'s 1/RMS
-division when the underlying activation magnitude is small at deep layers**.
-Fuzz tests confirm every shader is correct to rel < 1e-4 in isolation, so
-this is not a discrete shader bug.
-
-The standard fix in the GGUF ecosystem is **Q8_1-quantized activations**:
-quantize the input vector to Q8_1 once per matmul, do the dot product as
-`int8 × int8 → int32` accumulation, convert to f32 at the end. This is
-deterministic across CPU and GPU implementations (no floating-point reorder),
-which is why llama.cpp Vulkan matches its CPU reference bit-for-bit. Adopting
-it eliminates the drift as a side effect.
-
-**Do not chase the residual amplification any further with our current f32
-matvec stack.** Spend that time on the Q8_1 milestone instead.
+- `lm_head` now has a Q6_K x Q8_1 GPU path in progress. Q5_K/IQ variants still
+  need coverage if future models use them.
+- The 6 global layers that share V from K still use the CPU attention path.
+- Dense `w_down` has comments that still mention f32-activation fallback for
+  non-256-aligned widths; current Q5_0/Q5_1 Q8_1 coverage exists and should be
+  verified with profiling rather than assumed.
+- Descriptor sets and command buffers are allocated/freed at dispatch frequency.
+  This is probably not the 20x gap, but it will matter once matmul is faster.
+- `submitBatchCopy` always waits idle. There is no fence ring or async graph
+  execution yet.
 
 ---
 
-## Phase 7k* — Q8_1 activation quantization + integer-dot matvec [DONE]
+## llama.cpp Vulkan Delta
 
-**Landed**: 4.28 prefill / 4.07 decode tok/s (vs 3.10/3.07 baseline). The
-drift the original plan deferred ("expected to disappear" with Q8_1) did in
-fact collapse once Q8_1 covered enough of the path — see notes below.
+Reference tree: `/opt/ai-lab/llama.cpp/ggml/src/ggml-vulkan/`.
 
-Reference: llama.cpp's `quantize_q8_1.comp`, `mul_mat_vecq.comp`,
-`mul_mat_vecq_funcs.glsl`, `mul_mat_vec_base.glsl`.
+The current llmtoy Q8_1 matvec shaders are not faithful ports of llama.cpp's
+fast path. Example: `src/gpu/shaders/matvec_q4_k_q8_1.glsl` uses:
 
-### What changes
+- `local_size_x = 32`
+- one subgroup/workgroup per output row
+- each lane strides over 32-element sub-blocks
+- one `subgroupAdd`
 
-For every matmul (attention QKV/O, dense FFN gate/up/down, expert
-gate_up_exps/down_exps, lm_head):
+llama.cpp's `mul_mat_vec_q4_k.comp` plus `mul_mat_vec_base.glsl` uses a more
+general MMVQ framework:
 
-1. The activation vector stops being f32 in HOST_COHERENT and becomes Q8_1
-   in device-local VRAM, written by a `quantize_q8_1` shader.
-2. The matvec shader (`mul_mat_vecq_<weight_type>`) reads the weight in its
-   GGUF block format AND the activation in Q8_1, does the dot via
-   `subgroupAdd(int8_t × int8_t → int32_t)` with `GL_EXT_integer_dot_product`,
-   and writes f32 output.
-3. Each row's dot product is computed by a full subgroup (32 lanes on RDNA3)
-   working cooperatively, not by a single thread sequentially looping over
-   `cols`.
+- specialization constants for `BLOCK_SIZE`, `NUM_ROWS`, `NUM_COLS`
+- multiple rows per workgroup
+- optional multiple columns/batch vectors per workgroup
+- subgroup size control in pipeline creation
+- different reductions depending on subgroup/shared-memory capabilities
+- shared code across quant types with tuned packing/repack helpers
 
-Both wins land at once: ~10× memory bandwidth (coalesced subgroup reads vs
-scalar gather), ~4× ALU throughput (int dot vs scalar fma), AND CPU-matching
-precision.
+llama.cpp also has a separate `mul_mmq.comp` tiled matrix path for larger
+batch/prompt work, and device feature logic for integer dot, subgroup control,
+cooperative matrix, pipeline executable stats, async behavior, and profiling.
 
-### Order of work
-
-1. **[OPUS] `quantize_q8_1.glsl`**. Single elementwise shader: take an f32
-   vector of length `cols`, write `cols / 32` Q8_1 blocks (each block: f16 d,
-   f16 s, 32 × int8 qs). One workgroup per 32-element block, threads do the
-   per-block max-abs reduction via `subgroupMax`. Verify with a fuzz test:
-   `quantize_q8_1(x); dequantQ8_1(out)` should round-trip x to within Q8_1's
-   ~1/127 error.
-
-2. **[OPUS] Port `mul_mat_vec_q4_k.comp` first**. Q4_K is the most-used type
-   in our model (all attention matmuls L0–L29). Adopt llama.cpp's binding
-   conventions and `mul_mat_vec_base.glsl` framework as-is — don't try to
-   shrink it. After porting:
-   - Run the Q4_K fuzz test from `matvec.zig`. Must pass at rel < 1e-3
-     (looser than f32 matvec because Q8_1 introduces real ~1/127 quant error
-     on the activation).
-   - Run `llmtoy compare`. Layer-by-layer rel_err should now be **flat at
-     noise level** across all 30 layers (no more drift), and final argmax
-     should match. This is the moment the deferred 7i drift dies.
-   - Benchmark. Decode tok/s should roughly double immediately.
-
-3. **[SONNET] Mechanical port for Q3_K, Q5_0, Q5_1, Q8_0**. Once Q4_K's
-   pattern is established, the others are copy-paste of the corresponding
-   llama.cpp `mul_mat_vec_q*_k.comp` with our binding layout. Each gets a
-   fuzz test before commit.
-
-4. **[OPUS] Decide the fate of `matvec_fused_gu_q3k.glsl` and
-   `expert_accum.glsl`**. Both were performance hacks specific to the
-   scalar-per-row matmul era. With subgroup matvecs the per-shader cost
-   drops 4–10× and the fixed overhead of an extra dispatch per expert
-   matters less. Likely outcome: delete the fused shader, keep the accum
-   shader (since it removes a CPU readback regardless of matmul speed).
-   Measure both ways, pick the winner.
-
-### Estimated speedup
-
-The full effect of points 1–4 is the bulk of the 30× gap to llama.cpp.
-Realistic projection on this hardware: **3 → 30–50 tok/s** in one milestone.
-
-### What this milestone makes obsolete
-
-- Phase 7i's "remaining" amplification debug — replaced by Q8_1 determinism.
-- The non-subgroup `matvec_q*_k.glsl` shader family — superseded by the
-  `mul_mat_vecq_*` ports. Once those land and pass the fuzz tests, delete
-  the old shaders and their pipeline structs in `gpu/matvec.zig`. Don't
-  carry both.
-- `FusedGateUpPipeline` — see point 4.
+The likely core mistake in our current roadmap was treating "Q8_1 + integer
+dot + subgroup" as equivalent to llama.cpp. It is only the first layer. Kernel
+shape and occupancy still matter, and our one-row workgroups leave too much
+performance on the table.
 
 ---
 
-## Phase 7j — RMSNorm + residual + GPU GELU [INTEGRATED, SUBMIT 5 → 3]
+## Endgame Pipeline Picture
 
-**Status as of 2026-05-16 (integration session):**
-- ✓ All shaders done: `rmsnorm.glsl`, `elem_add.glsl`, `elem_scale.glsl`,
-  `gelu_mul.glsl`, `rope_neox_{table,theta}.glsl`. All fuzz-tested.
-- ✓ Pipelines + per-layer norm-weight buffer uploads + x_vram/xb_vram/
-  stage_buf in GpuWeights (commit `6f80133`).
-- ✓ **`runLayerAttnQ8_1`** — fuses attn_norm + quantize + QKV in 1 submit.
-- ✓ **`runLayerDenseFfnQ8_1`** — fuses ffn_norm + quantize + gate/up +
-  gelu*up + w_down + post_ffw_norm_1 in 1 submit (kills 1 submit/layer).
-- ✓ **`runLayerAttnResidualDenseFfnQ8_1`** — also folds wo + post_attn_norm +
-  residual into the same submit (kills another 1/layer). Per-layer count
-  drops from 5 → 3.
-- ✗ RoPE / per-head Q/K/V norms on GPU — not integrated; per-head dispatches
-  add their own submit cost and the CPU SIMD path is already cheap.
-  Deferred indefinitely (better addressed in 7l with full attention on GPU).
+Do not re-optimize the current path as if it were the final architecture. The
+final decode pipeline should look much closer to llama.cpp's Vulkan graph:
 
-**Actual measured gain:** ~0.5% on a 64-token generate
-(28.60 s baseline → 28.44 s with full 3-submit chain — borderline 1σ).
+- Weights are uploaded once and stay in VRAM. Supported quant formats include
+  all formats the target model actually uses on hot tensors: Q3_K, Q4_K,
+  Q5_0/Q5_1, Q6_K, and later Q5_K/IQ only when profiling proves they matter.
+- The residual stream, normalized activations, Q/K/V, KV cache, MoE
+  intermediates, and logits scratch stay device-resident across the token. CPU
+  should not see intermediate vectors except for sampling/logits and optional
+  debug checks.
+- Decode matmuls use MMVQ-style quantized weight x quantized activation
+  kernels: multiple rows per workgroup, tuned subgroup size, shared reduction
+  variants where useful, and quant-format helpers ported from llama.cpp before
+  local invention.
+- Prefill is a separate MMQ-style matrix-matrix path. Repeated batch-1 decode is
+  acceptable for correctness bring-up, not for parity.
+- A token should be recorded as a small number of command buffers or a graph-like
+  sequence with persistent descriptors and fence reuse. `vkQueueWaitIdle` after
+  every mini-batch is a bring-up crutch.
+- GPU profiling is always on for optimization experiments: timestamped dispatch
+  spans, CPU perf, and periodic llama.cpp reference runs are the source of truth.
 
-**Plan estimate was wrong.** The +20–38% number assumed each saved submit
-was ~3 ms of overhead. Measured on RX 7800 XT (Mesa RADV), per-submit
-overhead is closer to **~100–200 µs**. The 5 → 3 reduction saves
-~300–600 µs/token out of ~245 ms = 0.1–0.25%.
-
-**What this means for the remaining gap to llama.cpp (4 → 80–100 tok/s):**
-submit count was not the bottleneck. The bottleneck is **GPU matmul
-throughput** — Q3_K/Q4_K integer-dot on this hardware/driver, plus the
-inability to overlap CPU attention with GPU FFN. Phase 7l (attention on
-GPU + KV-cache in VRAM) is the only remaining structural lever that
-addresses this directly.
-
-**Reordered to AFTER 7k\*.** Rationale: with Q8_1 matvecs, the CPU still has
-to receive the f32 matvec output, do the norm, do the residual add, then
-re-quantize to Q8_1 for the next matmul — that's 3 PCIe round-trips per
-matmul × ~6 matmuls/layer × 30 layers = ~540 round-trips/token. Eliminating
-those is what gets us from "matmul on GPU" to "compute on GPU".
-
-After 7k\* lands, the activation already lives in VRAM in Q8_1 form. The
-norms/residuals/RoPE need GPU shaders so the CPU never has to pull the
-activation back to f32 between matmuls.
-
-### Shaders to write
-
-1. **`rmsnorm.glsl`**: workgroup-shared-memory reduction of `sum(x²)`, then
-   per-element scale by `weight[i] / sqrt(mean_sq + eps)`. Handle Gemma's
-   `(1 + w)` weight convention via a push-constant flag.
-2. **`add.glsl`**: trivial elementwise `a += b`.
-3. **`scale.glsl`**: trivial elementwise `x *= s` (used for embedding scale,
-   layer_output_scale).
-4. **`rope_neox.glsl`**: per-element rotation. Gemma4 reads
-   `rope_freqs.weight` for global layers; SWA layers compute θ from
-   `rope_theta_swa`. Push constant: `pos`. Two variants or one shader with a
-   uniform flag.
-
-### Residual stream lives in VRAM
-
-After embed-lookup (still CPU), upload `x[d_model]` to a device-local
-`x_buf` once. Every layer reads/writes `x_buf` in place via the shaders
-above + 7k\*'s matvecs. Only download after the final out_norm for the
-lm_head matmul.
-
-Each shader gets a fuzz test (CPU reference vs GPU output, rel < 1e-5 since
-these are exact rather than quantized).
+This means near-term fixes are only worth doing if they either remove a current
+CPU fallback or become one of the final MMVQ/MMQ kernels. Q6_K x Q8_1 qualifies:
+it removes the observed lm_head fallback now and is a required quant format for
+the final MMVQ family.
 
 ---
 
-## Phase 7l — Attention on GPU [SONNET + OPUS]
+## Phase 7m - Profiling Infrastructure First
 
-Same scope as the original plan, but now the matvecs and norms it needs
-already exist (from 7k\* and 7j). What's left:
+Status: STARTED. `LLMTOY_GPU_PROFILE=1` now enables Vulkan timestamp queries
+and prints aggregate dispatch timings at GPU shutdown. Coverage currently
+includes the standalone matvec runner plus the main Gemma4 Q8_1 attention,
+attention compute, dense FFN, and MoE GPU dispatch chains.
 
-### 7l.1  KV cache in VRAM [OPUS, DONE]
+Initial measurement, standard short prompt, 28 forwarded tokens:
 
-Three sub-commits:
+- Prefill/generation wall time was still about 4.5 tok/s.
+- Timestamped GPU dispatches summed to only about 307 ms total, around
+  11 ms/token.
+- CPU `perf` showed about two thirds of samples in `quant.dequant.dequantQ6K`.
+- Conclusion: the first optimization target is CPU fallback discovery/removal;
+  do not start MMVQ tuning until the profile table accounts for the full token.
 
-- **7l.1a** (`7255747`) — allocate device-local `k_vram[l]/v_vram[l]` per
-  layer in `GpuWeights`, sized to match the existing `Gemma4KvCache`. Lazy
-  init via `initKvVram(cfg, max_seq)`. Total ~560 MiB on Gemma4 26B A4B at
-  `max_seq=4096`. Plus `GpuContext.copyBufferRegion` for offset-aware
-  one-shot transfers, and slot upload/download helpers.
+After adding Q6_K x Q8_1 routing:
 
-- **7l.1b** (`c317c42`) — `rmsnorm_perhead.glsl` + `RmsnormPerHeadPipeline`.
-  One workgroup per head, 256 threads cooperate over `head_dim` via
-  subgroup reduction. Handles Q-norm (1+w, with weight), K-norm
-  (1+w, with weight), and V's rmsnormRaw (no weight at all) via push
-  constants. Three fuzz tests, all rel < 1e-6.
+- Prefill/generation rose to about 10 tok/s on the same short prompt.
+- `matvec_q8_1.single.262144x2816` appears in the timestamp table 28 times,
+  averaging about 1.69 ms per call.
+- `dequantQ6K` disappeared from CPU `perf`. Remaining CPU samples are mostly
+  `dequantRow` for Q3_K/Q5_K-style fallbacks and `dotIQ4NL`, plus Vulkan memory
+  allocation/free during setup/teardown.
+- The next profiling task is to map those CPU fallbacks to exact tensors and
+  decide whether they belong in the final GPU path or should be eliminated by
+  graph restructuring.
 
-- **7l.1c** (`b234300`) — `runLayerAttnQ8_1KvVram` extends the existing
-  Q8_1 attention submit with: per-head Q/K rmsnorm + V rmsnormRaw + RoPE
-  on Q,K + `vkCmdCopyBuffer` K/V into the per-layer cache, all in one
-  command-buffer submit. `forward.zig` skips the CPU per-head norm + RoPE
-  + `@memcpy` for the 24 SWA layers (which have `wv`); the 6 global layers
-  (which share V from K) fall back to `runLayerAttnQ8_1` + the CPU chain.
+Add a GPU profiler that can answer: where does one token spend GPU time, by
+layer and by dispatch type?
 
-**Verified**: per-layer rel_err identical to 7k\* baseline (layer 28
-worst-case 4.83%), all 30 argmaxes match CPU, final argmax matches.
+Minimum implementation:
 
-**Measured wall-clock** (3-run hyperfine, 64-token generate including
-~5.7 s model setup): **28.121 ± 0.126 s** vs 28.445 ± 0.178 s baseline,
-**−1.1% (within σ)**. As expected, 7l.1 alone is structural — the CPU
-norm/rope savings are roughly cancelled by extra GPU dispatches in the
-same submit. The VRAM-resident K/V cache is dead storage until 7l.2/3
-wire it into the actual attention compute.
+- Extend `GpuContext` with a timestamp query pool, timestamp period, and a
+  disabled-by-default profiler mode controlled by an env var such as
+  `LLMTOY_GPU_PROFILE=1`.
+- Add helpers:
+  - `beginProfiledBatch(label)`
+  - `writeTimestamp(cmd, label)` or scoped dispatch labels
+  - `endProfiledBatch`
+  - `collectProfileResults`
+- Timestamp boundaries around every meaningful dispatch in the Gemma4 GPU path:
+  `rmsnorm`, `quantize_q8_1`, each matvec type, `gelu_mul`, expert fused GU,
+  expert down, expert accum, attention QK, attention AV, copies/downloads.
+- Print a compact table aggregated by `(kernel, quant_type, shape)`:
+  count, total ms, avg us, min/max, and percent of GPU time.
+- Also emit per-layer totals so slow global/SWA layers stand out.
 
-### 7l.2  Q·K^T + softmax shader [OPUS, DONE — `fbc6a91`]
-`attn_qk_softmax.glsl`: one workgroup per Q head; 256 threads parallel
-across `win_len` positions (each thread sequentially computes the full
-head_dim dot product); 3-phase softmax via subgroupMax/subgroupAdd. The
-SWA mask is implicit in `win_len` (caller passes
-`min(seq, sliding_window)`). Circular-buffer slot indexing via
-`(seq - win_len + i) % cap`. 5 fuzz tests cover SWA + global shapes;
-all pass rel < 2e-6 vs CPU `sdpAttn`.
+Use llama.cpp's `GGML_VK_PERF_LOGGER` implementation as the design reference:
+`ggml-vulkan.cpp` has a timestamp query pool and writes timestamps around graph
+nodes/fusions.
 
-### 7l.3  attn_out = softmax_weights · V [OPUS, DONE — `fbc6a91`]
-`attn_av.glsl`: one workgroup per Q head; 256 threads parallel across
-the head_dim output dimension; each thread accumulates one output
-element over all `win_len` positions. Coalesced reads of
-`v_cache[slot, kv_h, dd]`. Output goes into `attn_in_buf` (wo's input
-buffer); `runLayerAttnResidualDenseFfnQ8_1` gains `skip_attn_upload`
-so the full-fused wo+dense-FFN submit reads it directly — no PCIe
-round-trip.
+Remaining deliverable:
 
-### 7l.4  Sliding-window mask [DONE — implicit in 7l.2]
-The SWA mask is implicit in `win_len` + circular slot indexing. No
-extra push-constant range needed.
+- `LLMTOY_GPU_PROFILE=1 ... generate --gpu --max-tokens 8` produces a stable
+  profile table.
+- `docs/benchmarks/phase7_gpu.md` gets one profile snapshot for the standard
+  prompt.
+- Extend shape/format labels beyond standalone `runQ8_1Mv` to all matvec spans
+  so dense FFN, MoE, and attention projections can be compared by shape.
 
-### 7l result
+Expected result:
 
-Active on Gemma4's 24 SWA layers (which have `wv`); the 6 global
-layers (share V from K) still use the CPU `sdpAttn` path. Adding
-support for those layers later is a "V-from-K" copy shader away.
-
-Hyperfine cumulative (3 runs, 64-token generate including ~5.7 s model
-setup):
-
-| Stage    | mean ± σ          | Δ vs prev       |
-|----------|-------------------|-----------------|
-| 7j base  | 28.445 ± 0.178 s  | —               |
-| 7l.1     | 28.121 ± 0.126 s  | **−1.1%**       |
-| 7l.2/3   | 27.355 ± 0.277 s  | **−2.7%** (3.8% total) |
-
-The plan's 30–50% estimate was optimistic. CPU `sdpAttn` at typical
-decode `win_len` was only ~1.5 ms/token, so removing it recovered the
-same order. The remaining ~325 ms/token is dominated by GPU matmul
-throughput (Q3_K/Q4_K integer-dot on this hardware/driver), which 7l
-doesn't change. Closing the rest of the gap to llama.cpp's
-~80–100 tok/s needs matmul-shader work (subgroup matvec, fp16 coopmat)
-or upstream wins in submit pacing (7m, 7n).
-
-After 7l, the only CPU work per token is MoE topK (128 floats → 8 indices —
-small), and the final sample.
+- Matvecs should dominate. If they do not, update this plan with the measured
+  blocker before touching shaders.
 
 ---
 
-## Phase 7m — One submit per layer [SONNET]
+## Phase 7n - Matvec Microbenchmark Harness
 
-By 7l end we should be at ~2 submits/layer. Collapse to 1 by recording
-attention + FFN + MoE + residuals + norms in one command buffer between
-layer-input-write and layer-output-read. Mechanical, no new shaders.
+Status: TODO. This should land immediately after timestamps.
 
----
+End-to-end tok/s is too noisy for shader iteration. Add a command or test-only
+binary that runs one GPU kernel shape thousands of times with fixed buffers.
 
-## Phase 7n — Persistent command buffers [SONNET]
+Required shapes for Gemma4 26B A4B:
 
-The same command sequence runs every token; only push constants change
-(position, mask range). Record once via `VK_COMMAND_BUFFER_USAGE_…` reuse
-flags. Saves ~50 µs/layer × 30 = ~1.5 ms/token, ~5–10% at 30 tok/s.
+- Attention Q/K/V/O: Q3_K and Q4_K, `cols = d_model`, rows matching the actual
+  tensors.
+- Dense FFN gate/up: Q3_K, `cols = d_model`, `rows = d_ffn`.
+- Dense/expert down: Q5_0/Q5_1 where present, `cols = d_ffn` or expert width,
+  `rows = d_model`.
+- Expert gate/up/down: actual expert matrix shapes.
+- lm_head: Q6_K, `rows = vocab_size`, `cols = d_model`.
 
----
+The harness should report:
 
-## Phase 7o — Last-mile micro-optimisation [OPUS]
+- GPU timestamp average per dispatch
+- effective weight bandwidth GB/s
+- effective integer dot operations/s where meaningful
+- CPU-side dispatch overhead separately from GPU elapsed time
 
-By here we should be at or near llama.cpp parity. Final profile-driven
-tuning:
-
-- Pipeline cache warm-up (avoid first-token jitter).
-- `VK_KHR_cooperative_matrix` (coopmat) for fp16 GEMM in attention if RDNA3
-  exposes it under our driver.
-- Pre-sized descriptor pools (we re-allocate per dispatch today).
-- Single-buffer KV cache vs separate K/V (cache line behavior).
-- `VK_KHR_pipeline_executable_properties` to inspect register pressure and
-  tune `local_size`.
+This harness is where shader variants compete. Do not use full generation to
+decide between two matvec kernels unless the microbench result is inconclusive.
 
 ---
 
-## Sequencing summary (revised)
+## Phase 7o - Faithful llama.cpp MMVQ Port
 
-| Phase | Owner       | Status      | Achieved/Estimated gain                  |
-|-------|-------------|-------------|------------------------------------------|
-| 7h    | Sonnet      | DONE        | 0% (correctness only, two bugs found)    |
-| 7i    | Opus        | PARTIAL     | 0% (two bugs fixed, drift deferred)      |
-| 7k\*  | Opus+Sonnet | **DONE**    | **+38% prefill, +33% decode** (3.10 → 4.28 / 3.07 → 4.07 tok/s) — plus the drift collapsed (all argmaxes match CPU after enough Q8_1 coverage) |
-| 7j    | Sonnet+Opus | **DONE**    | 5 → 3 submits/layer; +0.5% wall-clock (submit overhead was much smaller than estimated) |
-| 7l.1  | Opus        | **DONE**    | KV cache in VRAM + GPU per-head norms + GPU RoPE; −1.1% wall-clock |
-| 7l.2/3 | Opus       | **DONE**    | GPU Q·K^T+softmax + attn·V; **−2.7%** (−3.8% total vs 7j). Estimate was optimistic — CPU sdpAttn was only ~1.5 ms/token at this win_len; the remaining ~325 ms/token is matmul throughput. |
-| 7l.4  | —           | implicit    | SWA mask is implicit in win_len + circular slot indexing — done in 7l.2 |
-| 7m    | Sonnet      | after 7l    | +5%                                      |
-| 7n    | Sonnet      | after 7m    | +5–10%                                   |
-| 7o    | Opus        | last        | +5–10%                                   |
+Status: TODO. This is the main performance project.
 
-Current standing: **~4.3 prefill / ~4.1 decode tok/s** vs llama.cpp Vulkan
-~80–100 tok/s on the same hardware. Remaining gap is ~20×. The next
-structural lever is **matmul-shader throughput**, not attention or submit
-overhead.
+Goal: replace the current one-row Q8_1 matvec shaders with a close port of
+llama.cpp's MMVQ structure, then tune for RX 7800 XT.
 
-Notes from the 7k\* push:
-- Q4_K covered 6/30 attention layers; Q3_K filled the other 24. Plan
-  originally assumed all 30 were Q4_K — fix landed as the Q3_K shader.
-- Integer-dot drift behavior turned out as predicted but only at the
-  *full-path* level: Q8_1 attention alone or Q8_1 attention+MoE-gateup didn't
-  fix the L13–L28 drift; once wo and dense FFN also went through Q8_1, the
-  drift collapsed and final argmax matched CPU.
-- Q5_0/Q5_1 shaders work at cols%32==0 (so they cover expert_down at
-  cols=704 and dense_down at cols=2112 — both unaligned to 256). Note the
-  packQ8_1_x4 helper had a partial-last-group bug only exposed on
-  non-128-aligned activations; fixed.
+Start with Q4_K because it is easiest to compare against
+`mul_mat_vec_q4_k.comp`. Then port Q3_K, Q5_0, Q5_1, and Q6_K. Add Q5_K/IQ
+only if the model's hot tensors need them.
 
-Notes for 7j integration (when picked up):
-- All shaders are committed and fuzz-tested (rel ~7e-8 for rmsnorm, ~1e-6
-  for rope). Pipelines live in GpuWeights; per-layer norm weight buffers
-  are already uploaded.
-- The restructure is mostly forward.zig surgery: keep x in x_vram, use
-  pl_rmsnorm/pl_elem_add/pl_rope_* dispatches between matvecs, and run
-  each layer's matmul+norm+residual chain in fewer command-buffer
-  submits (currently 5/layer; achievable 3/layer with CPU still owning
-  attention compute + MoE routing).
-- Estimated upside: ~20–38% from reduced submit count + eliminated
-  per-matmul PCIe upload/download. Worth it but not catastrophic to leave
-  on the table.
+Implementation plan:
 
-Benchmark llama.cpp Vulkan on this exact (model, GPU, driver, prompt)
-combination once per milestone so we always have a hard reference number;
-"close to llama.cpp" is a moving target as their backend evolves.
+1. Add a new experimental pipeline family rather than deleting the existing
+   shaders immediately. Keep a runtime or compile-time switch so one command
+   can compare old vs new.
 
----
+2. Port the shared framework shape:
+   - `BLOCK_SIZE` specialization constant, initially 64.
+   - `NUM_ROWS` specialization constant, test 1, 2, 4, 8.
+   - `NUM_COLS` specialization constant, test 1 first; use >1 only for batched
+     prefill or grouped expert work where the input has multiple vectors.
+   - subgroup size control if exposed; compare subgroup 32 and 64 on RDNA3.
+   - shared-memory vs no-shared-memory reduction variants.
 
-## Working notes for agents
+3. Match llama.cpp's Q4_K repacking and scale/min handling first. Do not invent
+   a new layout unless the faithful port is already measured.
 
-- **Always use `nix develop --command zig build [test]`** — `zig` is not on PATH.
-- **GPU runs require systemd-run wrap** for safety:
-  `systemd-run --user --scope -p MemoryMax=40G --quiet -- nix develop --command ./zig-out/bin/llmtoy ...`
-- **CLI argument order**: `generate <model> <prompt>` first, flags after.
-- **Reference shaders**: `/opt/ai-lab/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/`.
-  In particular `quantize_q8_1.comp`, `mul_mat_vecq.comp`, `mul_mat_vecq_funcs.glsl`,
-  `mul_mat_vec_base.glsl`, `mul_mat_vec_q*_k.comp`, `rope_neox.comp`,
-  `soft_max.comp`, `rms_norm.comp`.
-- **The verification protocol at the top of this document is mandatory**, not
-  aspirational. Two of the three commits before 7h would have failed it. If
-  you ship a change that breaks it, revert.
-- **Hand off to Opus** when: a numerical bug doesn't localize via the harness
-  within an hour of bisecting, a shader port produces wrong values and the
-  GGML packing doesn't visibly match, or a perf change regresses tok/s by
-  >5% and the cause is non-obvious.
-- **Don't optimize 7g style without 7h evidence**. The fused dense-FFN
-  experiment is a cautionary tale — looked promising, was actually slower,
-  required revert. Always measure before committing.
+4. Extend the port to Q3_K. This is likely the highest-impact quant type for
+   this model because many attention and FFN gate/up matrices are Q3_K.
+
+5. Extend to Q5_0/Q5_1 for down projections and experts.
+
+6. Add Q6_K to the MMVQ family after the fallback-removal shader is stable; it
+   should use the same framework as Q3/Q4 rather than remain a bespoke one-row
+   shader.
+
+7. Add Q5_K and/or IQ4_NL only if profiling shows `lm_head` or fallback tensors
+   have material cost. Correctness first; these formats are easy to get subtly
+   wrong.
+
+Acceptance criteria:
+
+- Every new quant shader passes fuzz tests at the existing tolerances.
+- Microbench shows a large per-dispatch improvement over the current shader.
+  A faithful MMVQ port should aim for multi-x speedup, not single-digit percent.
+- End-to-end generation improves materially. If microbench improves but tok/s
+  does not, inspect synchronization, downloads, and fallback paths with the
+  profiler before changing the shader again.
+
+Notes:
+
+- The current shaders use `dotPacked4x8EXT`, so the gap is not "missing integer
+  dot." The gap is occupancy, memory coalescing, row batching, subgroup sizing,
+  and possibly poor Q3_K/Q4_K unpack scheduling.
+- Check device properties, not assumptions. llama.cpp only enables integer dot
+  when `integerDotProduct4x8BitPackedSignedAccelerated` is true.
 
 ---
 
-## Cross-references
+## Phase 7p - Prefill Is Matrix-Matrix, Not Repeated Decode
 
-- Current benchmark numbers: `docs/benchmarks/phase7_gpu.md` (Phase 7f baseline).
+Status: TODO after MMVQ profiling.
+
+The current public path calls `forwardOne` for every prompt token. That means
+prefill is effectively repeated batch-1 decode. llama.cpp uses graph execution
+and can hit matrix-matrix kernels when batch size is large enough.
+
+Plan:
+
+- Add profiling that separates prefill and decode dispatch shapes.
+- Decide whether to implement a real batched prefill path for Gemma4:
+  - batch several prompt tokens through attention/FFN matmuls,
+  - use llama.cpp's `mul_mmq.comp` strategy for quantized weight x Q8_1
+    activations where it applies,
+  - keep decode on MMVQ.
+- Do not block decode parity on this. Decode is the visible 4 tok/s problem,
+  but prefill parity needs MMQ eventually.
+
+Acceptance criteria:
+
+- Prefill benchmark improves independently of decode.
+- Decode path remains clean and does not regress to accommodate prefill.
+
+---
+
+## Phase 7q - Remove CPU Round Trips That Profiling Proves Matter
+
+Status: TODO, lower priority than matvec.
+
+Known remaining CPU/GPU synchronization points:
+
+- `runLayerAttnResidualDenseFfnQ8_1` downloads both `x` and `ffn_out` after its
+  submit. The CPU needs `x` for later orchestration today, but the long-term
+  target is a VRAM-resident residual stream across the whole layer.
+- `runExpertBatch` writes MoE input/scales from CPU and reads accumulated MoE
+  output back to CPU.
+- MoE top-k routing is still CPU-side.
+- Global layers without explicit V still use CPU attention.
+- Command submission waits idle after every batch.
+
+Do not attack these blindly. Use Phase 7m profile data. If matvec is still 90%
+of GPU time and CPU wait is just waiting for matvec, round-trip removal will not
+close a 20x gap.
+
+High-value cleanup once matvec is faster:
+
+- Keep `x`, dense FFN output, and MoE output in VRAM until final logits.
+- Move router top-k to GPU or at least avoid readback of intermediate vectors.
+- Add a V-from-K shader/path for the 6 global layers so they use GPU attention.
+- Replace per-submit `vkQueueWaitIdle` with a small fence ring.
+
+---
+
+## Phase 7r - Descriptor, Command, and Pipeline Overhead
+
+Status: TODO after matvec throughput improves.
+
+The current wrappers allocate/update/free descriptor sets for nearly every
+dispatch and allocate/free command buffers for every submit. That overhead is
+visible in code (`MatvecPipeline.record`, many `vkFreeDescriptorSets`, and
+`GpuContext.submitBatchCopy`), but earlier measurements show submit overhead is
+not the primary bottleneck while matvecs take hundreds of ms/token.
+
+Roadmap:
+
+- Use descriptor buffers or persistent descriptor sets for stable bindings.
+- Pre-allocate per-layer/per-dispatch descriptor sets where buffers are stable.
+- Reuse command buffers where the sequence is fixed and only push constants
+  change.
+- Replace immediate `vkQueueWaitIdle` with fences.
+- Add pipeline cache serialization.
+
+Acceptance criteria:
+
+- CPU-side profile shows measurable dispatch overhead before this work starts.
+- Afterward, CPU time per token drops measurably without GPU timestamp regressions.
+
+---
+
+## Phase 7s - Device Feature and Shader Introspection
+
+Status: TODO, useful alongside 7o.
+
+Add `llmtoy gpu-info --verbose` or extend the existing command to print:
+
+- subgroup size and supported subgroup operations
+- integer dot product feature and acceleration booleans
+- subgroup size control support
+- cooperative matrix support and supported shapes
+- timestamp period
+- memory heaps/types relevant to VRAM/GTT
+- pipeline executable properties support
+
+If `VK_KHR_pipeline_executable_properties` is available, add an opt-in debug
+path to dump register usage/occupancy-like stats for the hot matvec pipelines.
+llama.cpp already has plumbing for pipeline stats; use it as the reference.
+
+This is not a substitute for timestamps, but it explains why one shader variant
+wins or loses on RADV/RDNA3.
+
+---
+
+## Phase 7t - llama.cpp Reference Benchmark Discipline
+
+Status: TODO.
+
+Once per milestone, benchmark the local llama.cpp clone with the same model,
+prompt, max token count, GPU, and driver. Record:
+
+- llama.cpp command line
+- git revision
+- Vulkan device line
+- prefill/decode tok/s
+- whether MMVQ/MMQ/integer-dot/coopmat paths are enabled if visible
+- any relevant env vars such as `GGML_VK_DISABLE_MMVQ`,
+  `GGML_VK_FORCE_MMVQ`, `GGML_VK_PERF_LOGGER`
+
+The reported 80-100 tok/s target may be real, stale, or measured with different
+batching/model flags. Future agents need a hard local reference, not folklore.
+
+---
+
+## Sequencing Summary
+
+| Phase | Status | Purpose | Expected impact |
+|-------|--------|---------|-----------------|
+| 7h-7l | DONE | Correctness, Q8_1, GPU norms/RoPE/KV/attention | 3 tok/s -> ~4 tok/s |
+| 7m | STARTED | GPU timestamp profiler | Blocks informed work |
+| 7n | TODO | Matvec microbench harness | Blocks shader iteration |
+| 7o | TODO | Faithful llama.cpp MMVQ-style matvecs | Main 20x lever |
+| 7p | TODO | Real batched prefill / MMQ | Prefill parity |
+| 7q | TODO | Remove proven CPU round trips | Secondary after matvec |
+| 7r | TODO | Descriptor/command/fence reuse | Secondary after matvec |
+| 7s | TODO | Feature/stats introspection | Supports shader tuning |
+| 7t | TODO | Repeatable llama.cpp reference | Keeps target honest |
+
+Priority order is strict: **profile, microbench, matvec kernel shape, then
+plumbing cleanup**. If an agent wants to do something else first, require a
+profile showing why it beats matvec work.
+
+---
+
+## Working Notes for Agents
+
+- Always use `nix develop --command zig build [test]`; plain `zig` may not be
+  on PATH.
+- GPU runs should use the memory-capped wrapper:
+
+```sh
+systemd-run --user --scope -p MemoryMax=40G --quiet -- \
+  nix develop --command ./zig-out/bin/llmtoy ...
+```
+
+- CLI argument order is `generate <model> <prompt>` first, flags after.
+- The old `scripts/regression_compare.py` workflow is obsolete for GPU work.
+  Use `llmtoy compare`, shader fuzz tests, GPU profiles, and direct llama.cpp
+  milestone benchmarks.
+- Reference llama.cpp shaders:
+  - `vulkan-shaders/quantize_q8_1.comp`
+  - `vulkan-shaders/mul_mat_vecq.comp`
+  - `vulkan-shaders/mul_mat_vecq_funcs.glsl`
+  - `vulkan-shaders/mul_mat_vec_base.glsl`
+  - `vulkan-shaders/mul_mat_vec_q*_k.comp`
+  - `vulkan-shaders/mul_mmq.comp`
+  - `vulkan-shaders/mul_mmq_funcs.glsl`
+  - `vulkan-shaders/flash_attn*.comp`
+  - `ggml-vulkan.cpp` for pipeline creation, feature gates, profiling, and
+    MMVQ/MMQ selection heuristics.
+
+---
+
+## Cross-References
+
+- Current benchmark history: `docs/benchmarks/phase7_gpu.md`.
+- General profiling notes: `docs/profiling.md`.
 - GPU code: `src/gpu/{context,buffer,matvec}.zig`, `src/gpu/shaders/*.glsl`.
-- Gemma4-specific GPU glue: `src/model/gemma4/{gpu_weights,forward}.zig`.
-- llama.cpp reference: `/opt/ai-lab/llama.cpp` (per memory).
+- Gemma4 GPU glue: `src/model/gemma4/{gpu_weights,forward}.zig`.
+- llama.cpp reference: `/opt/ai-lab/llama.cpp`.

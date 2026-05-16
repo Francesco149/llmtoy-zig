@@ -90,6 +90,7 @@ pub const GpuWeights = struct {
     pl_q4_k_q8_1:    MatvecPipeline,
     pl_q5_0_q8_1:    MatvecPipeline,
     pl_q5_1_q8_1:    MatvecPipeline,
+    pl_q6_k_q8_1:    MatvecPipeline,
     pl_quantize_q8_1: QuantizeQ8_1Pipeline,
     pl_q5_1:    MatvecPipeline,
     pl_q5_0:    MatvecPipeline,
@@ -240,6 +241,9 @@ pub const GpuWeights = struct {
         var pl_q5_1_q8_1 = try MatvecPipeline.initQ5_1Q8_1(&ctx);
         errdefer pl_q5_1_q8_1.deinit();
         std.debug.print("  init: pl_q5_1_q8_1 ok\n", .{});
+        var pl_q6_k_q8_1 = try MatvecPipeline.initQ6KQ8_1(&ctx);
+        errdefer pl_q6_k_q8_1.deinit();
+        std.debug.print("  init: pl_q6_k_q8_1 ok\n", .{});
         var pl_quantize_q8_1 = try QuantizeQ8_1Pipeline.init(&ctx);
         errdefer pl_quantize_q8_1.deinit();
         std.debug.print("  init: pl_quantize_q8_1 ok\n", .{});
@@ -299,6 +303,7 @@ pub const GpuWeights = struct {
             .pl_q4_k_q8_1 = pl_q4_k_q8_1,
             .pl_q5_0_q8_1 = pl_q5_0_q8_1,
             .pl_q5_1_q8_1 = pl_q5_1_q8_1,
+            .pl_q6_k_q8_1 = pl_q6_k_q8_1,
             .pl_quantize_q8_1 = pl_quantize_q8_1,
             .pl_q5_1 = pl_q5_1, .pl_q5_0 = pl_q5_0,
             .pl_fused_gu = pl_fused_gu, .pl_fused_gu_q8_1 = pl_fused_gu_q8_1,
@@ -715,6 +720,7 @@ pub const GpuWeights = struct {
         self.pl_quantize_q8_1.deinit();
         self.pl_q5_1_q8_1.deinit();
         self.pl_q5_0_q8_1.deinit();
+        self.pl_q6_k_q8_1.deinit();
         self.pl_q4_k_q8_1.deinit();
         self.pl_q3_k_q8_1.deinit();
         self.pl_q4_k.deinit();
@@ -790,11 +796,21 @@ pub const GpuWeights = struct {
         try vec_buf.upload(std.mem.sliceAsBytes(xb));
 
         const cmd = try self.ctx.beginBatch();
+        var quant_label_buf: [48]u8 = undefined;
+        const quant_label = std.fmt.bufPrint(
+            &quant_label_buf, "quantize_q8_1.cols{}", .{sess.cols}) catch "quantize_q8_1";
+        const p_quant = self.ctx.profileBegin(cmd, quant_label);
         const q_dset = try self.pl_quantize_q8_1.record(
             cmd, vec_buf, acts_buf, sess.cols);
+        self.ctx.profileEnd(cmd, p_quant);
         GpuCtx.recordShaderBarrier(cmd);
+        var mv_label_buf: [72]u8 = undefined;
+        const mv_label = std.fmt.bufPrint(
+            &mv_label_buf, "matvec_q8_1.single.{}x{}", .{ sess.rows, sess.cols }) catch "matvec_q8_1.single";
+        const p_mv = self.ctx.profileBegin(cmd, mv_label);
         const mv_dset = try pl.record(
             cmd, &sess.mat_buf, acts_buf, out_buf, sess.rows, sess.cols);
+        self.ctx.profileEnd(cmd, p_mv);
         try self.ctx.submitBatch(cmd);
 
         _ = vk.vkFreeDescriptorSets(self.ctx.device,
@@ -1006,19 +1022,29 @@ pub const GpuWeights = struct {
         const cmd = try self.ctx.beginBatch();
 
         // ── 1. attn_norm(x) → xb_vram
+        const p_norm = self.ctx.profileBegin(cmd, "attn_front.rmsnorm");
         const norm_dset = try self.pl_rmsnorm.record(
             cmd, vec_buf, attn_norm_buf, xb_buf, @intCast(x.len), eps, false);
+        self.ctx.profileEnd(cmd, p_norm);
         GpuCtx.recordShaderBarrier(cmd);
 
         // ── 2. quantize(xb_vram) → acts
+        const p_quant = self.ctx.profileBegin(cmd, "attn_front.quantize_q8_1");
         const quant_dset = try self.pl_quantize_q8_1.record(
             cmd, xb_buf, acts_buf, wq.cols);
+        self.ctx.profileEnd(cmd, p_quant);
         GpuCtx.recordShaderBarrier(cmd);
 
         // ── 3. QKV matvecs (parallel; share acts read)
+        const p_q = self.ctx.profileBegin(cmd, "attn_front.wq");
         const q_mv_dset = try wq_pl.record(cmd, &wq.mat_buf, acts_buf, q_buf, wq.rows, wq.cols);
+        self.ctx.profileEnd(cmd, p_q);
+        const p_k = self.ctx.profileBegin(cmd, "attn_front.wk");
         const k_mv_dset = try wk_pl.record(cmd, &wk.mat_buf, acts_buf, k_buf, wk.rows, wk.cols);
+        self.ctx.profileEnd(cmd, p_k);
+        const p_v = self.ctx.profileBegin(cmd, "attn_front.wv");
         const v_mv_dset = try wv_pl.record(cmd, &wv.mat_buf, acts_buf, v_buf, wv.rows, wv.cols);
+        self.ctx.profileEnd(cmd, p_v);
         GpuCtx.recordShaderBarrier(cmd);
 
         // ── 4. Per-head normalization in-place
@@ -1027,12 +1053,18 @@ pub const GpuWeights = struct {
         //   V: rmsnormRaw (no weight). v_buf is bound to the W slot too —
         //      the shader doesn't read it when use_weight==0, so any valid
         //      buffer works.
+        const p_qn = self.ctx.profileBegin(cmd, "attn_front.q_norm");
         const qn_dset = try self.pl_rmsnorm_perhead.record(
             cmd, q_buf, q_norm_buf, q_buf, n_heads,    head_dim, eps, true,  true);
+        self.ctx.profileEnd(cmd, p_qn);
+        const p_kn = self.ctx.profileBegin(cmd, "attn_front.k_norm");
         const kn_dset = try self.pl_rmsnorm_perhead.record(
             cmd, k_buf, k_norm_buf, k_buf, n_kv_heads, head_dim, eps, true,  true);
+        self.ctx.profileEnd(cmd, p_kn);
+        const p_vn = self.ctx.profileBegin(cmd, "attn_front.v_norm");
         const vn_dset = try self.pl_rmsnorm_perhead.record(
             cmd, v_buf, v_buf,      v_buf, n_kv_heads, head_dim, eps, false, false);
+        self.ctx.profileEnd(cmd, p_vn);
         GpuCtx.recordShaderBarrier(cmd);
 
         // ── 5. RoPE on Q and K (V isn't rotated)
@@ -1040,19 +1072,31 @@ pub const GpuWeights = struct {
         var kr_dset: vk.VkDescriptorSet = null;
         var rope_pool: vk.VkDescriptorPool = undefined;
         if (is_swa) {
+            const p_rope_q = self.ctx.profileBegin(cmd, "attn_front.rope_q_theta");
             qr_dset = try self.pl_rope_theta.record(cmd, q_buf, pos, head_dim, rope_theta_swa, n_heads);
+            self.ctx.profileEnd(cmd, p_rope_q);
+            const p_rope_k = self.ctx.profileBegin(cmd, "attn_front.rope_k_theta");
             kr_dset = try self.pl_rope_theta.record(cmd, k_buf, pos, head_dim, rope_theta_swa, n_kv_heads);
+            self.ctx.profileEnd(cmd, p_rope_k);
             rope_pool = self.pl_rope_theta.desc_pool;
         } else {
+            const p_rope_q = self.ctx.profileBegin(cmd, "attn_front.rope_q_table");
             qr_dset = try self.pl_rope_table.record(cmd, q_buf, rope_freqs_buf, pos, head_dim, n_heads);
+            self.ctx.profileEnd(cmd, p_rope_q);
+            const p_rope_k = self.ctx.profileBegin(cmd, "attn_front.rope_k_table");
             kr_dset = try self.pl_rope_table.record(cmd, k_buf, rope_freqs_buf, pos, head_dim, n_kv_heads);
+            self.ctx.profileEnd(cmd, p_rope_k);
             rope_pool = self.pl_rope_table.desc_pool;
         }
         GpuCtx.recordShaderToTransferBarrier(cmd);
 
         // ── 6. Append K, V to the per-layer VRAM cache at this slot
+        const p_k_copy = self.ctx.profileBegin(cmd, "attn_front.k_cache_copy");
         GpuCtx.recordCopyRegion(cmd, k_buf.handle, k_cache.handle, 0, slot_offset, slot_bytes);
+        self.ctx.profileEnd(cmd, p_k_copy);
+        const p_v_copy = self.ctx.profileBegin(cmd, "attn_front.v_cache_copy");
         GpuCtx.recordCopyRegion(cmd, v_buf.handle, v_cache.handle, 0, slot_offset, slot_bytes);
+        self.ctx.profileEnd(cmd, p_v_copy);
 
         try self.ctx.submitBatch(cmd);
 
@@ -1110,13 +1154,17 @@ pub const GpuWeights = struct {
         const n_q_per_kv = n_heads / n_kv_heads;
 
         const cmd = try self.ctx.beginBatch();
+        const p_qk = self.ctx.profileBegin(cmd, "attention.qk_softmax");
         const qk_dset = try self.pl_attn_qk.record(
             cmd, q_buf, k_cache, scores_buf,
             n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
+        self.ctx.profileEnd(cmd, p_qk);
         GpuCtx.recordShaderBarrier(cmd);
+        const p_av = self.ctx.profileBegin(cmd, "attention.av");
         const av_dset = try self.pl_attn_av.record(
             cmd, scores_buf, v_cache, attn_buf,
             n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap);
+        self.ctx.profileEnd(cmd, p_av);
         try self.ctx.submitBatch(cmd);
 
         const dev = self.ctx.device;
@@ -1138,6 +1186,7 @@ pub const GpuWeights = struct {
             .q4_k => &self.pl_q4_k_q8_1,
             .q5_0 => &self.pl_q5_0_q8_1,
             .q5_1 => &self.pl_q5_1_q8_1,
+            .q6_k => &self.pl_q6_k_q8_1,
             else  => null,
         };
     }
@@ -1418,53 +1467,75 @@ pub const GpuWeights = struct {
         const cmd = try self.ctx.beginBatch();
 
         // wo: quantize attn_concat, then Q8_1 matvec into attn_vram.
+        const p_wo_quant = self.ctx.profileBegin(cmd, "post_attn.wo_quantize");
         const wo_quant_dset = try self.pl_quantize_q8_1.record(
             cmd, attn_in_buf, acts_buf, @intCast(attn_concat.len));
+        self.ctx.profileEnd(cmd, p_wo_quant);
         GpuCtx.recordShaderBarrier(cmd);
+        const p_wo = self.ctx.profileBegin(cmd, "post_attn.wo");
         const wo_dset = try wo_pl.record(
             cmd, &wo.mat_buf, acts_buf, attn_vram, wo.rows, wo.cols);
+        self.ctx.profileEnd(cmd, p_wo);
         GpuCtx.recordShaderBarrier(cmd);
 
         // post_attention_norm in place on attn_vram.
+        const p_post_attn = self.ctx.profileBegin(cmd, "post_attn.rmsnorm");
         const post_attn_dset = try self.pl_rmsnorm.record(
             cmd, attn_vram, post_attn_buf, attn_vram,
             @intCast(wo.rows), eps, false);
+        self.ctx.profileEnd(cmd, p_post_attn);
         GpuCtx.recordShaderBarrier(cmd);
 
         // Residual: x_buf += attn_vram.  x_buf is HOST_COHERENT shared_vec
         // pre-loaded by the caller; after this dispatch it carries the new x.
+        const p_add = self.ctx.profileBegin(cmd, "post_attn.residual_add");
         const add_dset = try self.pl_elem_add.record(
             cmd, x_buf, attn_vram, @intCast(wo.rows));
+        self.ctx.profileEnd(cmd, p_add);
         GpuCtx.recordShaderBarrier(cmd);
 
         // ffn_norm(x_buf) → xb_vram.
+        const p_ffn_norm = self.ctx.profileBegin(cmd, "dense_ffn.rmsnorm");
         const ffn_norm_dset = try self.pl_rmsnorm.record(
             cmd, x_buf, ffn_norm_buf, xb_buf,
             @intCast(wo.rows), eps, false);
+        self.ctx.profileEnd(cmd, p_ffn_norm);
         GpuCtx.recordShaderBarrier(cmd);
 
         // Re-quantize xb for the FFN Q8_1 matvecs.
+        const p_ffn_quant = self.ctx.profileBegin(cmd, "dense_ffn.quantize_q8_1");
         const ffn_quant_dset = try self.pl_quantize_q8_1.record(
             cmd, xb_buf, acts_buf, w_gate.cols);
+        self.ctx.profileEnd(cmd, p_ffn_quant);
         GpuCtx.recordShaderBarrier(cmd);
 
+        const p_gate = self.ctx.profileBegin(cmd, "dense_ffn.gate");
         const gate_dset = try gate_pl.record(
             cmd, &w_gate.mat_buf, acts_buf, gate_buf, w_gate.rows, w_gate.cols);
+        self.ctx.profileEnd(cmd, p_gate);
+        const p_up = self.ctx.profileBegin(cmd, "dense_ffn.up");
         const up_dset   = try up_pl.record(
             cmd, &w_up.mat_buf,   acts_buf, up_buf,   w_up.rows,   w_up.cols);
+        self.ctx.profileEnd(cmd, p_up);
         GpuCtx.recordShaderBarrier(cmd);
 
+        const p_gelu = self.ctx.profileBegin(cmd, "dense_ffn.gelu_mul");
         const gelu_dset = try self.pl_gelu_mul.record(
             cmd, gate_buf, up_buf, w_gate.rows);
+        self.ctx.profileEnd(cmd, p_gelu);
         GpuCtx.recordShaderBarrier(cmd);
 
+        const p_down = self.ctx.profileBegin(cmd, "dense_ffn.down");
         const down_dset = try down_pl.record(
             cmd, &w_down.mat_buf, gate_buf, ffn_buf, w_down.rows, w_down.cols);
+        self.ctx.profileEnd(cmd, p_down);
         GpuCtx.recordShaderBarrier(cmd);
 
+        const p_post_ffw = self.ctx.profileBegin(cmd, "dense_ffn.post_norm");
         const post_ffw_dset = try self.pl_rmsnorm.record(
             cmd, ffn_buf, post_ffw_norm_1_buf, out_buf,
             @intCast(w_down.rows), eps, false);
+        self.ctx.profileEnd(cmd, p_post_ffw);
 
         try self.ctx.submitBatch(cmd);
 
@@ -1635,8 +1706,10 @@ pub const GpuWeights = struct {
 
         // Optional Phase 0: f32 moe_in → Q8_1 in shared_acts_q8_1 once.
         if (use_q8_1_gu) {
+            const p_quant = self.ctx.profileBegin(cmd, "moe.quantize_input");
             quant_dset = try self.pl_quantize_q8_1.record(
                 cmd, in_buf, acts_q8_1, @intCast(moe_in.len));
+            self.ctx.profileEnd(cmd, p_quant);
             GpuCtx.recordShaderBarrier(cmd);
         }
 
@@ -1644,8 +1717,10 @@ pub const GpuWeights = struct {
         for (0..n) |k| {
             const sg = eg_sessions[layer * self.n_experts + top_idx[k]].?;
             const su = eu_sessions[layer * self.n_experts + top_idx[k]].?;
+            const p_gu = self.ctx.profileBegin(cmd, "moe.fused_gate_up");
             fused_dsets[k] = try pl_gu.record(
                 cmd, &sg.mat_buf, &su.mat_buf, gu_in_buf, &mid_bufs[k], sg.rows, sg.cols);
+            self.ctx.profileEnd(cmd, p_gu);
         }
 
         // Barrier: fused writes mid_bufs; either quantize or down reads them.
@@ -1658,8 +1733,10 @@ pub const GpuWeights = struct {
             const sd0 = ed_sessions[layer * self.n_experts + top_idx[0]].?;
             const d_expert: u32 = @intCast(sd0.cols);
             for (0..n) |k| {
+                const p_quant_dn = self.ctx.profileBegin(cmd, "moe.quantize_mid");
                 quant_dn_dsets[k] = try self.pl_quantize_q8_1.record(
                     cmd, &mid_bufs[k], &mid_q8_1_bufs.?[k], d_expert);
+                self.ctx.profileEnd(cmd, p_quant_dn);
             }
             GpuCtx.recordShaderBarrier(cmd);
         }
@@ -1676,17 +1753,21 @@ pub const GpuWeights = struct {
             const dn_in_buf: *const GpuBuffer = if (use_q8_1_dn)
                 &mid_q8_1_bufs.?[k] else &mid_bufs[k];
             const pl_dn = if (use_q8_1_dn) pl_dn_q8_1.? else pl_dn_f32;
+            const p_down = self.ctx.profileBegin(cmd, "moe.down");
             down_dsets[k] = try pl_dn.recordToRange(
                 cmd, &sd.mat_buf, dn_in_buf,
                 all_out_buf.handle, out_off, out_sz, sd.rows, sd.cols);
+            self.ctx.profileEnd(cmd, p_down);
         }
 
         // Barrier: down writes all_out, accum reads all_out
         GpuCtx.recordShaderBarrier(cmd);
 
         // Phase 3: weighted accumulation on GPU
+        const p_accum = self.ctx.profileBegin(cmd, "moe.accum");
         const accum_dset = try self.pl_accum.record(
             cmd, all_out_buf, scales_buf, moe_out_buf, @intCast(d_model), @intCast(n));
+        self.ctx.profileEnd(cmd, p_accum);
 
         try self.ctx.submitBatch(cmd);
 
@@ -1713,7 +1794,7 @@ pub const GpuWeights = struct {
 
 fn isGpuSupported(t: GgmlType) bool {
     return switch (t) {
-        .f32, .q8_0, .q3_k, .q4_k, .q5_1, .q5_0 => true,
+        .f32, .q8_0, .q3_k, .q4_k, .q5_1, .q5_0, .q6_k => true,
         else => false,
     };
 }

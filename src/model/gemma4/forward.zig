@@ -446,11 +446,11 @@ fn mv(
     if (sess_opt) |sess| {
         const gw_ = gw.?;
         if (gw_.q8_1PipelineFor(mat.type_)) |q8_1_pl| {
-            // cols alignment: Q3_K/Q4_K need %256, Q5_0/Q5_1 need %32. The
+            // cols alignment: K-quants need %256, Q5_0/Q5_1 need %32. The
             // q8_1PipelineFor returns null for unsupported types so we only
-            // hit this for the four supported quant families.
+            // hit this for supported quant families.
             const k_aligned = switch (mat.type_) {
-                .q3_k, .q4_k => sess.cols % 256 == 0,
+                .q3_k, .q4_k, .q6_k => sess.cols % 256 == 0,
                 .q5_0, .q5_1 => sess.cols % 32 == 0,
                 else => false,
             };

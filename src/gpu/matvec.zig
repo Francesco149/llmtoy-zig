@@ -85,6 +85,11 @@ pub const MatvecPipeline = struct {
         return initFromSpv(ctx, &shaders.matvec_q5_1_q8_1, 1);
     }
 
+    pub fn initQ6KQ8_1(ctx: *const GpuContext) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_q6_k_q8_1.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.matvec_q6_k_q8_1, 1);
+    }
+
     fn initFromSpv(ctx: *const GpuContext, spv: anytype, rows_per_workgroup: u32) !MatvecPipeline {
         // align(4) on the const in shaders.zig should guarantee this, but
         // assert the actual runtime address in case @embedFile doesn't honour it.
@@ -339,25 +344,7 @@ pub const MatvecPipeline = struct {
         };
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
-        const cmd_alloc = vk.VkCommandBufferAllocateInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            .pNext = null,
-            .commandPool = ctx.cmd_pool,
-            .level = vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            .commandBufferCount = 1,
-        };
-        var cmd: vk.VkCommandBuffer = undefined;
-        if (vk.vkAllocateCommandBuffers(dev, &cmd_alloc, &cmd) != vk.VK_SUCCESS)
-            return error.VkCommandBufferAllocFailed;
-        defer vk.vkFreeCommandBuffers(dev, ctx.cmd_pool, 1, &cmd);
-
-        const begin_ci = vk.VkCommandBufferBeginInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            .pNext = null,
-            .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            .pInheritanceInfo = null,
-        };
-        _ = vk.vkBeginCommandBuffer(cmd, &begin_ci);
+        const cmd = try ctx.beginBatch();
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -368,24 +355,11 @@ pub const MatvecPipeline = struct {
             0, @sizeOf(PushConst), &pc);
 
         const groups = (rows + self.rows_per_workgroup - 1) / self.rows_per_workgroup;
+        const p_mv = ctx.profileBegin(cmd, "matvec.run");
         vk.vkCmdDispatch(cmd, groups, 1, 1);
+        ctx.profileEnd(cmd, p_mv);
 
-        _ = vk.vkEndCommandBuffer(cmd);
-
-        const submit = vk.VkSubmitInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .pNext = null,
-            .waitSemaphoreCount = 0,
-            .pWaitSemaphores = null,
-            .pWaitDstStageMask = null,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &cmd,
-            .signalSemaphoreCount = 0,
-            .pSignalSemaphores = null,
-        };
-        if (vk.vkQueueSubmit(ctx.queue, 1, &submit, null) != vk.VK_SUCCESS)
-            return error.VkQueueSubmitFailed;
-        _ = vk.vkQueueWaitIdle(ctx.queue);
+        try ctx.submitBatch(cmd);
     }
 };
 
@@ -443,6 +417,13 @@ pub const MatvecSession = struct {
         return initBytes(ctx, mat_bytes, rows, cols);
     }
 
+    // Upload a Q6_K quantized matrix (raw GGUF bytes) to VRAM.
+    pub fn initQ6K(ctx: *const GpuContext, mat_bytes: []const u8, rows: u32, cols: u32) !MatvecSession {
+        std.debug.assert(cols % 256 == 0);
+        std.debug.assert(mat_bytes.len == rows * (cols / 256) * 210);
+        return initBytes(ctx, mat_bytes, rows, cols);
+    }
+
     // Upload any GPU-supported quant type. Returns null for unsupported types.
     pub fn initFromRaw(ctx: *const GpuContext, mat_data: []const u8, mat_type: GgmlType, rows: u32, cols: u32) !?MatvecSession {
         return switch (mat_type) {
@@ -452,6 +433,7 @@ pub const MatvecSession = struct {
             .q4_k => try initQ4K(ctx, mat_data, rows, cols),
             .q5_1 => try initQ5_1(ctx, mat_data, rows, cols),
             .q5_0 => try initQ5_0(ctx, mat_data, rows, cols),
+            .q6_k => try initQ6K(ctx, mat_data, rows, cols),
             else  => null,
         };
     }
@@ -2878,7 +2860,9 @@ fn fuzzQuantQ8_1(
     const blocks_per_row = cols / blk_elems;
     for (0..rows) |i| for (0..blocks_per_row) |b| {
         const off = (i * blocks_per_row + b) * blk_bytes;
-        mat[off + 0] = small_d_le[0]; mat[off + 1] = small_d_le[1];
+        const d_off: usize = if (tag == .q6_k) 208 else 0;
+        mat[off + d_off + 0] = small_d_le[0];
+        mat[off + d_off + 1] = small_d_le[1];
         if (tag == .q5_1) {
             mat[off + 2] = small_d_le[0];
             mat[off + 3] = small_d_le[1];
@@ -2961,6 +2945,16 @@ test "gpu matvec Q5_1 × Q8_1 fuzz small" {
 test "gpu matvec Q5_1 × Q8_1 fuzz model-sized" {
     try fuzzQuantQ8_1(.q5_1, 24, 32,
         MatvecPipeline.initQ5_1Q8_1, MatvecSession.initQ5_1, 64, 704, 53);
+}
+
+test "gpu matvec Q6_K × Q8_1 fuzz small" {
+    try fuzzQuantQ8_1(.q6_k, 210, 256,
+        MatvecPipeline.initQ6KQ8_1, MatvecSession.initQ6K, 32, 256, 59);
+}
+
+test "gpu matvec Q6_K × Q8_1 fuzz lm-head-shaped cols" {
+    try fuzzQuantQ8_1(.q6_k, 210, 256,
+        MatvecPipeline.initQ6KQ8_1, MatvecSession.initQ6K, 64, 2816, 61);
 }
 
 // ── rmsnorm fuzz test ─────────────────────────────────────────────────────────
@@ -3529,4 +3523,3 @@ test "gpu elem_scale fuzz" {
     try x_buf.download(std.mem.sliceAsBytes(got));
     for (got, x) |g, xi| try std.testing.expectApproxEqAbs(xi * s, g, 1e-6);
 }
-

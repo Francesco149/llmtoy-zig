@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Stray inference/profile processes
-stray=$(pgrep -af 'llama-cli|llmtoy generate|regression_compare.py|profile_gemma4.sh|perf (record|stat)' 2>/dev/null || true)
+stray=$(pgrep -af 'llama-cli|llmtoy generate|profile_gemma4.sh|perf (record|stat)' 2>/dev/null || true)
 if [[ -n "$stray" ]]; then
     echo "STRAY (stop before benchmarking):"
     echo "$stray"

@@ -110,16 +110,15 @@ Known-good reference source:
    ```
 
    Look especially for stray `llama-cli`, `llmtoy generate`,
-   `regression_compare.py`, `profile_gemma4.sh`, or `perf` processes. A sandboxed
-   Codex `ps` only sees the sandbox namespace unless the command is run outside
-   the sandbox, so use the host check when the number matters.
+   `profile_gemma4.sh`, or `perf` processes. A sandboxed Codex `ps` only sees
+   the sandbox namespace unless the command is run outside the sandbox, so use
+   the host check when the number matters.
 
 ## Known Follow-Ups
 
 - Add stop-string handling for `<turn|>` and ChatML-style end markers.
 - Improve Gemma4 tokenization toward a 1:1 llama.cpp match for punctuation,
   bytes/fallback tokens, and edge-case whitespace.
-- Add direct known-good regression comparisons against llama.cpp and eventually
-  transformers.
+- Add direct known-good CPU/GPU compare fixtures for supported local models.
 - Add Q3_K dequantization fixtures against ggml output.
 - Once correctness regressions are stable, resume CPU/GPU optimization work.

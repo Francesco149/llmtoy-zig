@@ -1,6 +1,191 @@
 const std = @import("std");
 const vk = @import("vk.zig").vk;
 
+const max_profile_events = 4096;
+const max_profile_labels = 256;
+const profile_label_len = 72;
+
+const ProfileEvent = struct {
+    label: [profile_label_len]u8 = [_]u8{0} ** profile_label_len,
+    label_len: u8 = 0,
+    start_query: u32 = 0,
+    end_query: u32 = 0,
+};
+
+const ProfileAggregate = struct {
+    label: [profile_label_len]u8 = [_]u8{0} ** profile_label_len,
+    label_len: u8 = 0,
+    count: u64 = 0,
+    total_ns: u64 = 0,
+    min_ns: u64 = std.math.maxInt(u64),
+    max_ns: u64 = 0,
+};
+
+pub const GpuProfiler = struct {
+    query_pool: vk.VkQueryPool,
+    timestamp_period: f32,
+    events: [max_profile_events]ProfileEvent = undefined,
+    event_count: u32 = 0,
+    query_count: u32 = 0,
+    timestamps: [max_profile_events * 2]u64 = undefined,
+    aggregates: [max_profile_labels]ProfileAggregate = undefined,
+    aggregate_count: u32 = 0,
+    dropped_events: u64 = 0,
+
+    pub fn init(device: vk.VkDevice, timestamp_period: f32) !GpuProfiler {
+        const ci = vk.VkQueryPoolCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+            .queryType = vk.VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = max_profile_events * 2,
+            .pipelineStatistics = 0,
+        };
+        var pool: vk.VkQueryPool = null;
+        if (vk.vkCreateQueryPool(device, &ci, null, &pool) != vk.VK_SUCCESS)
+            return error.VkQueryPoolCreateFailed;
+
+        return .{
+            .query_pool = pool,
+            .timestamp_period = timestamp_period,
+        };
+    }
+
+    pub fn deinit(self: *GpuProfiler, device: vk.VkDevice) void {
+        vk.vkDestroyQueryPool(device, self.query_pool, null);
+    }
+
+    fn resetBatch(self: *GpuProfiler, cmd: vk.VkCommandBuffer) void {
+        self.event_count = 0;
+        self.query_count = 0;
+        vk.vkCmdResetQueryPool(cmd, self.query_pool, 0, max_profile_events * 2);
+    }
+
+    fn begin(self: *GpuProfiler, cmd: vk.VkCommandBuffer, label: []const u8) u32 {
+        if (self.event_count >= max_profile_events or self.query_count + 2 > max_profile_events * 2) {
+            self.dropped_events += 1;
+            return std.math.maxInt(u32);
+        }
+
+        const event_id = self.event_count;
+        self.event_count += 1;
+        const start_query = self.query_count;
+        self.query_count += 1;
+
+        var ev = &self.events[event_id];
+        const n = @min(label.len, profile_label_len);
+        @memset(&ev.label, 0);
+        @memcpy(ev.label[0..n], label[0..n]);
+        ev.label_len = @intCast(n);
+        ev.start_query = start_query;
+        ev.end_query = std.math.maxInt(u32);
+
+        vk.vkCmdWriteTimestamp(cmd, vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            self.query_pool, start_query);
+        return event_id;
+    }
+
+    fn end(self: *GpuProfiler, cmd: vk.VkCommandBuffer, event_id: u32) void {
+        if (event_id == std.math.maxInt(u32) or event_id >= self.event_count) return;
+        if (self.query_count >= max_profile_events * 2) {
+            self.dropped_events += 1;
+            return;
+        }
+        const end_query = self.query_count;
+        self.query_count += 1;
+        self.events[event_id].end_query = end_query;
+        vk.vkCmdWriteTimestamp(cmd, vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            self.query_pool, end_query);
+    }
+
+    fn collectBatch(self: *GpuProfiler, device: vk.VkDevice) void {
+        if (self.query_count == 0) return;
+        const rc = vk.vkGetQueryPoolResults(
+            device,
+            self.query_pool,
+            0,
+            self.query_count,
+            self.query_count * @sizeOf(u64),
+            @ptrCast(&self.timestamps),
+            @sizeOf(u64),
+            vk.VK_QUERY_RESULT_64_BIT | vk.VK_QUERY_RESULT_WAIT_BIT,
+        );
+        if (rc != vk.VK_SUCCESS) {
+            self.dropped_events += self.event_count;
+            return;
+        }
+
+        for (self.events[0..self.event_count]) |ev| {
+            if (ev.end_query == std.math.maxInt(u32)) continue;
+            const start = self.timestamps[ev.start_query];
+            const end_ts = self.timestamps[ev.end_query];
+            if (end_ts < start) continue;
+            const ns_f = @as(f64, @floatFromInt(end_ts - start)) *
+                @as(f64, @floatCast(self.timestamp_period));
+            const ns: u64 = @intFromFloat(ns_f);
+            self.addAggregate(ev.label[0..ev.label_len], ns);
+        }
+    }
+
+    fn addAggregate(self: *GpuProfiler, label: []const u8, ns: u64) void {
+        for (self.aggregates[0..self.aggregate_count]) |*agg| {
+            if (agg.label_len == label.len and
+                std.mem.eql(u8, agg.label[0..agg.label_len], label))
+            {
+                agg.count += 1;
+                agg.total_ns += ns;
+                agg.min_ns = @min(agg.min_ns, ns);
+                agg.max_ns = @max(agg.max_ns, ns);
+                return;
+            }
+        }
+
+        if (self.aggregate_count >= max_profile_labels) {
+            self.dropped_events += 1;
+            return;
+        }
+
+        const idx = self.aggregate_count;
+        self.aggregate_count += 1;
+        var agg = &self.aggregates[idx];
+        @memset(&agg.label, 0);
+        @memcpy(agg.label[0..label.len], label);
+        agg.label_len = @intCast(label.len);
+        agg.count = 1;
+        agg.total_ns = ns;
+        agg.min_ns = ns;
+        agg.max_ns = ns;
+    }
+
+    pub fn print(self: *const GpuProfiler) void {
+        if (self.aggregate_count == 0 and self.dropped_events == 0) return;
+
+        var total_ns: u64 = 0;
+        for (self.aggregates[0..self.aggregate_count]) |agg| total_ns += agg.total_ns;
+
+        std.debug.print("\nGPU profile (timestamp queries):\n", .{});
+        std.debug.print("{s: <36} {s: >8} {s: >12} {s: >10} {s: >10} {s: >10} {s: >7}\n",
+            .{ "label", "count", "total ms", "avg us", "min us", "max us", "%" });
+
+        for (self.aggregates[0..self.aggregate_count]) |agg| {
+            const total_ms = @as(f64, @floatFromInt(agg.total_ns)) / 1_000_000.0;
+            const avg_us = @as(f64, @floatFromInt(agg.total_ns)) /
+                @as(f64, @floatFromInt(agg.count)) / 1_000.0;
+            const min_us = @as(f64, @floatFromInt(agg.min_ns)) / 1_000.0;
+            const max_us = @as(f64, @floatFromInt(agg.max_ns)) / 1_000.0;
+            const pct = if (total_ns == 0) 0.0 else
+                100.0 * @as(f64, @floatFromInt(agg.total_ns)) /
+                @as(f64, @floatFromInt(total_ns));
+            std.debug.print("{s: <36} {d: >8} {d: >12.3} {d: >10.2} {d: >10.2} {d: >10.2} {d: >6.1}\n",
+                .{ agg.label[0..agg.label_len], agg.count, total_ms, avg_us, min_us, max_us, pct });
+        }
+
+        if (self.dropped_events != 0) {
+            std.debug.print("GPU profile dropped events: {}\n", .{self.dropped_events});
+        }
+    }
+};
+
 pub const GpuContext = struct {
     instance: vk.VkInstance,
     phys_dev: vk.VkPhysicalDevice,
@@ -8,6 +193,7 @@ pub const GpuContext = struct {
     queue: vk.VkQueue,
     queue_family: u32,
     cmd_pool: vk.VkCommandPool,
+    profiler: ?*GpuProfiler,
 
     pub fn init() !GpuContext {
         // We require Vulkan 1.3 for shaderIntegerDotProduct (core in 1.3) plus
@@ -125,6 +311,9 @@ pub const GpuContext = struct {
         var queue: vk.VkQueue = undefined;
         vk.vkGetDeviceQueue(device, queue_family, 0, &queue);
 
+        var props: vk.VkPhysicalDeviceProperties = undefined;
+        vk.vkGetPhysicalDeviceProperties(phys_dev, &props);
+
         // Command pool (reset-able)
         const pool_ci = vk.VkCommandPoolCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -136,6 +325,12 @@ pub const GpuContext = struct {
         if (vk.vkCreateCommandPool(device, &pool_ci, null, &cmd_pool) != vk.VK_SUCCESS)
             return error.VkCommandPoolCreateFailed;
 
+        var profiler: ?*GpuProfiler = null;
+        if (std.c.getenv("LLMTOY_GPU_PROFILE") != null) {
+            profiler = try std.heap.page_allocator.create(GpuProfiler);
+            profiler.?.* = try GpuProfiler.init(device, props.limits.timestampPeriod);
+        }
+
         return .{
             .instance = instance,
             .phys_dev = phys_dev,
@@ -143,10 +338,16 @@ pub const GpuContext = struct {
             .queue = queue,
             .queue_family = queue_family,
             .cmd_pool = cmd_pool,
+            .profiler = profiler,
         };
     }
 
     pub fn deinit(self: *GpuContext) void {
+        if (self.profiler) |p| {
+            p.print();
+            p.deinit(self.device);
+            std.heap.page_allocator.destroy(p);
+        }
         vk.vkDestroyCommandPool(self.device, self.cmd_pool, null);
         vk.vkDestroyDevice(self.device, null);
         vk.vkDestroyInstance(self.instance, null);
@@ -201,7 +402,17 @@ pub const GpuContext = struct {
             .pInheritanceInfo = null,
         };
         _ = vk.vkBeginCommandBuffer(cmd, &begin_ci);
+        if (self.profiler) |p| p.resetBatch(cmd);
         return cmd;
+    }
+
+    pub fn profileBegin(self: *const GpuContext, cmd: vk.VkCommandBuffer, label: []const u8) u32 {
+        if (self.profiler) |p| return p.begin(cmd, label);
+        return std.math.maxInt(u32);
+    }
+
+    pub fn profileEnd(self: *const GpuContext, cmd: vk.VkCommandBuffer, event_id: u32) void {
+        if (self.profiler) |p| p.end(cmd, event_id);
     }
 
     pub fn recordCopy(cmd: vk.VkCommandBuffer, src: vk.VkBuffer, dst: vk.VkBuffer, size: vk.VkDeviceSize) void {
@@ -275,6 +486,7 @@ pub const GpuContext = struct {
         if (vk.vkQueueSubmit(self.queue, 1, &submit, null) != vk.VK_SUCCESS)
             return error.VkQueueSubmitFailed;
         _ = vk.vkQueueWaitIdle(self.queue);
+        if (self.profiler) |p| p.collectBatch(self.device);
     }
 
     // Copy `size` bytes from src[src_offset..] to dst[dst_offset..] in a

@@ -102,22 +102,6 @@ nix shell nixpkgs#llama-cpp -c llama-cli \
   --simple-io
 ```
 
-The regression helper runs both commands sequentially and prints compact output
-for visual inspection:
-
-```sh
-nix develop --command python3 scripts/regression_compare.py \
-  --model "$MODEL" \
-  --prompt "$PROMPT" \
-  --chat \
-  --max-tokens 32 \
-  --threads 12 \
-  --temperature 0.1 \
-  --top-k 40 \
-  --top-p 0.9 \
-  --expect-substring MoE
-```
-
 ## Roadmap
 
 See [docs/roadmap.md](docs/roadmap.md) for the phase-by-phase plan.
