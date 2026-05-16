@@ -30,6 +30,8 @@ const ElemScalePipeline   = mv_mod.ElemScalePipeline;
 const GeluMulPipeline     = mv_mod.GeluMulPipeline;
 const RopeNeoxTablePipeline = mv_mod.RopeNeoxTablePipeline;
 const RopeNeoxThetaPipeline = mv_mod.RopeNeoxThetaPipeline;
+const AttnQkSoftmaxPipeline = mv_mod.AttnQkSoftmaxPipeline;
+const AttnAvPipeline        = mv_mod.AttnAvPipeline;
 const wt_                = @import("weights.zig");
 const Gemma4Weights      = wt_.Gemma4Weights;
 const Gemma4LayerWeights = wt_.Gemma4LayerWeights;
@@ -102,6 +104,8 @@ pub const GpuWeights = struct {
     pl_gelu_mul:     GeluMulPipeline,
     pl_rope_table:   RopeNeoxTablePipeline,
     pl_rope_theta:   RopeNeoxThetaPipeline,
+    pl_attn_qk:      AttnQkSoftmaxPipeline,
+    pl_attn_av:      AttnAvPipeline,
     layers:     []GpuLayerWeights,
     lm_head:    ?MatvecSession,
     // Shared host-coherent I/O buffers sized to the largest matrix across all
@@ -187,6 +191,13 @@ pub const GpuWeights = struct {
     v_vram:   ?[]GpuBuffer,
     kv_cap:   ?[]usize,
     kv_stage: ?GpuBuffer,
+    // 7l.2/3 — fused-attention scratch.
+    //   scores_vram: device-local; n_heads * max(cap[l]) floats. Written by
+    //               attn_qk_softmax shader, read by attn_av shader.
+    //   attn_max_win: max(cap[l]) across layers (for scores stride).
+    // Allocated alongside k_vram/v_vram in initKvVram.
+    scores_vram: ?GpuBuffer,
+    attn_max_win: usize,
     allocator:   std.mem.Allocator,
 
     pub fn init(g4w: *const Gemma4Weights, g4cfg: Gemma4Config, allocator: std.mem.Allocator) !GpuWeights {
@@ -263,6 +274,10 @@ pub const GpuWeights = struct {
         errdefer pl_rope_table.deinit();
         var pl_rope_theta = try RopeNeoxThetaPipeline.init(&ctx);
         errdefer pl_rope_theta.deinit();
+        var pl_attn_qk = try AttnQkSoftmaxPipeline.init(&ctx);
+        errdefer pl_attn_qk.deinit();
+        var pl_attn_av = try AttnAvPipeline.init(&ctx);
+        errdefer pl_attn_av.deinit();
         std.debug.print("  init: pl_rmsnorm + elem + rope ok\n", .{});
 
         const layers = try allocator.alloc(GpuLayerWeights, g4cfg.n_layers);
@@ -292,6 +307,7 @@ pub const GpuWeights = struct {
             .pl_elem_add = pl_elem_add,
             .pl_elem_scale = pl_elem_scale, .pl_gelu_mul = pl_gelu_mul,
             .pl_rope_table = pl_rope_table, .pl_rope_theta = pl_rope_theta,
+            .pl_attn_qk = pl_attn_qk, .pl_attn_av = pl_attn_av,
             .layers = layers, .lm_head = null,
             .shared_vec = null, .shared_out = null,
             .shared_acts_q8_1 = null,
@@ -308,6 +324,7 @@ pub const GpuWeights = struct {
             .q_out_buf = null, .k_out_buf = null, .v_out_buf = null,
             .gate_out_buf = null, .up_out_buf = null,
             .k_vram = null, .v_vram = null, .kv_cap = null, .kv_stage = null,
+            .scores_vram = null, .attn_max_win = 0,
             .allocator = allocator,
         };
         errdefer gw.deinit();
@@ -569,14 +586,31 @@ pub const GpuWeights = struct {
         }
 
         const stage = try GpuBuffer.initStaging(&self.ctx, max_nkv * @sizeOf(f32));
+        errdefer {
+            var s = stage; s.deinit();
+        }
+
+        // 7l.2/3 — scores buffer for the fused-attention chain. Sized to
+        // n_heads × max(cap[l]) floats so the largest layer fits.
+        var max_cap: usize = 0;
+        for (cap) |c| {
+            if (c > max_cap) max_cap = c;
+        }
+        const scores_bytes = cfg.n_heads * max_cap * @sizeOf(f32);
+        const scores = try GpuBuffer.initDeviceLocal(&self.ctx, scores_bytes,
+            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
         self.k_vram = k;
         self.v_vram = v;
         self.kv_cap = cap;
         self.kv_stage = stage;
+        self.scores_vram = scores;
+        self.attn_max_win = max_cap;
 
-        std.debug.print("  KV VRAM: total={} MiB, stage={} KiB\n",
-            .{ total_bytes / (1024 * 1024), (max_nkv * @sizeOf(f32)) / 1024 });
+        std.debug.print("  KV VRAM: total={} MiB, stage={} KiB, scores={} KiB\n",
+            .{ total_bytes / (1024 * 1024),
+               (max_nkv * @sizeOf(f32)) / 1024,
+               scores_bytes / 1024 });
     }
 
     // Upload one position's K or V row into the per-layer VRAM cache at slot.
@@ -616,6 +650,7 @@ pub const GpuWeights = struct {
     }
 
     pub fn deinit(self: *GpuWeights) void {
+        if (self.scores_vram) |*b| b.deinit();
         if (self.kv_stage) |*b| b.deinit();
         if (self.kv_cap)   |c| self.allocator.free(c);
         if (self.v_vram) |bs| {
@@ -668,6 +703,8 @@ pub const GpuWeights = struct {
         self.pl_fused_gu.deinit();
         self.pl_q5_0.deinit();
         self.pl_q5_1.deinit();
+        self.pl_attn_av.deinit();
+        self.pl_attn_qk.deinit();
         self.pl_rope_theta.deinit();
         self.pl_rope_table.deinit();
         self.pl_gelu_mul.deinit();
@@ -1036,6 +1073,61 @@ pub const GpuWeights = struct {
         try v_buf.download(std.mem.sliceAsBytes(v_out));
     }
 
+    // 7l.2/3 — GPU attention compute. Replaces the per-head CPU sdpAttn loop.
+    //
+    // Reads:
+    //   - Q from q_out_buf (host-coherent — GPU still reads it; has the rope'd
+    //     norm'd Q for this token, written by runLayerAttnQ8_1KvVram).
+    //   - K from k_vram[layer] (per-layer VRAM cache, populated by 7l.1c).
+    //   - V from v_vram[layer] (per-layer VRAM cache).
+    //
+    // Writes:
+    //   - attn_in_buf (host-coherent, sized max_nq). After this submit, the
+    //     wo input is already on the GPU side; runLayerAttnResidualDenseFfnQ8_1
+    //     should skip its own upload (caller passes skip_attn_upload=true).
+    //
+    // For verification / non-full-fused wo paths, the caller can also receive
+    // a CPU copy of attn_concat via `attn_out`. Pass null to skip the download.
+    pub fn runLayerAttention(
+        self: *const GpuWeights,
+        layer: usize,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        pos: u32,
+        win_len: u32,
+        cap: u32,
+        scale: f32,
+        attn_out: ?[]f32,
+    ) !void {
+        const q_buf      = &(self.q_out_buf orelse return error.NotOnGpu);
+        const k_cache    = &((self.k_vram orelse return error.NotOnGpu)[layer]);
+        const v_cache    = &((self.v_vram orelse return error.NotOnGpu)[layer]);
+        const scores_buf = &(self.scores_vram orelse return error.NotOnGpu);
+        const attn_buf   = &(self.attn_in_buf orelse return error.NotOnGpu);
+
+        const seq = pos + 1;
+        const n_q_per_kv = n_heads / n_kv_heads;
+
+        const cmd = try self.ctx.beginBatch();
+        const qk_dset = try self.pl_attn_qk.record(
+            cmd, q_buf, k_cache, scores_buf,
+            n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
+        GpuCtx.recordShaderBarrier(cmd);
+        const av_dset = try self.pl_attn_av.record(
+            cmd, scores_buf, v_cache, attn_buf,
+            n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap);
+        try self.ctx.submitBatch(cmd);
+
+        const dev = self.ctx.device;
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_attn_qk.desc_pool, 1, &qk_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_attn_av.desc_pool, 1, &av_dset);
+
+        if (attn_out) |o| {
+            try attn_buf.download(std.mem.sliceAsBytes(o));
+        }
+    }
+
     // Pipeline for the Q8_1-activation integer-dot path. Returns null when
     // the weight type has no Q8_1 shader yet (Q5_K, Q5_0, Q5_1, Q8_0, IQ4_NL,
     // F32 — these would either fall back to the f32-activation path or run
@@ -1288,6 +1380,7 @@ pub const GpuWeights = struct {
         x: []f32,                          // in: unnormalized residual; out: x + post_attn_norm(wo(attn_concat))
         attn_concat: []const f32,          // CPU sdpAttn output, length = nq
         ffn_out: []f32,                    // post_ffw_norm_1 result (d_model)
+        skip_attn_upload: bool,            // 7l.2/3: GPU attention already wrote attn_in_buf
     ) !void {
         const lw     = &self.layers[layer];
         const wo     = lw.wo     orelse return error.NotOnGpu;
@@ -1318,7 +1411,9 @@ pub const GpuWeights = struct {
         const out_buf     = &(self.dense_ffn_out_buf orelse return error.NotOnGpu);
 
         try x_buf.upload(std.mem.sliceAsBytes(x));
-        try attn_in_buf.upload(std.mem.sliceAsBytes(attn_concat));
+        if (!skip_attn_upload) {
+            try attn_in_buf.upload(std.mem.sliceAsBytes(attn_concat));
+        }
 
         const cmd = try self.ctx.beginBatch();
 

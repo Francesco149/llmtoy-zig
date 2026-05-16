@@ -243,30 +243,40 @@ pub fn forwardOne(
         const start   = if (seq > win_len) seq - win_len else 0;
         _ = start; // used implicitly via kv_slot math below
 
-        // Compute attention for each Q head.
-        @memset(attn_concat[0..nq_l], 0.0);
-        for (0..cfg.n_heads) |h| {
-            const kv_h = h / (cfg.n_heads / n_kv_l);
+        // Compute attention. 7l.2/3 GPU path is taken when the 7l.1c QKV+norm
+        // chain ran (so Q is in q_out_buf and K/V live in k_vram/v_vram).
+        // Attention output is written to attn_in_buf on the GPU side; we
+        // download to attn_concat so the non-full-fused wo path can read it,
+        // and pass skip_attn_upload=true to the full-fused path below.
+        const use_gpu_attn = gpu_did_norms_and_rope;
+        if (use_gpu_attn) {
+            try gpu.?.runLayerAttention(l,
+                @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd),
+                @intCast(pos), @intCast(win_len), @intCast(kv_cap_l), 1.0,
+                attn_concat[0..nq_l]);
+        } else {
+            @memset(attn_concat[0..nq_l], 0.0);
+            for (0..cfg.n_heads) |h| {
+                const kv_h = h / (cfg.n_heads / n_kv_l);
 
-            // Gather K and V for this head from the circular KV cache.
-            const ks = ks_head[0..win_len * hd];
-            const vs = vs_head[0..win_len * hd];
-            for (0..win_len) |wi| {
-                // wi=0 is the oldest position, wi=win_len-1 is current (pos).
-                const abs_pos = (seq - win_len) + wi;
-                const slot    = abs_pos % kv_cap_l;
-                @memcpy(ks[wi * hd ..][0..hd], kv.k[l][slot * kv_nkv + kv_h * hd ..][0..hd]);
-                @memcpy(vs[wi * hd ..][0..hd], kv.v[l][slot * kv_nkv + kv_h * hd ..][0..hd]);
+                const ks = ks_head[0..win_len * hd];
+                const vs = vs_head[0..win_len * hd];
+                for (0..win_len) |wi| {
+                    const abs_pos = (seq - win_len) + wi;
+                    const slot    = abs_pos % kv_cap_l;
+                    @memcpy(ks[wi * hd ..][0..hd], kv.k[l][slot * kv_nkv + kv_h * hd ..][0..hd]);
+                    @memcpy(vs[wi * hd ..][0..hd], kv.v[l][slot * kv_nkv + kv_h * hd ..][0..hd]);
+                }
+
+                try attn_mod.sdpAttn(
+                    attn_concat[h * hd ..][0..hd],
+                    q[h * hd ..][0..hd],
+                    ks, vs,
+                    win_len, hd,
+                    1.0, // Gemma4 uses scale=1.0 (per-head Q/K norms control magnitude)
+                    allocator,
+                );
             }
-
-            try attn_mod.sdpAttn(
-                attn_concat[h * hd ..][0..hd],
-                q[h * hd ..][0..hd],
-                ks, vs,
-                win_len, hd,
-                1.0, // Gemma4 uses scale=1.0 (per-head Q/K norms control magnitude)
-                allocator,
-            );
         }
 
         // Output projection → post-attention norm → first residual.
@@ -298,7 +308,8 @@ pub fn forwardOne(
             try g.runLayerAttnResidualDenseFfnQ8_1(l, cfg.eps,
                 wo_q8_pl.?, gate_q8_pl.?, up_q8_pl.?,
                 g.pipelineFor(lw.w_down.type_),
-                x, attn_concat[0..nq_l], ffn_buf);
+                x, attn_concat[0..nq_l], ffn_buf,
+                use_gpu_attn);
             // x updated with post-attn residual; ffn_buf has post_ffw_norm_1.
         } else if (can_fused_dense) {
             const g = gpu.?;
