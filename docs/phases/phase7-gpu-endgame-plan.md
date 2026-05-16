@@ -293,12 +293,13 @@ nix develop --command ./zig-out/bin/llmtoy bench-matvec <model.gguf> \
   --iters 256 --target L0.attn_q
 ```
 
-Current targets are `lm_head`, `L0.attn_q`, `L0.attn_q.r4`, `L0.attn_v`,
-`L0.attn_v.r4`, `L3.attn_v`, `L5.attn_q`, `L0.dense_down`,
+Current targets are `lm_head`, `lm_head.fast`, `L0.attn_q`, `L0.attn_q.r4`,
+`L0.attn_v`, `L0.attn_v.r4`, `L3.attn_v`, `L5.attn_q`, `L0.dense_down`,
 `L5.dense_down`, `L0.expert_down`, and `L10.expert_down`. They cover Q3_K,
 Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, and IQ4_NL with the target model's actual
 row/column sizes. The `.r4` targets are experimental Q4_K row-batching probes,
-not production routes.
+and `lm_head.fast` is an experimental Q6_K packed-decode probe; neither is a
+production route.
 
 End-to-end tok/s is too noisy for shader iteration. Add a command or test-only
 binary that runs one GPU kernel shape thousands of times with fixed buffers.
@@ -368,6 +369,21 @@ First Q4_K row-batching probe:
   target, but do not route generation through it. The next MMVQ attempt should
   port llama.cpp's framework more faithfully rather than only changing
   `local_size_y`.
+
+First Q6_K packed-decode probe:
+
+- `matvec_q6_k_q8_1_fast.glsl` keeps the current one-row dispatch shape but
+  decodes four Q6 values at a time from packed byte words.
+- A u32-reinterpreted Q6_K struct failed fuzz; keep the byte layout unless a
+  dedicated repack step is added.
+- Correct byte-layout version passes Q6_K x Q8_1 fuzz with `rel=6.963e-8`
+  small and `rel=2.384e-7` lm-head-shaped.
+- Bench result: current `lm_head` 2032.90 us wall / 1034.10 us GPU; packed
+  decode 2033.22 us wall / 1001.17 us GPU. This is not a production win.
+- Conclusion: local decode cleanup is not enough. The next Q6_K attempt should
+  port llama.cpp's `mul_mat_vecq.comp`/`mul_mat_vec_q6_k.comp` loop structure
+  more directly, including `K_PER_ITER`, `BLOCK_SIZE`, and specialization
+  variants.
 
 ---
 

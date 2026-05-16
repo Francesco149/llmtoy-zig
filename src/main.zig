@@ -348,6 +348,7 @@ const BenchPipelines = struct {
     q5_1: gpu_matvec.MatvecPipeline,
     q5_k: gpu_matvec.MatvecPipeline,
     q6_k: gpu_matvec.MatvecPipeline,
+    q6_k_fast: gpu_matvec.MatvecPipeline,
     iq4_nl: gpu_matvec.MatvecPipeline,
     quant: gpu_matvec.QuantizeQ8_1Pipeline,
 
@@ -366,6 +367,8 @@ const BenchPipelines = struct {
         errdefer q5_k.deinit();
         var q6_k = try gpu_matvec.MatvecPipeline.initQ6KQ8_1(ctx);
         errdefer q6_k.deinit();
+        var q6_k_fast = try gpu_matvec.MatvecPipeline.initQ6KQ8_1Fast(ctx);
+        errdefer q6_k_fast.deinit();
         var iq4_nl = try gpu_matvec.MatvecPipeline.initIQ4NLQ8_1(ctx);
         errdefer iq4_nl.deinit();
         var quant = try gpu_matvec.QuantizeQ8_1Pipeline.init(ctx);
@@ -374,7 +377,7 @@ const BenchPipelines = struct {
             .q3_k = q3_k, .q4_k = q4_k,
             .q4_k_r4 = q4_k_r4,
             .q5_0 = q5_0, .q5_1 = q5_1,
-            .q5_k = q5_k, .q6_k = q6_k,
+            .q5_k = q5_k, .q6_k = q6_k, .q6_k_fast = q6_k_fast,
             .iq4_nl = iq4_nl, .quant = quant,
         };
     }
@@ -382,6 +385,7 @@ const BenchPipelines = struct {
     fn deinit(self: *BenchPipelines) void {
         self.quant.deinit();
         self.iq4_nl.deinit();
+        self.q6_k_fast.deinit();
         self.q6_k.deinit();
         self.q5_k.deinit();
         self.q5_1.deinit();
@@ -434,10 +438,11 @@ fn cmdBenchMatvec(
 
     var ran: usize = 0;
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "lm_head", weights.lm_head, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q6_k_fast, &pipes.quant, opts, &ran, "lm_head.fast", weights.lm_head, .q6_k, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L0.attn_q", weights.layers[0].wq, gpa, io);
-    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_r4, &pipes.quant, opts, &ran, "L0.attn_q.r4", weights.layers[0].wq, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_r4, &pipes.quant, opts, &ran, "L0.attn_q.r4", weights.layers[0].wq, .q4_k, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L0.attn_v", weights.layers[0].wv.?, gpa, io);
-    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_r4, &pipes.quant, opts, &ran, "L0.attn_v.r4", weights.layers[0].wv.?, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_r4, &pipes.quant, opts, &ran, "L0.attn_v.r4", weights.layers[0].wv.?, .q4_k, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L3.attn_v", weights.layers[3].wv.?, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L5.attn_q", weights.layers[5].wq, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L0.dense_down", weights.layers[0].w_down, gpa, io);
@@ -475,10 +480,11 @@ fn benchWithPipelineIfSelected(
     ran: *usize,
     name: []const u8,
     mat: g4_weights.RawMatrix,
+    expected_type: gguf_types.GgmlType,
     gpa: std.mem.Allocator,
     io: std.Io,
 ) !void {
-    if (mat.type_ != .q4_k) return;
+    if (mat.type_ != expected_type) return;
     if (opts.target) |t| if (!std.mem.eql(u8, t, name) and !std.mem.eql(u8, t, "all")) return;
     try benchOneMatvecWithPipeline(out, ctx, pipeline, quant, name, mat, opts.iters, opts.reuse_descriptor, gpa, io);
     ran.* += 1;

@@ -455,6 +455,34 @@ Interpretation:
   per-layer dispatches, while the shader track continues with a faithful MMVQ
   port for large tensors.
 
+### Q6_K packed-decode probe
+
+Added an experimental bench-only `matvec_q6_k_q8_1_fast.glsl` target exposed as
+`lm_head.fast`. The first attempt used a u32-reinterpreted Q6_K block struct and
+failed fuzz because the shader-side layout did not match the GGUF bytes. The
+correct version keeps the proven byte layout and only changes the decode path:
+it loads four Q6 low/high bytes into packed u32 words, unpacks four signed i8
+values, then uses the same `dotPacked4x8EXT` accumulation as the current Q6_K
+shader.
+
+Validation:
+
+- Q6_K x Q8_1 fast fuzz small: `rel=6.963e-8`
+- Q6_K x Q8_1 fast lm-head-shaped cols: `rel=2.384e-7`
+
+Bench results on `lm_head`:
+
+| Mode | wall us, no profiler | GPU us, profiler |
+|------|----------------------|------------------|
+| current Q6_K | 2032.90 | 1034.10 |
+| packed decode | 2033.22 | 1001.17 |
+
+Interpretation: packed decode slightly reduces measured kernel time in the
+timestamp run, but it does not improve wall-clock throughput. This is not worth
+routing into generation as-is. It remains useful as a correctness-checked
+comparison target while the real Q6_K MMVQ port moves toward llama.cpp's
+`K_PER_ITER`/`NUM_ROWS` framework rather than another local decode tweak.
+
 The submit-count reductions buy ~150–300 µs/token in saved overhead. On
 RX 7800 XT with our shaders the absolute per-submit cost (~150 µs) is
 small relative to the 220 ms of GPU matmul work per token, so each saved

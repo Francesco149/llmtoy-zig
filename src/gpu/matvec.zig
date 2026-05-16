@@ -96,6 +96,11 @@ pub const MatvecPipeline = struct {
         return initFromSpv(ctx, &shaders.matvec_q6_k_q8_1, 1);
     }
 
+    pub fn initQ6KQ8_1Fast(ctx: *const GpuContext) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_q6_k_q8_1_fast.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.matvec_q6_k_q8_1_fast, 1);
+    }
+
     pub fn initQ5KQ8_1(ctx: *const GpuContext) !MatvecPipeline {
         comptime std.debug.assert(shaders.matvec_q5_k_q8_1.len % 4 == 0);
         return initFromSpv(ctx, &shaders.matvec_q5_k_q8_1, 1);
@@ -3025,6 +3030,16 @@ test "gpu matvec Q6_K × Q8_1 fuzz small" {
 test "gpu matvec Q6_K × Q8_1 fuzz lm-head-shaped cols" {
     try fuzzQuantQ8_1(.q6_k, 210, 256,
         MatvecPipeline.initQ6KQ8_1, MatvecSession.initQ6K, 64, 2816, 61);
+}
+
+test "gpu matvec Q6_K × Q8_1 fast fuzz small" {
+    try fuzzQuantQ8_1(.q6_k, 210, 256,
+        MatvecPipeline.initQ6KQ8_1Fast, MatvecSession.initQ6K, 32, 256, 63);
+}
+
+test "gpu matvec Q6_K × Q8_1 fast fuzz lm-head-shaped cols" {
+    try fuzzQuantQ8_1(.q6_k, 210, 256,
+        MatvecPipeline.initQ6KQ8_1Fast, MatvecSession.initQ6K, 64, 2816, 65);
 }
 
 test "gpu matvec Q5_K × Q8_1 fuzz small" {
