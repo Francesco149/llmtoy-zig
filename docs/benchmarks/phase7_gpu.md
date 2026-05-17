@@ -516,6 +516,81 @@ step is not `NUM_ROWS > 1`; it is closing the structural gap with llama.cpp's
 Q6_K port by adding packed16-style views / repacking, the `sccache` scale cache,
 and the exact `itid`/`ix` offset schedule from `mul_mat_vec_q6_k.comp`.
 
+### Q6_K MMVQ q8-helper rewrite and NUM_ROWS sweep
+
+Corrected the Q6_K MMVQ direction after re-reading llama.cpp: for Q8_1
+activation MMVQ the relevant implementation is `mul_mat_vecq.comp` plus the
+`DATA_A_Q6_K` section in `mul_mat_vecq_funcs.glsl`, not the f32-activation
+`mul_mat_vec_q6_k.comp` scale-cache path. The shader now mirrors the Q8_1
+helper structure:
+
+- preload one Q8_1 block into `cache_b_qs[4]` and `cache_b_ds`
+- use `repack4(ib_a, iqs)` over Q6_K data
+- use `get_d_scale(ib_a, iqs)` and `mmvq_dot_product(...)`
+- keep `BLOCK_SIZE` and `NUM_ROWS` as specialization constants
+
+Added `lm_head.mmvq.b64.r2` and `lm_head.mmvq.b64.r4`.
+
+Correctness:
+
+| Variant | lm-head-shaped rel |
+|---------|--------------------|
+| b64/r2 | `2.659e-7` |
+| b64/r4 | `1.590e-7` |
+
+Bench snapshot:
+
+| Target | GPU us, profiler |
+|--------|------------------|
+| `lm_head` | 1047.38 |
+| `lm_head.fast` | 1003.59 |
+| `lm_head.mmvq.b32.r1` | 1167.04 |
+| `lm_head.mmvq.b64.r1` | 1146.15 |
+| `lm_head.mmvq.b64.r2` | 1077.15 |
+| `lm_head.mmvq.b64.r4` | 1112.46 |
+
+`NUM_ROWS=2` helps, but the MMVQ port still does not beat the current one-row
+Q6_K shader or packed-decode probe. The remaining structural gap is now likely
+the memory view/layout side: llama.cpp's generated shaders read Q6_K through
+`block_q6_K_packed16`, while llmtoy still reconstructs 16-bit pieces from
+byte arrays in the shader. The next step should add an upload-time packed16
+view or separate repacked session for MMVQ kernels, then rerun the same b64/r2
+benchmark before touching production routing.
+
+Follow-up structural pass:
+
+- Added a same-binding `block_q6_K_packed16` view to
+  `matvec_q6_k_q8_1_mmvq.glsl`. The raw byte view remains in place for
+  `scales` and `d`, matching llama.cpp's Q6_K helper behavior.
+- Replaced the full shared-memory reduction tree with llama.cpp's safe
+  `USE_SUBGROUP_ADD` shape: `subgroupAdd` within each subgroup, then a tiny
+  shared-memory sum across subgroup partials.
+
+Correctness after packed16 + subgroup reduction:
+
+| Variant | lm-head-shaped rel |
+|---------|--------------------|
+| b64/r1 | `1.947e-7` |
+| b64/r2 | `2.991e-7` |
+| b64/r4 | `1.590e-7` |
+
+Focused timestamp snapshot, 64 iterations:
+
+| Target | GPU us, profiler |
+|--------|------------------|
+| `lm_head` | 1025.31 |
+| `lm_head.mmvq.b64.r1` | 1020.66 |
+| `lm_head.mmvq.b64.r4` | 1058.60 |
+
+This is the first correctness-checked MMVQ variant to narrowly beat the current
+Q6_K `lm_head` kernel on GPU timestamps, but the margin is only about 0.5% and
+single-target wall times remain noisy. Treat `b64/r1` as the current best
+MMVQ candidate, not as enough evidence to route production generation through
+it. The next shader-side check is llama.cpp's 4-then-2 manual unroll schedule;
+if that does not produce a larger win, the remaining parity gap is likely not
+inside this isolated Q6_K matvec but in bringing the same generated MMVQ family
+to Q3_K/Q4_K and reducing per-layer dispatch structure.
+
 The submit-count reductions buy ~150–300 µs/token in saved overhead. On
 RX 7800 XT with our shaders the absolute per-submit cost (~150 µs) is
 small relative to the 220 ms of GPU matmul work per token, so each saved

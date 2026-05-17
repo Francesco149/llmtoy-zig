@@ -294,8 +294,9 @@ nix develop --command ./zig-out/bin/llmtoy bench-matvec <model.gguf> \
 ```
 
 Current targets are `lm_head`, `lm_head.fast`, `lm_head.mmvq.b32.r1`,
-`lm_head.mmvq.b64.r1`, `L0.attn_q`, `L0.attn_q.r4`, `L0.attn_v`,
-`L0.attn_v.r4`, `L3.attn_v`, `L5.attn_q`, `L0.dense_down`,
+`lm_head.mmvq.b64.r1`, `lm_head.mmvq.b64.r2`, `lm_head.mmvq.b64.r4`,
+`L0.attn_q`, `L0.attn_q.r4`, `L0.attn_v`, `L0.attn_v.r4`, `L3.attn_v`,
+`L5.attn_q`, `L0.dense_down`,
 `L5.dense_down`, `L0.expert_down`, and `L10.expert_down`. They cover Q3_K,
 Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, and IQ4_NL with the target model's actual
 row/column sizes. The `.r4` targets are experimental Q4_K row-batching probes,
@@ -410,6 +411,38 @@ First Q6_K MMVQ port slice:
   exact Q6_K per-thread offsets. Next work should close that gap before trying
   `NUM_ROWS > 1`.
 
+Q6_K MMVQ q8-helper rewrite:
+
+- Re-reading llama.cpp showed the Q8_1 activation path should mirror
+  `mul_mat_vecq.comp` and `mul_mat_vecq_funcs.glsl`, not the f32-activation
+  `mul_mat_vec_q6_k.comp` `sccache` path.
+- The MMVQ shader now uses `cache_b_qs[4]`, `cache_b_ds`, `repack4`,
+  `get_d_scale`, and `mmvq_dot_product` in the same structure as llama.cpp's
+  `DATA_A_Q6_K` helper.
+- Added `lm_head.mmvq.b64.r2` and `lm_head.mmvq.b64.r4`.
+- Correctness: b64/r2 `rel=2.659e-7`, b64/r4 `rel=1.590e-7` on lm-head-shaped
+  fuzz.
+- GPU timestamps: b64/r2 improves to about 1077 us, b64/r4 about 1112 us, but
+  both still trail the current Q6_K shader and `lm_head.fast`.
+- Added llama.cpp-style packed16 aliasing and subgroup reduction:
+  `matvec_q6_k_q8_1_mmvq.glsl` now declares the same binding as both raw
+  `block_q6_K` and `block_q6_K_packed16`, reads `ql/qh` through packed16, and
+  still reads `scales/d` through the raw byte view. Reduction now follows
+  llama.cpp's safe `USE_SUBGROUP_ADD` path: subgroup reduction first, shared
+  memory only across subgroup partials.
+- Correctness after this pass: b64/r1 `rel=1.947e-7`, b64/r2 `rel=2.991e-7`,
+  b64/r4 `rel=1.590e-7` on lm-head-shaped fuzz.
+- Focused GPU timestamps after this pass: current `lm_head` about 1025 us,
+  `lm_head.mmvq.b64.r1` about 1021 us, and `lm_head.mmvq.b64.r4` about
+  1059 us. This is the first MMVQ variant to narrowly beat the current Q6_K
+  path, but the win is too small to promote into generation yet.
+- Updated conclusion: for Q6_K, the obvious llama.cpp structural pieces are now
+  in place for the isolated MMVQ target. The next Q6_K-only checks are
+  llama.cpp's manual 4-then-2 iteration unroll and subgroup-size control. If
+  those do not produce a larger win, stop polishing Q6_K in isolation and port
+  the same MMVQ family to Q3_K/Q4_K, where the model spends much more decode
+  time.
+
 ---
 
 ## Phase 7o - Faithful llama.cpp MMVQ Port
@@ -511,14 +544,37 @@ Implementation plan:
 10. Add Q5_K to the MMVQ family after the fallback-removal shader is stable.
    Correctness first; K-quants are easy to get subtly wrong.
 
-Suggested first implementation slice:
+Completed implementation slices:
 
 1. Add specialization support to `MatvecPipeline.initFromSpv`.
-2. Add one generated-style Q6_K MMVQ shader with `BLOCK_SIZE=32`,
-   `NUM_ROWS=1`, `NUM_COLS=1`, and the safe shared-memory reduction.
-3. Add fuzz coverage by reusing `fuzzQuantQ8_1(.q6_k, ...)`.
-4. Add `bench-matvec --target lm_head.mmvq.b32.r1`.
-5. Only after it passes, add variants for `BLOCK_SIZE=64` and `NUM_ROWS=2/4`.
+2. Add a Q6_K MMVQ shader target with `BLOCK_SIZE`, `NUM_ROWS`, and `NUM_COLS`
+   specialization constants.
+3. Align the Q6_K Q8_1 path with `mul_mat_vecq.comp` /
+   `mul_mat_vecq_funcs.glsl`, including `cache_b_qs`, `cache_b_ds`, `repack4`,
+   `get_d_scale`, and `mmvq_dot_product`.
+4. Add packed16 Q6_K `ql/qh` reads by aliasing the same weight binding as both
+   raw and `block_q6_K_packed16`. No upload-time repack was needed for Q6_K
+   because the packed16 view preserves the same 210-byte block layout.
+5. Replace the plain shared-memory tree with subgroup reduction plus
+   cross-subgroup shared-memory partials.
+6. Sweep `lm_head.mmvq.b32.r1`, `b64.r1`, `b64.r2`, and `b64.r4`; current best
+   candidate is `b64.r1`.
+
+Next implementation slice:
+
+1. Add a second Q6_K MMVQ shader variant, or a specialization flag, that
+   preserves llama.cpp's 4-then-2 manual iteration unroll exactly. Compare only
+   `lm_head.mmvq.b64.r1` first.
+2. Add subgroup-size visibility/control to `gpu-info` or pipeline creation if
+   RADV exposes it. Record whether this RX 7800 XT run is using subgroup 32 or
+   64; `USE_SUBGROUP_ADD_NO_SHMEM` is only safe to test when one subgroup covers
+   the whole workgroup.
+3. If Q6_K remains a single-digit-percent win, do not spend another session on
+   Q6_K micro-tweaks. Start Q3_K/Q4_K MMVQ using the same framework, because
+   those formats dominate attention and FFN gate/up decode time.
+4. Keep current production routing on the existing kernels until a full
+   generate profile shows a material token/s improvement, not just a narrow
+   isolated `lm_head` win.
 
 Acceptance criteria:
 

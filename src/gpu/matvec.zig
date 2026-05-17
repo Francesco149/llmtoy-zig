@@ -3093,6 +3093,22 @@ fn initQ6KQ8_1MmvqB64R1(ctx: *const GpuContext) !MatvecPipeline {
     });
 }
 
+fn initQ6KQ8_1MmvqB64R2(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ6KQ8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 2,
+        .num_cols = 1,
+    });
+}
+
+fn initQ6KQ8_1MmvqB64R4(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ6KQ8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 4,
+        .num_cols = 1,
+    });
+}
+
 test "gpu matvec Q6_K × Q8_1 MMVQ b32 r1 fuzz small" {
     try fuzzQuantQ8_1(.q6_k, 210, 256,
         initQ6KQ8_1MmvqB32R1, MatvecSession.initQ6K, 32, 256, 67);
@@ -3111,6 +3127,16 @@ test "gpu matvec Q6_K × Q8_1 MMVQ b64 r1 fuzz small" {
 test "gpu matvec Q6_K × Q8_1 MMVQ b64 r1 fuzz lm-head-shaped cols" {
     try fuzzQuantQ8_1(.q6_k, 210, 256,
         initQ6KQ8_1MmvqB64R1, MatvecSession.initQ6K, 64, 2816, 73);
+}
+
+test "gpu matvec Q6_K × Q8_1 MMVQ b64 r2 fuzz lm-head-shaped cols" {
+    try fuzzQuantQ8_1(.q6_k, 210, 256,
+        initQ6KQ8_1MmvqB64R2, MatvecSession.initQ6K, 64, 2816, 75);
+}
+
+test "gpu matvec Q6_K × Q8_1 MMVQ b64 r4 fuzz lm-head-shaped cols" {
+    try fuzzQuantQ8_1(.q6_k, 210, 256,
+        initQ6KQ8_1MmvqB64R4, MatvecSession.initQ6K, 64, 2816, 77);
 }
 
 test "gpu matvec Q5_K × Q8_1 fuzz small" {

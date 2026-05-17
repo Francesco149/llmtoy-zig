@@ -2,7 +2,8 @@
 // Experimental Q6_K x Q8_1 MMVQ-style matvec.
 //
 // This is the first generated-style port target. It keeps llmtoy's existing
-// Q6_K and Q8_1 buffer layouts, but changes the work shape toward llama.cpp:
+// Q6_K and Q8_1 buffer storage, but aliases Q6_K quants through llama.cpp's
+// packed16 view so each thread can use 2-byte ql/qh loads:
 // - local_size_x is specialization constant BLOCK_SIZE
 // - NUM_ROWS rows are accumulated by each invocation
 // - each thread processes K_PER_ITER=16 columns per loop iteration
@@ -16,6 +17,8 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32  : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16: require
 #extension GL_EXT_integer_dot_product                     : require
+#extension GL_KHR_shader_subgroup_basic                   : require
+#extension GL_KHR_shader_subgroup_arithmetic              : require
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 32u;
 layout(constant_id = 1) const uint NUM_ROWS   = 1u;
@@ -32,12 +35,20 @@ struct block_q6_K {
     float16_t d;
 };
 
+struct block_q6_K_packed16 {
+    uint16_t  ql[64];
+    uint16_t  qh[32];
+    int16_t   scales[8];
+    float16_t d;
+};
+
 struct block_q8_1_x4 {
     f16vec2  ds[4];
     int32_t  qs[32];
 };
 
 layout(std430, set = 0, binding = 0) readonly  buffer W { block_q6_K     weights[]; };
+layout(std430, set = 0, binding = 0) readonly  buffer WP16 { block_q6_K_packed16 weights_p16[]; };
 layout(std430, set = 0, binding = 1) readonly  buffer A { block_q8_1_x4  acts[];    };
 layout(std430, set = 0, binding = 2) writeonly buffer D { float          out_vec[]; };
 
@@ -45,78 +56,74 @@ layout(push_constant) uniform PC { uint rows; uint cols; } pc;
 
 shared float tmpsh[NUM_ROWS][BLOCK_SIZE];
 
-uint32_t load4_ql(uint blk, uint idx) {
-    return uint32_t(weights[blk].ql[idx + 0u]) |
-        (uint32_t(weights[blk].ql[idx + 1u]) << 8u) |
-        (uint32_t(weights[blk].ql[idx + 2u]) << 16u) |
-        (uint32_t(weights[blk].ql[idx + 3u]) << 24u);
+int32_t cache_b_qs[4];
+vec2 cache_b_ds;
+
+i8vec2 q6_vals2(uint blk, uint ql_idx16, uint qh_idx16, uint ql_shift, uint qh_shift) {
+    const uint32_t ql = (uint32_t(weights_p16[blk].ql[ql_idx16]) >> ql_shift) & 0x0F0Fu;
+    const uint32_t qh = ((uint32_t(weights_p16[blk].qh[qh_idx16]) >> qh_shift) & 0x0303u) << 4u;
+    const uint32_t q = ql | qh;
+    return i8vec2(
+        int8_t(int(q & 0xFFu) - 32),
+        int8_t(int((q >> 8u) & 0xFFu) - 32));
 }
 
-uint32_t load4_qh(uint blk, uint idx) {
-    return uint32_t(weights[blk].qh[idx + 0u]) |
-        (uint32_t(weights[blk].qh[idx + 1u]) << 8u) |
-        (uint32_t(weights[blk].qh[idx + 2u]) << 16u) |
-        (uint32_t(weights[blk].qh[idx + 3u]) << 24u);
+i32vec4 repack4(uint ib_a, uint iqs) {
+    const uint ib_k = ib_a / 8u;
+    const uint iqs_k = (ib_a & 7u) * 8u + iqs;
+
+    const uint ql_idx = (iqs_k / 32u) * 16u + (iqs_k & 15u);
+    const uint ql_shift = (((iqs_k & 31u) / 16u) * 4u);
+
+    const uint qh_idx = (iqs_k / 32u) * 8u + iqs;
+    const uint qh_shift = (((iqs_k & 31u) / 8u) * 2u);
+
+    const i8vec2 vals00 = q6_vals2(ib_k, ql_idx * 2u + 0u, qh_idx * 2u + 0u, ql_shift, qh_shift);
+    const i8vec2 vals01 = q6_vals2(ib_k, ql_idx * 2u + 1u, qh_idx * 2u + 1u, ql_shift, qh_shift);
+    const i8vec2 vals10 = q6_vals2(ib_k, ql_idx * 2u + 2u, qh_idx * 2u + 2u, ql_shift, qh_shift);
+    const i8vec2 vals11 = q6_vals2(ib_k, ql_idx * 2u + 3u, qh_idx * 2u + 3u, ql_shift, qh_shift);
+    const i8vec2 vals20 = q6_vals2(ib_k, ql_idx * 2u + 4u, qh_idx * 2u + 4u, ql_shift, qh_shift);
+    const i8vec2 vals21 = q6_vals2(ib_k, ql_idx * 2u + 5u, qh_idx * 2u + 5u, ql_shift, qh_shift);
+    const i8vec2 vals30 = q6_vals2(ib_k, ql_idx * 2u + 6u, qh_idx * 2u + 6u, ql_shift, qh_shift);
+    const i8vec2 vals31 = q6_vals2(ib_k, ql_idx * 2u + 7u, qh_idx * 2u + 7u, ql_shift, qh_shift);
+
+    return i32vec4(
+        pack32(i8vec4(vals00.x, vals00.y, vals01.x, vals01.y)),
+        pack32(i8vec4(vals10.x, vals10.y, vals11.x, vals11.y)),
+        pack32(i8vec4(vals20.x, vals20.y, vals21.x, vals21.y)),
+        pack32(i8vec4(vals30.x, vals30.y, vals31.x, vals31.y)));
 }
 
-int32_t q6_pack4(uint blk, uint elem) {
-    const uint sub = elem >> 5u;             // 32-element sub-block
-    const uint word = (elem & 31u) >> 2u;    // 4 values per word
-    const uint half256 = sub >> 2u;
-    const uint within = sub & 3u;
-    const uint ql_base = half256 * 64u + ((within & 1u) * 32u);
-    const uint qh_base = half256 * 32u;
-    const uint ql_shift = (within >= 2u) ? 4u : 0u;
-    const uint qh_shift = within * 2u;
-
-    const uint32_t lo = (load4_ql(blk, ql_base + word * 4u) >> ql_shift) & 0x0F0F0F0Fu;
-    const uint32_t hi = ((load4_qh(blk, qh_base + word * 4u) >> qh_shift) & 0x03030303u) << 4u;
-    const uint32_t q = lo | hi;
-    return pack32(i8vec4(
-        int8_t(int( q        & 0xFFu) - 32),
-        int8_t(int((q >>  8u) & 0xFFu) - 32),
-        int8_t(int((q >> 16u) & 0xFFu) - 32),
-        int8_t(int((q >> 24u) & 0xFFu) - 32)));
+float get_d_scale(uint ib_a, uint iqs) {
+    const uint ib_k = ib_a / 8u;
+    const uint iqs_k = (ib_a & 7u) * 8u + iqs;
+    return float(weights[ib_k].d) * float(weights[ib_k].scales[iqs_k / 4u]);
 }
 
-float q6_scale(uint blk, uint elem) {
-    const uint sub = elem >> 5u;
-    const uint half256 = sub >> 2u;
-    const uint within = sub & 3u;
-    const uint first_or_second_16 = (elem & 31u) >> 4u;
-    return float(weights[blk].scales[half256 * 8u + within * 2u + first_or_second_16]);
+float mmvq_dot_product(uint ib_a, uint iqs) {
+    const i32vec4 qs_a = repack4(ib_a, iqs * 4u);
+    const float d_scale = get_d_scale(ib_a, iqs * 4u);
+
+    int32_t q_sum = 0;
+    q_sum += dotPacked4x8EXT(qs_a.x, cache_b_qs[0]);
+    q_sum += dotPacked4x8EXT(qs_a.y, cache_b_qs[1]);
+    q_sum += dotPacked4x8EXT(qs_a.z, cache_b_qs[2]);
+    q_sum += dotPacked4x8EXT(qs_a.w, cache_b_qs[3]);
+
+    return cache_b_ds.x * d_scale * float(q_sum);
 }
 
-float dot16_q6_q8(uint row, uint col) {
-    if (col >= pc.cols) return 0.0;
-
-    const uint q6k_per_row = pc.cols / 256u;
-    const uint blk = row * q6k_per_row + (col >> 8u);
-    const uint elem = col & 255u;
-
+void preload_q8(uint col) {
     const uint q8_block = col >> 5u;
-    const uint q8_word = (col & 31u) >> 2u;
+    const uint b_qs_idx = (col & 31u) >> 4u;
     const uint x4_idx = q8_block >> 2u;
     const uint x4_sub = q8_block & 3u;
-    const uint act_off = x4_sub * 8u + q8_word;
-    const float d_b = float(acts[x4_idx].ds[x4_sub].x);
-
-    const float d_w = float(weights[blk].d);
-    const float sc0 = q6_scale(blk, elem);
-    const float sc1 = q6_scale(blk, elem + 8u);
-
-    int32_t sum0 = 0;
-    int32_t sum1 = 0;
-    [[unroll]] for (uint k = 0u; k < 2u; ++k) {
-        const uint e = elem + k * 4u;
-        sum0 += dotPacked4x8EXT(q6_pack4(blk, e), acts[x4_idx].qs[act_off + k]);
-    }
-    [[unroll]] for (uint k = 0u; k < 2u; ++k) {
-        const uint e = elem + 8u + k * 4u;
-        sum1 += dotPacked4x8EXT(q6_pack4(blk, e), acts[x4_idx].qs[act_off + 2u + k]);
-    }
-
-    return d_w * d_b * (sc0 * float(sum0) + sc1 * float(sum1));
+    const uint act_off = x4_sub * 8u + b_qs_idx * 4u;
+    cache_b_ds = vec2(acts[x4_idx].ds[x4_sub]);
+    cache_b_qs[0] = acts[x4_idx].qs[act_off + 0u];
+    cache_b_qs[1] = acts[x4_idx].qs[act_off + 1u];
+    cache_b_qs[2] = acts[x4_idx].qs[act_off + 2u];
+    cache_b_qs[3] = acts[x4_idx].qs[act_off + 3u];
 }
 
 void main() {
@@ -129,35 +136,44 @@ void main() {
         temp[n] = 0.0;
     }
 
-    const uint stride = BLOCK_SIZE * K_PER_ITER;
-    for (uint base = tid * K_PER_ITER; base < pc.cols; base += stride) {
+    const uint q6k_per_row = pc.cols / 256u;
+    const uint num_iters = (pc.cols + K_PER_ITER * BLOCK_SIZE - 1u) / (K_PER_ITER * BLOCK_SIZE);
+    for (uint i = 0u; i < num_iters; ++i) {
+        const uint col = i * BLOCK_SIZE * K_PER_ITER + tid * K_PER_ITER;
+        if (col >= pc.cols) continue;
+        preload_q8(col);
+        const uint iqs = tid & 1u;
         [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
             const uint row = first_row + n;
             if (row < pc.rows) {
-                temp[n] += dot16_q6_q8(row, base);
+                const uint ib_a = row * q6k_per_row * 8u + (col >> 5u);
+                temp[n] += mmvq_dot_product(ib_a, iqs);
             }
         }
     }
 
     [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
-        tmpsh[n][tid] = temp[n];
+        temp[n] = subgroupAdd(temp[n]);
+        if (gl_SubgroupInvocationID == 0u) {
+            tmpsh[n][gl_SubgroupID] = temp[n];
+        }
     }
     barrier();
 
-    for (uint s = BLOCK_SIZE >> 1u; s > 0u; s >>= 1u) {
-        if (tid < s) {
-            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
-                tmpsh[n][tid] += tmpsh[n][tid + s];
+    if (tid == 0u) {
+        [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+            temp[n] = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+                temp[n] += tmpsh[n][s];
             }
         }
-        barrier();
     }
 
     if (tid == 0u) {
         [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
             const uint row = first_row + n;
             if (row < pc.rows) {
-                out_vec[row] = tmpsh[n][0];
+                out_vec[row] = temp[n];
             }
         }
     }
