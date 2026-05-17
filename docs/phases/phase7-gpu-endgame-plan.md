@@ -896,6 +896,15 @@ systemd-run --user --scope -p MemoryMax=40G --quiet -- \
     Q8_1 quantization, layer 0 `bench-moe` improved to about 561 us/iter wall
     and 94 us/iter GPU phases, but it stays experimental because gate/up-ID is
     still slower than the current per-expert gate/up GPU phase.
+  - `LLMTOY_EXPERT_REUSE_DSETS=1` is a follow-up experiment for the opt-in
+    expert-ID route. It reuses stable descriptor sets for the flattened
+    four-dispatch MoE sequence. Layer 0 improved again to about 502 us/iter
+    wall with the same ~88 us GPU phase time; layer 10 measured about
+    549 us/iter wall with ~99 us GPU phases. This confirms descriptor churn
+    matters once the route is flattened, but command-buffer allocation,
+    submit/wait, and final readback remain the larger gap. Layer-slice compare
+    passes for layers 0 and 10, but cumulative all-layer compare is not yet a
+    promotion gate for the gate/up-ID experiment.
   - Before enabling any ID path in `runExpertBatch`, add or use a model-backed
     correctness check that compares real selected-expert intermediates against
     the existing per-expert path, then run `llmtoy compare --gpu-layers`.

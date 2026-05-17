@@ -42,7 +42,7 @@ pub fn forwardOne(
     cfg: Gemma4Config,
     pool: *math.ThreadPool,
     allocator: std.mem.Allocator,
-    gpu: ?*const GpuWeights,
+    gpu: ?*GpuWeights,
     layer_taps: ?[][]f32,
     gpu_layer_range: ?[2]usize,
 ) ![]f32 {

@@ -1336,7 +1336,7 @@ fn cmdGenerate(
         if (gpu_weights) |*gw| gw.initKvVram(g4cfg, max_seq) catch |e| {
             std.debug.print("KV VRAM alloc failed ({s}), continuing without GPU KV cache\n", .{@errorName(e)});
         };
-        const gpu_ptr: ?*const g4_gpu.GpuWeights = if (gpu_weights != null) &gpu_weights.? else null;
+        const gpu_ptr: ?*g4_gpu.GpuWeights = if (gpu_weights != null) &gpu_weights.? else null;
         var kv = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
         defer kv.deinit();
         const t_prefill_start = clk.now(io);

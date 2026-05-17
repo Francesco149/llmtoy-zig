@@ -131,6 +131,11 @@ The GPU phase timing is useful for shader comparisons; the wall timing exposes
 the current descriptor/command-recording overhead that llama.cpp avoids with its
 expert-id pipeline shape.
 
+Use `LLMTOY_EXPERT_GU_ID=1 LLMTOY_EXPERT_REUSE_DSETS=1` to test the current
+opt-in flattened expert-ID route with persistent descriptor sets. This is still
+an experiment, but it isolates descriptor churn from command submission and
+readback overhead.
+
 ## Sampling Profile
 
 ```sh

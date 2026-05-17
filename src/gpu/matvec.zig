@@ -919,6 +919,17 @@ pub const AccumPipeline = struct {
         d_model: u32,
         n: u32,
     ) !vk.VkDescriptorSet {
+        const dset = try self.allocSet(inputs_buf, scales_buf, out_buf);
+        self.recordWithSet(cmd, dset, d_model, n);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const AccumPipeline,
+        inputs_buf: *const GpuBuffer,
+        scales_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -943,6 +954,16 @@ pub const AccumPipeline = struct {
         };
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
+        return dset;
+    }
+
+    pub fn recordWithSet(
+        self: *const AccumPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        d_model: u32,
+        n: u32,
+    ) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         // PushConst: rows=d_model, cols=n (reuses the 2×u32 push constant struct)
@@ -950,8 +971,6 @@ pub const AccumPipeline = struct {
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(PushConst), &pc);
         const groups = (d_model + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
-
-        return dset;
     }
 
     pub fn deinit(self: *AccumPipeline) void {
@@ -1091,93 +1110,38 @@ pub const QuantizeQ8_1Pipeline = struct {
         ncols: u32,
     ) !vk.VkDescriptorSet {
         std.debug.assert(ncols % 4 == 0); // vec4-aligned reads
-        const dev = self.device;
-        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null,
-            .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1,
-            .pSetLayouts = &self.dset_layout,
-        };
-        var dset: vk.VkDescriptorSet = null;
-        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
-            return error.VkDescriptorSetAllocFailed;
-
-        const buf_infos = [2]vk.VkDescriptorBufferInfo{
-            .{ .buffer = in_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = out_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-        };
-        const writes = [2]vk.VkWriteDescriptorSet{
-            mkWrite(dset, 0, &buf_infos[0]),
-            mkWrite(dset, 1, &buf_infos[1]),
-        };
-        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
-
-        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
-        const pc = QuantizePushConst{ .ncols = ncols };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(QuantizePushConst), &pc);
-        // One workgroup per 128-element x4 group (32 threads each).
-        const groups = (ncols + 127) / 128;
-        vk.vkCmdDispatch(cmd, groups, 1, 1);
-
+        const dset = try self.allocSet(in_buf, out_buf);
+        self.recordWithSet(cmd, dset, ncols);
         return dset;
     }
 
-    pub fn recordToOffset(
+    pub fn allocSet(
         self: *const QuantizeQ8_1Pipeline,
-        cmd: vk.VkCommandBuffer,
+        in_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        return self.allocSetRangeToOffset(in_buf, 0, vk.VK_WHOLE_SIZE, out_buf, 0, vk.VK_WHOLE_SIZE);
+    }
+
+    pub fn allocSetToOffset(
+        self: *const QuantizeQ8_1Pipeline,
         in_buf: *const GpuBuffer,
         out_buf: *const GpuBuffer,
         out_offset: u64,
         out_range: u64,
-        ncols: u32,
     ) !vk.VkDescriptorSet {
-        std.debug.assert(ncols % 4 == 0);
-        const dev = self.device;
-        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null,
-            .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1,
-            .pSetLayouts = &self.dset_layout,
-        };
-        var dset: vk.VkDescriptorSet = null;
-        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
-            return error.VkDescriptorSetAllocFailed;
-
-        const buf_infos = [2]vk.VkDescriptorBufferInfo{
-            .{ .buffer = in_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = out_buf.handle, .offset = out_offset, .range = out_range },
-        };
-        const writes = [2]vk.VkWriteDescriptorSet{
-            mkWrite(dset, 0, &buf_infos[0]),
-            mkWrite(dset, 1, &buf_infos[1]),
-        };
-        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
-
-        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
-        const pc = QuantizePushConst{ .ncols = ncols };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(QuantizePushConst), &pc);
-        const groups = (ncols + 127) / 128;
-        vk.vkCmdDispatch(cmd, groups, 1, 1);
-
-        return dset;
+        return self.allocSetRangeToOffset(in_buf, 0, vk.VK_WHOLE_SIZE, out_buf, out_offset, out_range);
     }
 
-    pub fn recordRangeToOffset(
+    pub fn allocSetRangeToOffset(
         self: *const QuantizeQ8_1Pipeline,
-        cmd: vk.VkCommandBuffer,
         in_buf: *const GpuBuffer,
         in_offset: u64,
         in_range: u64,
         out_buf: *const GpuBuffer,
         out_offset: u64,
         out_range: u64,
-        ncols: u32,
     ) !vk.VkDescriptorSet {
-        std.debug.assert(ncols % 4 == 0);
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1200,13 +1164,53 @@ pub const QuantizeQ8_1Pipeline = struct {
         };
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
+        return dset;
+    }
+
+    pub fn recordWithSet(
+        self: *const QuantizeQ8_1Pipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        ncols: u32,
+    ) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = QuantizePushConst{ .ncols = ncols };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(QuantizePushConst), &pc);
+        // One workgroup per 128-element x4 group (32 threads each).
         const groups = (ncols + 127) / 128;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
+    }
 
+    pub fn recordToOffset(
+        self: *const QuantizeQ8_1Pipeline,
+        cmd: vk.VkCommandBuffer,
+        in_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+        out_offset: u64,
+        out_range: u64,
+        ncols: u32,
+    ) !vk.VkDescriptorSet {
+        std.debug.assert(ncols % 4 == 0);
+        const dset = try self.allocSetToOffset(in_buf, out_buf, out_offset, out_range);
+        self.recordWithSet(cmd, dset, ncols);
+        return dset;
+    }
+
+    pub fn recordRangeToOffset(
+        self: *const QuantizeQ8_1Pipeline,
+        cmd: vk.VkCommandBuffer,
+        in_buf: *const GpuBuffer,
+        in_offset: u64,
+        in_range: u64,
+        out_buf: *const GpuBuffer,
+        out_offset: u64,
+        out_range: u64,
+        ncols: u32,
+    ) !vk.VkDescriptorSet {
+        std.debug.assert(ncols % 4 == 0);
+        const dset = try self.allocSetRangeToOffset(in_buf, in_offset, in_range, out_buf, out_offset, out_range);
+        self.recordWithSet(cmd, dset, ncols);
         return dset;
     }
 
@@ -1252,6 +1256,16 @@ pub const QuantizeQ8_1BatchedPipeline = struct {
         active: u32,
     ) !vk.VkDescriptorSet {
         std.debug.assert(ncols % 4 == 0);
+        const dset = try self.allocSet(in_buf, out_buf);
+        self.recordWithSet(cmd, dset, ncols, active);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const QuantizeQ8_1BatchedPipeline,
+        in_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1274,14 +1288,22 @@ pub const QuantizeQ8_1BatchedPipeline = struct {
         };
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
+        return dset;
+    }
+
+    pub fn recordWithSet(
+        self: *const QuantizeQ8_1BatchedPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        ncols: u32,
+        active: u32,
+    ) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = QuantizeBatchedPushConst{ .ncols = ncols, .n_active = active };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(QuantizeBatchedPushConst), &pc);
         const groups_x = (ncols + 127) / 128;
         vk.vkCmdDispatch(cmd, groups_x, active, 1);
-
-        return dset;
     }
 
     pub fn deinit(self: *QuantizeQ8_1BatchedPipeline) void {
@@ -1307,7 +1329,7 @@ pub const ExpertGateUpIdPipeline = struct {
 
     pub fn initQ3KQ8_1(ctx: *const GpuContext) !ExpertGateUpIdPipeline {
         comptime std.debug.assert(shaders.expert_gate_up_id_q3_k_q8_1.len % 4 == 0);
-        const built = try buildSimplePipeline(ctx, &shaders.expert_gate_up_id_q3_k_q8_1, 4, @sizeOf(ExpertGateUpIdPushConst), 16);
+        const built = try buildSimplePipeline(ctx, &shaders.expert_gate_up_id_q3_k_q8_1, 4, @sizeOf(ExpertGateUpIdPushConst), 64);
         return .{
             .pipeline = built.pipeline,
             .layout = built.layout,
@@ -1327,6 +1349,18 @@ pub const ExpertGateUpIdPipeline = struct {
         rows: u32,
         cols: u32,
         active: u32,
+    ) !vk.VkDescriptorSet {
+        const dset = try self.allocSet(weights_buf, acts_buf, ids_buf, out_buf);
+        self.recordWithSet(cmd, dset, rows, cols, active);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const ExpertGateUpIdPipeline,
+        weights_buf: *const GpuBuffer,
+        acts_buf: *const GpuBuffer,
+        ids_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
     ) !vk.VkDescriptorSet {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
@@ -1354,13 +1388,22 @@ pub const ExpertGateUpIdPipeline = struct {
         };
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
+        return dset;
+    }
+
+    pub fn recordWithSet(
+        self: *const ExpertGateUpIdPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        rows: u32,
+        cols: u32,
+        active: u32,
+    ) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = ExpertGateUpIdPushConst{ .rows = rows, .cols = cols, .n_active = active };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ExpertGateUpIdPushConst), &pc);
         vk.vkCmdDispatch(cmd, rows, active, 1);
-
-        return dset;
     }
 
     pub fn deinit(self: *ExpertGateUpIdPipeline) void {
@@ -1395,7 +1438,7 @@ pub const ExpertDownIdPipeline = struct {
     }
 
     fn initFromSpv(ctx: *const GpuContext, spv: anytype) !ExpertDownIdPipeline {
-        const built = try buildSimplePipeline(ctx, spv, 5, @sizeOf(ExpertDownIdPushConst), 8);
+        const built = try buildSimplePipeline(ctx, spv, 5, @sizeOf(ExpertDownIdPushConst), 64);
         return .{
             .pipeline = built.pipeline,
             .layout = built.layout,
@@ -1416,6 +1459,19 @@ pub const ExpertDownIdPipeline = struct {
         rows: u32,
         cols: u32,
         active: u32,
+    ) !vk.VkDescriptorSet {
+        const dset = try self.allocSet(weights_buf, acts_buf, ids_buf, scales_buf, out_buf);
+        self.recordWithSet(cmd, dset, rows, cols, active);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const ExpertDownIdPipeline,
+        weights_buf: *const GpuBuffer,
+        acts_buf: *const GpuBuffer,
+        ids_buf: *const GpuBuffer,
+        scales_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
     ) !vk.VkDescriptorSet {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
@@ -1445,13 +1501,22 @@ pub const ExpertDownIdPipeline = struct {
         };
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
+        return dset;
+    }
+
+    pub fn recordWithSet(
+        self: *const ExpertDownIdPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        rows: u32,
+        cols: u32,
+        active: u32,
+    ) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = ExpertDownIdPushConst{ .rows = rows, .cols = cols, .n_active = active };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ExpertDownIdPushConst), &pc);
         vk.vkCmdDispatch(cmd, rows, active, 1);
-
-        return dset;
     }
 
     pub fn deinit(self: *ExpertDownIdPipeline) void {

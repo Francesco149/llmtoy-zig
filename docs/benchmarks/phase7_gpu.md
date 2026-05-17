@@ -1063,6 +1063,32 @@ host/submit/readback overhead. The next final-pipeline step should reduce
 MoE command/descriptor/readback overhead further or improve the Q3_K ID inner
 loop toward llama.cpp's ~39-46 us trace.
 
+Descriptor-reuse probe:
+
+- Added `LLMTOY_EXPERT_REUSE_DSETS=1` as a second experiment. It lazily
+  allocates stable descriptor sets for the opt-in expert-ID route's quantize
+  input, gate/up ID, batched mid quantize, down ID, and accumulation bindings,
+  then only rebinds and changes push constants in the timed loop.
+- Layer 0, `LLMTOY_EXPERT_GU_ID=1 LLMTOY_EXPERT_REUSE_DSETS=1 bench-moe
+  --iters 16 --layer 0`: `502.43 us/iter` wall, `88.21 us/iter` GPU phases,
+  `414.22 us/iter` host/submit. The same build without descriptor reuse in
+  this run measured `610.39 us/iter` wall and `88.50 us/iter` GPU phases.
+- Layer 10, `LLMTOY_EXPERT_GU_ID=1 LLMTOY_EXPERT_REUSE_DSETS=1 bench-moe
+  --iters 16 --layer 10`: `548.89 us/iter` wall, `99.28 us/iter` GPU phases,
+  `449.61 us/iter` host/submit.
+- Correctness still holds:
+  `LLMTOY_EXPERT_GU_ID=1 LLMTOY_EXPERT_REUSE_DSETS=1 llmtoy compare ...
+  "explain MoE" --chat --gpu-layers 0:0` and `--gpu-layers 10:10` keep all
+  layer argmaxes and final argmax matching CPU.
+
+Interpretation: descriptor allocation/update/free is a measurable part of the
+remaining MoE host overhead once the expert-ID route has only four dispatches
+per selected-expert batch. This stays opt-in because command-buffer allocation,
+queue submit/wait, and the final host readback still dominate the remaining
+~0.41-0.45 ms/iteration gap. Also, cumulative all-layer `compare` with the
+gate/up-ID experiment is still not a promotion gate; validate layer slices while
+the Q3_K gate/up-ID kernel remains experimental.
+
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
 Attempted fusing gate-gelu-up + w_down into a single submit (4 submits/layer):

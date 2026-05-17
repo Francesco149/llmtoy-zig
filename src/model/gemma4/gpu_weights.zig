@@ -191,6 +191,12 @@ pub const GpuWeights = struct {
     expert_accum_scales_slice: ?[]f32,
     expert_ids_slice: ?[]u32,
     moe_gpu_slice: ?[]f32,
+    expert_quant_input_dset: ?vk.VkDescriptorSet,
+    expert_quant_mid_batched_dset: ?vk.VkDescriptorSet,
+    expert_accum_dset: ?vk.VkDescriptorSet,
+    expert_gate_up_id_dsets: ?[]?vk.VkDescriptorSet,
+    expert_down_id_dsets: ?[]?vk.VkDescriptorSet,
+    expert_down_id_dset_is_iq4: ?[]bool,
     // Per-projection output buffers for batched dispatch.
     // QKV: all three read the same input → one upload, three parallel dispatches.
     // gate+up: both read the same FFN-norm input → same pattern.
@@ -404,6 +410,12 @@ pub const GpuWeights = struct {
             .expert_accum_scales_slice = null,
             .expert_ids_slice = null,
             .moe_gpu_slice = null,
+            .expert_quant_input_dset = null,
+            .expert_quant_mid_batched_dset = null,
+            .expert_accum_dset = null,
+            .expert_gate_up_id_dsets = null,
+            .expert_down_id_dsets = null,
+            .expert_down_id_dset_is_iq4 = null,
             .q_out_buf = null,
             .k_out_buf = null,
             .v_out_buf = null,
@@ -572,6 +584,12 @@ pub const GpuWeights = struct {
         @memset(gw.expert_gate_up_flat.?, null);
         gw.expert_down_flat = try allocator.alloc(?MatvecSession, g4cfg.n_layers);
         @memset(gw.expert_down_flat.?, null);
+        gw.expert_gate_up_id_dsets = try allocator.alloc(?vk.VkDescriptorSet, g4cfg.n_layers);
+        @memset(gw.expert_gate_up_id_dsets.?, null);
+        gw.expert_down_id_dsets = try allocator.alloc(?vk.VkDescriptorSet, g4cfg.n_layers);
+        @memset(gw.expert_down_id_dsets.?, null);
+        gw.expert_down_id_dset_is_iq4 = try allocator.alloc(bool, g4cfg.n_layers);
+        @memset(gw.expert_down_id_dset_is_iq4.?, false);
         std.debug.print("  uploading {} experts × {} layers to GPU...\n", .{ g4cfg.n_experts, g4cfg.n_layers });
         for (0..g4cfg.n_layers) |l| {
             if (enable_gate_up_id and isExpertGateUpIdSupported(g4w.layers[l].gate_up_exps.type_)) {
@@ -758,6 +776,35 @@ pub const GpuWeights = struct {
         if (self.k_vram) |bs| {
             for (bs) |*b| b.deinit();
             self.allocator.free(bs);
+        }
+        if (self.expert_down_id_dsets) |sets| {
+            for (sets, 0..) |*ds, i| if (ds.*) |set| {
+                var tmp = set;
+                const is_iq4 = if (self.expert_down_id_dset_is_iq4) |flags| flags[i] else false;
+                const pool = if (is_iq4) self.pl_expert_down_id_iq4_nl.desc_pool else self.pl_expert_down_id_q5_1.desc_pool;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
+        if (self.expert_down_id_dset_is_iq4) |flags| self.allocator.free(flags);
+        if (self.expert_gate_up_id_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_expert_gate_up_id_q3_k.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
+        if (self.expert_accum_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_accum.desc_pool, 1, &tmp);
+        }
+        if (self.expert_quant_mid_batched_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1_batched.desc_pool, 1, &tmp);
+        }
+        if (self.expert_quant_input_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, &tmp);
         }
         if (self.moe_gpu_buf) |*b| {
             b.unmap();
@@ -1747,7 +1794,7 @@ pub const GpuWeights = struct {
     // CPU writes moe_in and scales, then reads moe_gpu_buf after submit.
     // Returns error.ExpertNotOnGpu if any session is missing; caller falls back to CPU.
     pub fn runExpertBatch(
-        self: *const GpuWeights,
+        self: *GpuWeights,
         layer: usize,
         top_idx: []const usize,
         gate_up_type: GgmlType,
@@ -1783,6 +1830,12 @@ pub const GpuWeights = struct {
         const use_id_dn = use_q8_1_dn and pl_dn_id != null and down_flat != null;
         const gate_up_flat = if (self.expert_gate_up_flat) |gufs| gufs[layer] else null;
         const use_id_gu = gate_up_type == .q3_k and use_q8_1_dn and gate_up_flat != null;
+        const reuse_id_dsets = std.c.getenv("LLMTOY_EXPERT_REUSE_DSETS") != null;
+        const reuse_quant_input_dset = reuse_id_dsets and use_id_gu;
+        const reuse_gate_up_id_dset = reuse_id_dsets and use_id_gu;
+        const reuse_quant_mid_batched_dset = reuse_id_dsets and use_id_gu;
+        const reuse_down_id_dset = reuse_id_dsets and use_id_dn;
+        const reuse_accum_dset = reuse_id_dsets and (use_id_gu or use_id_dn);
 
         for (top_idx) |eidx| {
             if (!use_id_gu) {
@@ -1830,7 +1883,13 @@ pub const GpuWeights = struct {
         // Optional Phase 0: f32 moe_in → Q8_1 in shared_acts_q8_1 once.
         if (use_q8_1_gu) {
             const p_quant = self.ctx.profileBegin(cmd, "moe.quantize_input");
-            quant_dset = try self.pl_quantize_q8_1.record(cmd, in_buf, acts_q8_1, @intCast(moe_in.len));
+            if (reuse_quant_input_dset) {
+                if (self.expert_quant_input_dset == null)
+                    self.expert_quant_input_dset = try self.pl_quantize_q8_1.allocSet(in_buf, acts_q8_1);
+                self.pl_quantize_q8_1.recordWithSet(cmd, self.expert_quant_input_dset.?, @intCast(moe_in.len));
+            } else {
+                quant_dset = try self.pl_quantize_q8_1.record(cmd, in_buf, acts_q8_1, @intCast(moe_in.len));
+            }
             self.ctx.profileEnd(cmd, p_quant);
             GpuCtx.recordShaderBarrier(cmd);
         }
@@ -1840,7 +1899,14 @@ pub const GpuWeights = struct {
         // current path writes one mid_buf per selected expert.
         if (use_id_gu) {
             const p_gu = self.ctx.profileBegin(cmd, "moe.fused_gate_up");
-            gate_up_id_dset = try self.pl_expert_gate_up_id_q3_k.record(cmd, &gate_up_flat.?.mat_buf, gu_in_buf, ids_buf, all_out_buf, @intCast(gate_up_flat.?.rows / (2 * self.n_experts)), @intCast(gate_up_flat.?.cols), @intCast(n));
+            if (reuse_gate_up_id_dset) {
+                const sets = self.expert_gate_up_id_dsets orelse return error.ExpertNotOnGpu;
+                if (sets[layer] == null)
+                    sets[layer] = try self.pl_expert_gate_up_id_q3_k.allocSet(&gate_up_flat.?.mat_buf, gu_in_buf, ids_buf, all_out_buf);
+                self.pl_expert_gate_up_id_q3_k.recordWithSet(cmd, sets[layer].?, @intCast(gate_up_flat.?.rows / (2 * self.n_experts)), @intCast(gate_up_flat.?.cols), @intCast(n));
+            } else {
+                gate_up_id_dset = try self.pl_expert_gate_up_id_q3_k.record(cmd, &gate_up_flat.?.mat_buf, gu_in_buf, ids_buf, all_out_buf, @intCast(gate_up_flat.?.rows / (2 * self.n_experts)), @intCast(gate_up_flat.?.cols), @intCast(n));
+            }
             self.ctx.profileEnd(cmd, p_gu);
         } else {
             for (0..n) |k| {
@@ -1866,7 +1932,13 @@ pub const GpuWeights = struct {
             const mid_q8_1_bytes = mv_mod.q8_1OutBytes(d_expert);
             if (use_id_gu) {
                 const p_quant_dn = self.ctx.profileBegin(cmd, "moe.quantize_mid");
-                quant_mid_id_dset = try self.pl_quantize_q8_1_batched.record(cmd, all_out_buf, mid_q8_1_flat_buf, d_expert, @intCast(n));
+                if (reuse_quant_mid_batched_dset) {
+                    if (self.expert_quant_mid_batched_dset == null)
+                        self.expert_quant_mid_batched_dset = try self.pl_quantize_q8_1_batched.allocSet(all_out_buf, mid_q8_1_flat_buf);
+                    self.pl_quantize_q8_1_batched.recordWithSet(cmd, self.expert_quant_mid_batched_dset.?, d_expert, @intCast(n));
+                } else {
+                    quant_mid_id_dset = try self.pl_quantize_q8_1_batched.record(cmd, all_out_buf, mid_q8_1_flat_buf, d_expert, @intCast(n));
+                }
                 self.ctx.profileEnd(cmd, p_quant_dn);
             } else {
                 for (0..n) |k| {
@@ -1890,7 +1962,16 @@ pub const GpuWeights = struct {
         var down_id_dset: ?vk.VkDescriptorSet = null;
         if (use_id_dn) {
             const p_down = self.ctx.profileBegin(cmd, "moe.down");
-            down_id_dset = try pl_dn_id.?.record(cmd, &down_flat.?.mat_buf, mid_q8_1_flat_buf, ids_buf, scales_buf, all_out_buf, @intCast(d_model), @intCast(down_flat.?.cols), @intCast(n));
+            if (reuse_down_id_dset) {
+                const sets = self.expert_down_id_dsets orelse return error.ExpertNotOnGpu;
+                if (sets[layer] == null) {
+                    sets[layer] = try pl_dn_id.?.allocSet(&down_flat.?.mat_buf, mid_q8_1_flat_buf, ids_buf, scales_buf, all_out_buf);
+                    if (self.expert_down_id_dset_is_iq4) |flags| flags[layer] = down_type == .iq4_nl;
+                }
+                pl_dn_id.?.recordWithSet(cmd, sets[layer].?, @intCast(d_model), @intCast(down_flat.?.cols), @intCast(n));
+            } else {
+                down_id_dset = try pl_dn_id.?.record(cmd, &down_flat.?.mat_buf, mid_q8_1_flat_buf, ids_buf, scales_buf, all_out_buf, @intCast(d_model), @intCast(down_flat.?.cols), @intCast(n));
+            }
             self.ctx.profileEnd(cmd, p_down);
         } else {
             for (0..n) |k| {
@@ -1913,19 +1994,30 @@ pub const GpuWeights = struct {
 
         // Phase 3: weighted accumulation on GPU
         const p_accum = self.ctx.profileBegin(cmd, "moe.accum");
-        const accum_dset = try self.pl_accum.record(cmd, all_out_buf, accum_scales_buf, moe_out_buf, @intCast(d_model), @intCast(n));
+        var accum_dset: ?vk.VkDescriptorSet = null;
+        if (reuse_accum_dset) {
+            if (self.expert_accum_dset == null)
+                self.expert_accum_dset = try self.pl_accum.allocSet(all_out_buf, accum_scales_buf, moe_out_buf);
+            self.pl_accum.recordWithSet(cmd, self.expert_accum_dset.?, @intCast(d_model), @intCast(n));
+        } else {
+            accum_dset = try self.pl_accum.record(cmd, all_out_buf, accum_scales_buf, moe_out_buf, @intCast(d_model), @intCast(n));
+        }
         self.ctx.profileEnd(cmd, p_accum);
 
         try self.ctx.submitBatch(cmd);
 
         const pl_dn_used = if (use_q8_1_dn) pl_dn_q8_1.? else pl_dn_f32.?;
-        if (gate_up_id_dset) |*ds| {
+        if (reuse_gate_up_id_dset and use_id_gu) {
+            // Persistent descriptor set is owned by GpuWeights.
+        } else if (gate_up_id_dset) |*ds| {
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_expert_gate_up_id_q3_k.desc_pool, 1, ds);
         } else {
             for (fused_dsets[0..n]) |*ds|
                 _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_gu.desc_pool, 1, ds);
         }
-        if (use_id_dn) {
+        if (reuse_down_id_dset and use_id_dn) {
+            // Persistent descriptor set is owned by GpuWeights.
+        } else if (use_id_dn) {
             var ds = down_id_dset.?;
             _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_dn_id.?.desc_pool, 1, &ds);
         } else {
@@ -1933,7 +2025,9 @@ pub const GpuWeights = struct {
                 _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_dn_used.desc_pool, 1, ds);
         }
         if (use_q8_1_dn) {
-            if (quant_mid_id_dset) |*ds| {
+            if (reuse_quant_mid_batched_dset and use_id_gu) {
+                // Persistent descriptor set is owned by GpuWeights.
+            } else if (quant_mid_id_dset) |*ds| {
                 _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1_batched.desc_pool, 1, ds);
             } else {
                 for (quant_dn_dsets[0..n]) |*ds|
@@ -1942,8 +2036,10 @@ pub const GpuWeights = struct {
         }
         if (quant_dset) |*ds|
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, ds);
-        var accum_ds = accum_dset;
-        _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_accum.desc_pool, 1, &accum_ds);
+        if (accum_dset) |set| {
+            var accum_ds = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_accum.desc_pool, 1, &accum_ds);
+        }
 
         // Add GPU-accumulated expert result into moe_buf.
         for (moe_buf, moe_slice) |*m, v| m.* += v;
