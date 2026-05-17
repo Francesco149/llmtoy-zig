@@ -350,6 +350,10 @@ const BenchPipelines = struct {
     q3_k_mmvq_b32_r1: gpu_matvec.MatvecPipeline,
     q3_k_mmvq_b64_r1: gpu_matvec.MatvecPipeline,
     q4_k: gpu_matvec.MatvecPipeline,
+    q4_k_mmvq_b32_r1: gpu_matvec.MatvecPipeline,
+    q4_k_mmvq_b64_r1: gpu_matvec.MatvecPipeline,
+    q4_k_mmvq_b64_r2: gpu_matvec.MatvecPipeline,
+    q4_k_mmvq_b64_r4: gpu_matvec.MatvecPipeline,
     q4_k_r4: gpu_matvec.MatvecPipeline,
     q5_0: gpu_matvec.MatvecPipeline,
     q5_1: gpu_matvec.MatvecPipeline,
@@ -380,6 +384,30 @@ const BenchPipelines = struct {
         errdefer q3_k_mmvq_b64_r1.deinit();
         var q4_k = try gpu_matvec.MatvecPipeline.initQ4KQ8_1(ctx);
         errdefer q4_k.deinit();
+        var q4_k_mmvq_b32_r1 = try gpu_matvec.MatvecPipeline.initQ4KQ8_1Mmvq(ctx, .{
+            .block_size = 32,
+            .num_rows = 1,
+            .num_cols = 1,
+        });
+        errdefer q4_k_mmvq_b32_r1.deinit();
+        var q4_k_mmvq_b64_r1 = try gpu_matvec.MatvecPipeline.initQ4KQ8_1Mmvq(ctx, .{
+            .block_size = 64,
+            .num_rows = 1,
+            .num_cols = 1,
+        });
+        errdefer q4_k_mmvq_b64_r1.deinit();
+        var q4_k_mmvq_b64_r2 = try gpu_matvec.MatvecPipeline.initQ4KQ8_1Mmvq(ctx, .{
+            .block_size = 64,
+            .num_rows = 2,
+            .num_cols = 1,
+        });
+        errdefer q4_k_mmvq_b64_r2.deinit();
+        var q4_k_mmvq_b64_r4 = try gpu_matvec.MatvecPipeline.initQ4KQ8_1Mmvq(ctx, .{
+            .block_size = 64,
+            .num_rows = 4,
+            .num_cols = 1,
+        });
+        errdefer q4_k_mmvq_b64_r4.deinit();
         var q4_k_r4 = try gpu_matvec.MatvecPipeline.initQ4KQ8_1R4(ctx);
         errdefer q4_k_r4.deinit();
         var q5_0 = try gpu_matvec.MatvecPipeline.initQ5_0Q8_1(ctx);
@@ -423,6 +451,10 @@ const BenchPipelines = struct {
         return .{
             .q3_k = q3_k, .q3_k_mmvq_b32_r1 = q3_k_mmvq_b32_r1,
             .q3_k_mmvq_b64_r1 = q3_k_mmvq_b64_r1, .q4_k = q4_k,
+            .q4_k_mmvq_b32_r1 = q4_k_mmvq_b32_r1,
+            .q4_k_mmvq_b64_r1 = q4_k_mmvq_b64_r1,
+            .q4_k_mmvq_b64_r2 = q4_k_mmvq_b64_r2,
+            .q4_k_mmvq_b64_r4 = q4_k_mmvq_b64_r4,
             .q4_k_r4 = q4_k_r4,
             .q5_0 = q5_0, .q5_1 = q5_1,
             .q5_k = q5_k, .q6_k = q6_k, .q6_k_fast = q6_k_fast,
@@ -447,6 +479,10 @@ const BenchPipelines = struct {
         self.q5_1.deinit();
         self.q5_0.deinit();
         self.q4_k_r4.deinit();
+        self.q4_k_mmvq_b64_r4.deinit();
+        self.q4_k_mmvq_b64_r2.deinit();
+        self.q4_k_mmvq_b64_r1.deinit();
+        self.q4_k_mmvq_b32_r1.deinit();
         self.q4_k.deinit();
         self.q3_k_mmvq_b64_r1.deinit();
         self.q3_k_mmvq_b32_r1.deinit();
@@ -502,8 +538,16 @@ fn cmdBenchMatvec(
     try benchWithPipelineIfSelected(out, &ctx, &pipes.q6_k_mmvq_b64_r2, &pipes.quant, opts, &ran, "lm_head.mmvq.b64.r2", weights.lm_head, .q6_k, gpa, io);
     try benchWithPipelineIfSelected(out, &ctx, &pipes.q6_k_mmvq_b64_r4, &pipes.quant, opts, &ran, "lm_head.mmvq.b64.r4", weights.lm_head, .q6_k, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L0.attn_q", weights.layers[0].wq, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_mmvq_b32_r1, &pipes.quant, opts, &ran, "L0.attn_q.mmvq.b32.r1", weights.layers[0].wq, .q4_k, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_mmvq_b64_r1, &pipes.quant, opts, &ran, "L0.attn_q.mmvq.b64.r1", weights.layers[0].wq, .q4_k, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_mmvq_b64_r2, &pipes.quant, opts, &ran, "L0.attn_q.mmvq.b64.r2", weights.layers[0].wq, .q4_k, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_mmvq_b64_r4, &pipes.quant, opts, &ran, "L0.attn_q.mmvq.b64.r4", weights.layers[0].wq, .q4_k, gpa, io);
     try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_r4, &pipes.quant, opts, &ran, "L0.attn_q.r4", weights.layers[0].wq, .q4_k, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L0.attn_v", weights.layers[0].wv.?, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_mmvq_b32_r1, &pipes.quant, opts, &ran, "L0.attn_v.mmvq.b32.r1", weights.layers[0].wv.?, .q4_k, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_mmvq_b64_r1, &pipes.quant, opts, &ran, "L0.attn_v.mmvq.b64.r1", weights.layers[0].wv.?, .q4_k, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_mmvq_b64_r2, &pipes.quant, opts, &ran, "L0.attn_v.mmvq.b64.r2", weights.layers[0].wv.?, .q4_k, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_mmvq_b64_r4, &pipes.quant, opts, &ran, "L0.attn_v.mmvq.b64.r4", weights.layers[0].wv.?, .q4_k, gpa, io);
     try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_r4, &pipes.quant, opts, &ran, "L0.attn_v.r4", weights.layers[0].wv.?, .q4_k, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L3.attn_v", weights.layers[3].wv.?, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L5.attn_q", weights.layers[5].wq, gpa, io);

@@ -75,6 +75,11 @@ pub const MatvecPipeline = struct {
         return initFromSpv(ctx, &shaders.matvec_q4_k_q8_1, 1);
     }
 
+    pub fn initQ4KQ8_1Mmvq(ctx: *const GpuContext, spec: MmvqSpec) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_q4_k_q8_1_mmvq.len % 4 == 0);
+        return initFromSpvMmvq(ctx, &shaders.matvec_q4_k_q8_1_mmvq, spec);
+    }
+
     // Experimental Q4_K × Q8_1 variant: 4 rows per workgroup.
     pub fn initQ4KQ8_1R4(ctx: *const GpuContext) !MatvecPipeline {
         comptime std.debug.assert(shaders.matvec_q4_k_q8_1_r4.len % 4 == 0);
@@ -2837,6 +2842,62 @@ test "gpu matvec Q4_K × Q8_1 R4 fuzz small" {
 
 test "gpu matvec Q4_K × Q8_1 R4 fuzz model-sized" {
     try fuzzQ4KQ8_1(64, 2304, 19, MatvecPipeline.initQ4KQ8_1R4, "Q4_K×Q8_1.r4");
+}
+
+fn initQ4KQ8_1MmvqB32R1(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ4KQ8_1Mmvq(ctx, .{
+        .block_size = 32,
+        .num_rows = 1,
+        .num_cols = 1,
+    });
+}
+
+fn initQ4KQ8_1MmvqB64R1(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ4KQ8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 1,
+        .num_cols = 1,
+    });
+}
+
+fn initQ4KQ8_1MmvqB64R2(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ4KQ8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 2,
+        .num_cols = 1,
+    });
+}
+
+fn initQ4KQ8_1MmvqB64R4(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ4KQ8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 4,
+        .num_cols = 1,
+    });
+}
+
+test "gpu matvec Q4_K × Q8_1 MMVQ b32 r1 fuzz small" {
+    try fuzzQ4KQ8_1(32, 256, 21, initQ4KQ8_1MmvqB32R1, "Q4_K×Q8_1.mmvq.b32.r1");
+}
+
+test "gpu matvec Q4_K × Q8_1 MMVQ b32 r1 fuzz model-sized" {
+    try fuzzQ4KQ8_1(64, 2304, 23, initQ4KQ8_1MmvqB32R1, "Q4_K×Q8_1.mmvq.b32.r1");
+}
+
+test "gpu matvec Q4_K × Q8_1 MMVQ b64 r1 fuzz small" {
+    try fuzzQ4KQ8_1(32, 256, 25, initQ4KQ8_1MmvqB64R1, "Q4_K×Q8_1.mmvq.b64.r1");
+}
+
+test "gpu matvec Q4_K × Q8_1 MMVQ b64 r1 fuzz model-sized" {
+    try fuzzQ4KQ8_1(64, 2304, 27, initQ4KQ8_1MmvqB64R1, "Q4_K×Q8_1.mmvq.b64.r1");
+}
+
+test "gpu matvec Q4_K × Q8_1 MMVQ b64 r2 fuzz model-sized" {
+    try fuzzQ4KQ8_1(64, 2304, 29, initQ4KQ8_1MmvqB64R2, "Q4_K×Q8_1.mmvq.b64.r2");
+}
+
+test "gpu matvec Q4_K × Q8_1 MMVQ b64 r4 fuzz model-sized" {
+    try fuzzQ4KQ8_1(64, 2304, 31, initQ4KQ8_1MmvqB64R4, "Q4_K×Q8_1.mmvq.b64.r4");
 }
 
 // Q3_K × Q8_1 fuzz: same structure as fuzzQ4KQ8_1 but with Q3_K weight bytes.

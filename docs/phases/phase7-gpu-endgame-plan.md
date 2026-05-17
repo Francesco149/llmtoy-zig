@@ -297,13 +297,17 @@ Current targets are `lm_head`, `lm_head.fast`, `lm_head.mmvq.b32.r1`,
 `lm_head.mmvq.b64.r1`, `lm_head.mmvq.b64.r2`, `lm_head.mmvq.b64.r4`,
 `L0.attn_q`, `L0.attn_q.r4`, `L0.attn_v`, `L0.attn_v.r4`, `L3.attn_v`,
 `L5.attn_q`, `L5.attn_q.mmvq.b32.r1`, `L5.attn_q.mmvq.b64.r1`,
-`L0.dense_down`,
+`L0.attn_q.mmvq.b32.r1`, `L0.attn_q.mmvq.b64.r1`,
+`L0.attn_q.mmvq.b64.r2`, `L0.attn_q.mmvq.b64.r4`,
+`L0.attn_v.mmvq.b32.r1`, `L0.attn_v.mmvq.b64.r1`,
+`L0.attn_v.mmvq.b64.r2`, `L0.attn_v.mmvq.b64.r4`, `L0.dense_down`,
 `L5.dense_down`, `L0.expert_down`, and `L10.expert_down`. They cover Q3_K,
 Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, and IQ4_NL with the target model's actual
 row/column sizes. The `.r4` targets are experimental Q4_K row-batching probes,
 `lm_head.fast` is an experimental Q6_K packed-decode probe, `lm_head.mmvq.*`
 targets are early Q6_K MMVQ ports, and `L5.attn_q.mmvq.*` targets are early
-Q3_K MMVQ ports; none is a production route until it beats the current path.
+Q3_K MMVQ ports. `L0.attn_q/v.mmvq.*` targets are early Q4_K MMVQ ports.
+None is a production route until it beats the current path.
 
 End-to-end tok/s is too noisy for shader iteration. Add a command or test-only
 binary that runs one GPU kernel shape thousands of times with fixed buffers.
@@ -573,9 +577,9 @@ Next implementation slice:
 
 1. Repeat the Q3_K b64/r1 measurement once more after the next shader change;
    keep it bench-only unless it stays ahead in stable runs.
-2. Port the same framework to Q4_K. Start with `L0.attn_q`/`L0.attn_v`
-   candidates because Q4_K appears in the attention projections and already has
-   a negative local-size-y `.r4` probe to compare against.
+2. Move to the next non-Q4/Q6 bottleneck from the profile. Likely candidates:
+   Q5_0/Q5_1 down projections, Q5_K attention-V, or IQ4_NL expert down. Keep
+   each as a bench-only MMVQ target until it beats the current shader.
 3. Keep current production routing on the existing kernels until a full
    generate profile shows a material token/s improvement, not just a narrow
    isolated `lm_head` win.
@@ -596,6 +600,24 @@ Q3_K MMVQ first slice:
 - Updated conclusion: b64/r1 is a bench-only Q3_K candidate; b32/r1 is a
   negative. Repeat/tune b64 only if it remains ahead in stable runs, then port
   the same framework to Q4_K.
+
+Q4_K MMVQ first slice:
+
+- Added `matvec_q4_k_q8_1_mmvq.glsl`, using llama.cpp's `DATA_A_Q4_K`
+  structure: packed32 Q4 reads, Q8_1 cache, Q4 scale/min decode, and the safe
+  MMVQ reduction.
+- Added bench targets for `L0.attn_q` and `L0.attn_v`: b32/r1, b64/r1,
+  b64/r2, and b64/r4.
+- Correctness: b32/r1 `rel=2.654e-5`, b64/r1 `rel=1.436e-5`,
+  b64/r2 `rel=2.626e-5`, b64/r4 `rel=3.619e-5` on 2304-column fuzz.
+- Focused GPU timestamps: current `L0.attn_q` about 14.89 us, b32/r1 about
+  19.13 us, b64/r1 about 16.12 us, b64/r2 about 16.79 us, b64/r4 about
+  16.41 us. Current `L0.attn_v` about 9.33 us, b32/r1 about 11.17 us,
+  b64/r1 about 10.03 us.
+- Updated conclusion: Q4_K MMVQ is correct but not a win. Keep it bench-only
+  as a reference. The current Q4_K shader is already strong for these small
+  attention projections; do not spend another session on Q4_K MMVQ unless a
+  full profile shows a different Q4_K shape dominates.
 
 Acceptance criteria:
 

@@ -636,6 +636,45 @@ of the current shader in this focused run. `b32/r1` is a clear negative. Keep
 the candidate bench-only until repeated runs and a full generation profile show
 a material win.
 
+### Q4_K MMVQ scaffold
+
+Added `matvec_q4_k_q8_1_mmvq.glsl`, following llama.cpp's `DATA_A_Q4_K`
+helper with packed32 Q4 reads, Q8_1 activation caching, Q4 scale/min handling,
+and the same MMVQ reduction framework. Added bench targets:
+
+- `L0.attn_q.mmvq.b32.r1`
+- `L0.attn_q.mmvq.b64.r1`
+- `L0.attn_q.mmvq.b64.r2`
+- `L0.attn_q.mmvq.b64.r4`
+- equivalent `L0.attn_v.*` targets
+
+Correctness:
+
+| Variant | 2304-col rel |
+|---------|--------------|
+| b32/r1 | `2.654e-5` |
+| b64/r1 | `1.436e-5` |
+| b64/r2 | `2.626e-5` |
+| b64/r4 | `3.619e-5` |
+
+Focused timestamp snapshots, 128 iterations:
+
+| Target | GPU us, profiler |
+|--------|------------------|
+| `L0.attn_q` | 14.89 |
+| `L0.attn_q.mmvq.b32.r1` | 19.13 |
+| `L0.attn_q.mmvq.b64.r1` | 16.12 |
+| `L0.attn_q.mmvq.b64.r2` | 16.79 |
+| `L0.attn_q.mmvq.b64.r4` | 16.41 |
+| `L0.attn_v` | 9.33 |
+| `L0.attn_v.mmvq.b32.r1` | 11.17 |
+| `L0.attn_v.mmvq.b64.r1` | 10.03 |
+
+The Q4_K MMVQ port is correct but not a GPU-time win. `b64/r1` is closest,
+while `b32/r1`, `r2`, and `r4` are clear negatives. Keep these as bench-only
+reference targets and do not route Q4_K production through MMVQ without a
+separate measured reason.
+
 The submit-count reductions buy ~150–300 µs/token in saved overhead. On
 RX 7800 XT with our shaders the absolute per-submit cost (~150 µs) is
 small relative to the 220 ms of GPU matmul work per token, so each saved
