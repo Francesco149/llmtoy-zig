@@ -249,6 +249,76 @@ buffers + attn_in_buf/attn_vram) to collapse per-layer submits:
 | `runLayerDenseFfnQ8_1`                       | 4 | Fuses gate+up + GPU GELU + w_down + post_ffw_norm_1 — eliminates the standalone w_down submit |
 | `runLayerAttnResidualDenseFfnQ8_1`           | 3 | Also folds wo + post_attn_norm + residual into the same submit |
 
+## Phase 7o — Q5_0/Q5_1 MMVQ bench-only probe
+
+Added llama.cpp-style legacy-quant MMVQ shaders for Q5_0 and Q5_1. They pass
+the GPU fuzz tests, but they are not production wins on the target shapes.
+
+Focused `bench-matvec --iters 128 --target all` GPU timestamps:
+
+| Target | Current GPU us | Best Q5 MMVQ GPU us | Result |
+|--------|----------------|---------------------|--------|
+| `L0.dense_down` Q5_1 | 8.27 | 10.33 (`b64.r2`) | slower |
+| `L5.dense_down` Q5_0 | 9.34 | 11.69 (`b64.r2`) | slower |
+| `L0.expert_down` Q5_1 | 4.27 | 4.89 (`b64.r2`) | slower |
+
+Conclusion: keep Q5 MMVQ as bench-only reference code. The existing simple Q5
+Q8_1 kernels are faster for these decode shapes on this device.
+
+## llama.cpp Vulkan Reference — Nix package
+
+Reference package:
+
+```text
+nixpkgs#llama-cpp-vulkan
+llama-cli version: 8983 (80afa33)
+device: Vulkan0 AMD Radeon RX 7800 XT (RADV NAVI32)
+```
+
+The plain `nixpkgs#llama-cpp` package only exposes `BLAS` here. Use
+`nixpkgs#llama-cpp-vulkan` for parity work.
+
+Production-like reference command, adapted from
+`../nix-lab/hosts/lame/llama.nix`:
+
+```sh
+env GGML_VK_PERF_LOGGER=1 GGML_VK_PERF_LOGGER_FREQUENCY=1 \
+  VK_ICD_FILENAMES=/run/opengl-driver/share/vulkan/icd.d/radeon_icd.x86_64.json \
+  nix shell nixpkgs#llama-cpp-vulkan -c llama-cli \
+  -m /opt/ai-lab/models/mudler/gemma-4-26B-A4B-it-APEX-GGUF/gemma-4-26B-A4B-APEX-I-Mini.gguf \
+  -p "Briefly explain the full forward pass of a MoE model" \
+  -n 8 -t 12 -c 120000 -ngl 99 --n-cpu-moe 0 \
+  --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --parallel 1 \
+  --chat-template-file /opt/ai-lab/templates/new-chat-template-gemma.jinja \
+  --temp 0 --top-k 40 --top-p 0.9 --seed 42 \
+  --conversation --single-turn --reasoning off --no-display-prompt \
+  --no-warmup --simple-io --device Vulkan0 --perf
+```
+
+`llama-cli` rejected `--kv-unified`; that flag is present in the llama-server
+service config but was omitted from this CLI probe.
+
+Result:
+
+| Engine | Prompt tok/s | Generation tok/s |
+|--------|--------------|------------------|
+| llama.cpp Vulkan (`nixpkgs#llama-cpp-vulkan`) | 223.5 | 85.6 |
+
+The observed llama.cpp decode pipeline is the real parity target:
+
+| Kernel family | Representative decode timing |
+|---------------|------------------------------|
+| `MUL_MAT_ID_VEC q3_K m=1408 n=8 k=2816 n_expert=128` | ~39-46 us |
+| `MUL_MAT_ID_MUL MUL_MAT_ID_VEC q5_0 m=2816 n=8 k=704 n_expert=128` | ~36-40 us |
+| `MUL_MAT_ID_MUL MUL_MAT_ID_VEC iq4_nl m=2816 n=8 k=704 n_expert=128` | ~27-29 us |
+| `MUL_MAT_VEC q6_K m=262144 n=1 k=2816` | ~1.03 ms |
+| `FLASH_ATTN_EXT` SWA/global decode | ~14 us / ~30 us per layer group |
+| `RMS_NORM_MUL` and `RMS_NORM_MUL_ROPE` | fused small-op path, ~6 us per call |
+
+This changes the near-term optimization target. Isolated one-row matvec ports
+are not enough; llama.cpp's big wins are fused MoE `MUL_MAT_ID*_VEC` routing,
+Vulkan flash attention, q8_0 KV, and graph fusion around norms/RoPE/adds.
+
 Hyperfine 5-run wall-clock for `generate "Write three lines about the
 history of Rome." --chat --temperature 0 --max-tokens 64 --gpu` (includes
 ~5.7 s model setup):
@@ -776,9 +846,222 @@ the activation no longer round-trips between CPU/GPU per matmul, and
 follow-on optimisations (one-submit per layer, persistent command
 buffers, V-from-K shader for global layers) all become possible.
 
+Follow-up: the V-from-K global-layer path is now wired into
+`runLayerAttnQ8_1KvVram`. For layers without `wv`, the GPU copies raw K into
+the V buffer before K norm/RoPE, then runs the existing V `rmsnormRaw`, cache
+append, and GPU attention path. This removes the global-layer CPU
+norm/RoPE/`sdpAttn` fallback without changing the long-term graph shape.
+
+Verification:
+
+- `llmtoy compare ... "explain MoE" --chat --gpu-layers 5:5`: all layer
+  argmaxes and final argmax match CPU.
+- Full `llmtoy compare ... "explain MoE" --chat`: all layer argmaxes and final
+  argmax match CPU.
+- Short timestamped generation,
+  `LLMTOY_GPU_PROFILE=1 ... generate "what is 1+1?" --chat --temperature 0
+  --max-tokens 8 --gpu`: prefill 17.89 tok/s, decode 17.87 tok/s.
+
+Profile evidence from the short generation: `attn_front.v_from_k_copy` appears
+140 times (5 shared-V layers × 28 forwarded tokens), `attention.qk_softmax` and
+`attention.av` run 840 times (30 layers × 28 tokens), and `attn_front.wv`
+appears only for the 25 layers with explicit V. The copy itself is tiny
+(~0.35 us/call); the value is eliminating the CPU fallback and keeping the
+attention graph device-resident.
+
 Verified via `llmtoy compare`: all 30 layer argmaxes match CPU,
 per-layer rel_err identical to 7l.1 baseline, final argmax matches
 (1852 = 1852).
+
+## Phase 7m/7n — Current MoE batch baseline
+
+Added `llmtoy bench-moe <model.gguf> [--iters N] [--layer N]`, which uploads
+the real Gemma4 tensors and times the production `GpuWeights.runExpertBatch`
+path for a fixed top-8 expert set. This is the pre-fusion baseline before
+porting llama.cpp's `MUL_MAT_ID_VEC` / `MUL_MAT_ID_MUL` pipeline shape.
+
+Command:
+
+```sh
+nix develop --command env LLMTOY_GPU_PROFILE=1 ./zig-out/bin/llmtoy \
+  bench-moe /opt/ai-lab/models/mudler/gemma-4-26B-A4B-it-APEX-GGUF/gemma-4-26B-A4B-APEX-I-Mini.gguf \
+  --iters 64 --layer N
+```
+
+Quiet-system preflight: no stray processes, 1m load 0.36, 59 GiB available.
+
+| Layer | gate/up | down | wall us/iter | GPU phase us/iter | host/submit us/iter |
+|-------|---------|------|--------------|-------------------|---------------------|
+| 0 | Q3_K | Q5_1 | 614.08 | 84.97 | 529.12 |
+| 10 | Q3_K | IQ4_NL | 629.70 | 96.81 | 532.89 |
+
+Layer 0 GPU phase breakdown:
+
+| Phase | dispatches | avg us/dispatch | avg us/iter |
+|-------|------------|-----------------|-------------|
+| `moe.quantize_input` | 64 | 2.40 | 2.40 |
+| `moe.fused_gate_up` | 512 | 6.28 | 50.25 |
+| `moe.quantize_mid` | 512 | 0.28 | 2.28 |
+| `moe.down` | 512 | 3.18 | 25.45 |
+| `moe.accum` | 64 | 4.59 | 4.59 |
+
+Layer 10 GPU phase breakdown:
+
+| Phase | dispatches | avg us/dispatch | avg us/iter |
+|-------|------------|-----------------|-------------|
+| `moe.quantize_input` | 64 | 2.38 | 2.38 |
+| `moe.fused_gate_up` | 512 | 6.28 | 50.24 |
+| `moe.quantize_mid` | 512 | 0.28 | 2.26 |
+| `moe.down` | 512 | 4.67 | 37.37 |
+| `moe.accum` | 64 | 4.55 | 4.55 |
+
+Interpretation: raw GPU MoE work is already in the same order as llama.cpp's
+per-op Vulkan trace, but the current path pays roughly 0.53 ms/iteration in
+host-side descriptor allocation/free, command recording, and many tiny dispatches
+inside a single submission. The next optimization is not another isolated
+one-row matvec variant; it is a llama.cpp-shaped expert-id dispatch that packs
+the selected experts and fuses the down score multiply.
+
+## Phase 7o — Expert-ID MoE shape prototypes
+
+Reference source: `/opt/ai-lab/llama.cpp/ggml/src/ggml-vulkan/`, especially
+`ggml_vk_mul_mat_vec_id_q_f16`, `mul_mat_vecq.comp`, and
+`mul_mat_vec_base.glsl`.
+
+Fixed a correctness bug in the simple pipeline helper while adding the
+expert-id prototypes: `buildSimplePipeline` only allocated descriptor metadata
+for four storage bindings, but the first down-id pipeline needs five bindings
+(`weights`, `acts`, `ids`, `scales`, `out`). In ReleaseFast this presented as
+bad benchmark behavior rather than a clean assert. The helper now supports five
+bindings and `zig build test` includes focused expert-id shader tests.
+
+Clean-system command:
+
+```sh
+nix develop --command env LLMTOY_GPU_PROFILE=1 ./zig-out/bin/llmtoy \
+  bench-moe /opt/ai-lab/models/mudler/gemma-4-26B-A4B-it-APEX-GGUF/gemma-4-26B-A4B-APEX-I-Mini.gguf \
+  --iters 16 --layer N
+```
+
+Clean Vulkan baseline at process start was VRAM=182 MiB / GTT=15 MiB. Existing
+expert upload ends around VRAM=12548 MiB; the prototype flat layer uploads are
+temporary microbench scaffolding and should not be duplicated in the production
+path.
+
+| Layer | existing MoE GPU us/iter | gate-up-id GPU us | down-id GPU us | llama.cpp comparable trace |
+|-------|--------------------------|-------------------|----------------|----------------------------|
+| 0 Q3_K/Q5_1 | 85.86 | 55.04 | 26.05 | Q3_K ID ~39-46 us, Q5_0 ID+MUL ~36-40 us |
+| 10 Q3_K/IQ4_NL | 98.91 | 55.20 | 37.89 | Q3_K ID ~39-46 us, IQ4_NL ID+MUL ~27-29 us |
+
+Interpretation:
+
+- The down-id shape is viable. Q5_1 lands at ~26 us and IQ4_NL lands at ~38 us
+  for 8 selected experts, close enough to justify wiring it into the real MoE
+  path behind a correctness gate.
+- The first gate-up-id prototype is correct but not yet faster than the current
+  eight per-expert fused dispatches on GPU time alone: current gate/up totals
+  about 50 us/iter, prototype is about 55 us. It may still reduce host work
+  once integrated, but the GPU kernel should be brought closer to llama.cpp's
+  `mul_mat_vecq.comp` Q3_K inner loop before replacing the existing path.
+- A 64-lane local-size experiment passed correctness on the AMD target but did
+  not improve timings, so the prototype stays at the safer 32-lane subgroup
+  shape for now.
+
+Next debugging step: use a narrow model-backed correctness harness for the real
+MoE intermediates. Compare the current per-expert gate/up and down outputs
+against the ID prototypes for a selected layer, then use `llmtoy compare
+--gpu-layers L0:L1` once either ID path is wired into `runExpertBatch`.
+
+Follow-up integration result:
+
+- `runExpertBatch` now routes supported expert-down tensors through the
+  expert-id Q8_1 path. The production MoE down phase dropped from 8 dispatches
+  per iteration to 1 dispatch per iteration in `bench-moe`.
+- Correctness check:
+  `llmtoy compare ... "explain MoE" --chat --gpu-layers 0:0` keeps all layer
+  argmaxes and final argmax matching CPU.
+- Layer 0 `bench-moe --iters 32` with GPU timestamps after integration:
+  gate/up remains 256 dispatches / 50.32 us per iter, quantize-mid remains
+  256 dispatches / 2.31 us per iter, id-down is 32 dispatches / 28.12 us per
+  iter, accum is 32 dispatches / 4.66 us per iter, total wall is
+  618.43 us/iter.
+
+Interpretation: down-id integration is correct and reduces dispatch count, but
+it is not a material MoE wall-time win yet. Host submit/readback overhead still
+dominates this microbench, and gate/up remains the larger GPU-time slice. Keep
+the down-id route because it matches the intended MUL_MAT_ID shape, but the
+next MoE optimization should target gate/up kernel quality or broader command
+submission overhead rather than more down-id polishing.
+
+Gate/up-id one-pass Q3_K update:
+
+- The bench-only `expert_gate_up_id_q3_k_q8_1` shader now accumulates gate and
+  up in one pass over each Q8_1 activation block instead of calling the Q3_K
+  dot loop twice. This keeps the same selected-expert output contract and does
+  not change production routing.
+- Clean-system preflight before measurement: no stray processes, 1m load 0.60,
+  58 GiB available.
+- `zig build test` passes after the shader change, including the focused
+  expert gate/up ID correctness test.
+- Layer 0, `bench-moe --iters 16 --layer 0`: production path remains
+  610.94 us/iter wall, 86.77 us/iter GPU phases. Gate/up ID measures
+  155.96 us wall / 52.01 us GPU; down ID measures 90.42 us wall /
+  26.04 us GPU.
+- Layer 10, `bench-moe --iters 16 --layer 10`: production path remains
+  622.33 us/iter wall, 98.15 us/iter GPU phases. Gate/up ID measures
+  129.00 us wall / 51.88 us GPU; down ID measures 116.86 us wall /
+  37.83 us GPU.
+
+Interpretation: the one-pass change recovers a few microseconds versus the
+earlier ~55 us gate/up ID prototype, but it still does not beat the current
+eight per-expert fused gate/up dispatches on GPU time (~50 us/iter). Keep it as
+a bench-only improvement. A production gate/up-ID route would also need a
+non-duplicating flat gate/up weight layout, otherwise it adds a large extra VRAM
+copy of tensors that are already uploaded per expert.
+
+Opt-in production-like gate/up-ID route:
+
+- Added `LLMTOY_EXPERT_GU_ID=1` as an experiment. When enabled, each supported
+  layer uploads the existing flat `ffn_gate_up_exps.weight` tensor and skips the
+  separate per-expert gate/up uploads, avoiding the duplicate-VRAM failure mode.
+  The MoE path records one gate/up-ID dispatch into a flat f32 mid buffer, then
+  quantizes each selected expert range into the existing flat Q8_1 mid buffer
+  for expert-down ID.
+- A first attempt that kept both flat and per-expert gate/up uploads pushed the
+  process into GTT-heavy placement (`VRAM=14212 MiB GTT=4627 MiB`) and made even
+  standalone ID probes hundreds of microseconds slower. That path was removed;
+  the opt-in route now ends around `VRAM=12524 MiB GTT=28 MiB`, comparable to
+  baseline.
+- Correctness with the opt-in route:
+  `LLMTOY_EXPERT_GU_ID=1 llmtoy compare ... "explain MoE" --chat
+  --gpu-layers 0:0` keeps all layer argmaxes and final argmax matching CPU.
+- Layer 0, `LLMTOY_EXPERT_GU_ID=1 bench-moe --iters 16 --layer 0`:
+  gate/up drops from 128 dispatches to 16 dispatches in the timed loop, but
+  total wall does not improve. Measured `618.25 us/iter` wall,
+  `95.11 us/iter` GPU phases, `523.15 us/iter` host/submit.
+
+Follow-up: added `quantize_q8_1_batched.glsl` for the flat gate/up-ID mid
+buffer. In the opt-in route it quantizes all selected expert mids in one
+dispatch instead of recording one descriptor/dispatch per expert.
+
+- Layer 0, `LLMTOY_EXPERT_GU_ID=1 bench-moe --iters 16 --layer 0` after
+  batched mid quantization: `561.33 us/iter` wall, `93.89 us/iter` GPU phases,
+  `467.44 us/iter` host/submit.
+- Timed-loop dispatch counts moved from gate/up 16, quantize-mid 128, down 16,
+  accum 16 to gate/up 16, quantize-mid 16, down 16, accum 16. Per-iteration
+  `moe.quantize_mid` GPU time is now about `1.24 us`.
+- Correctness still holds:
+  `LLMTOY_EXPERT_GU_ID=1 llmtoy compare ... "explain MoE" --chat
+  --gpu-layers 0:0` keeps all layer argmaxes and final argmax matching CPU.
+
+Interpretation: the route is correct and structurally closer to llama.cpp's
+`MUL_MAT_ID_VEC`, and batched mid quantization gives the first meaningful
+MoE wall-time improvement from this route. It is still not ready as the default:
+gate/up-ID GPU time remains slightly slower than the current per-expert fused
+path, and the MoE microbench still pays about 0.47 ms/iteration in
+host/submit/readback overhead. The next final-pipeline step should reduce
+MoE command/descriptor/readback overhead further or improve the Q3_K ID inner
+loop toward llama.cpp's ~39-46 us trace.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

@@ -301,12 +301,18 @@ Current targets are `lm_head`, `lm_head.fast`, `lm_head.mmvq.b32.r1`,
 `L0.attn_q.mmvq.b64.r2`, `L0.attn_q.mmvq.b64.r4`,
 `L0.attn_v.mmvq.b32.r1`, `L0.attn_v.mmvq.b64.r1`,
 `L0.attn_v.mmvq.b64.r2`, `L0.attn_v.mmvq.b64.r4`, `L0.dense_down`,
-`L5.dense_down`, `L0.expert_down`, and `L10.expert_down`. They cover Q3_K,
+`L0.dense_down.mmvq.b64.r1`, `L0.dense_down.mmvq.b64.r2`,
+`L0.dense_down.mmvq.b64.r4`, `L5.dense_down`,
+`L5.dense_down.mmvq.b64.r1`, `L5.dense_down.mmvq.b64.r2`,
+`L5.dense_down.mmvq.b64.r4`, `L0.expert_down`,
+`L0.expert_down.mmvq.b64.r1`, `L0.expert_down.mmvq.b64.r2`,
+`L0.expert_down.mmvq.b64.r4`, and `L10.expert_down`. They cover Q3_K,
 Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, and IQ4_NL with the target model's actual
 row/column sizes. The `.r4` targets are experimental Q4_K row-batching probes,
 `lm_head.fast` is an experimental Q6_K packed-decode probe, `lm_head.mmvq.*`
-targets are early Q6_K MMVQ ports, and `L5.attn_q.mmvq.*` targets are early
-Q3_K MMVQ ports. `L0.attn_q/v.mmvq.*` targets are early Q4_K MMVQ ports.
+targets are early Q6_K MMVQ ports, `L5.attn_q.mmvq.*` targets are early
+Q3_K MMVQ ports, `L0.attn_q/v.mmvq.*` targets are early Q4_K MMVQ ports,
+and `dense_down/expert_down.mmvq.*` targets are early Q5_0/Q5_1 MMVQ ports.
 None is a production route until it beats the current path.
 
 End-to-end tok/s is too noisy for shader iteration. Add a command or test-only
@@ -619,6 +625,29 @@ Q4_K MMVQ first slice:
   attention projections; do not spend another session on Q4_K MMVQ unless a
   full profile shows a different Q4_K shape dominates.
 
+Q5_0/Q5_1 MMVQ first slice:
+
+- Added `matvec_q5_0_q8_1_mmvq.glsl` and
+  `matvec_q5_1_q8_1_mmvq.glsl`, following llama.cpp's legacy-quant
+  `DATA_A_Q5_0`/`DATA_A_Q5_1` MMVQ path: `K_PER_ITER=8`, packed16 quant
+  reads, packed32 Q5_1 scale/min reads, Q8_1 cache, and the safe
+  subgroup-plus-shared-memory reduction.
+- Added bench-only targets for dense down and one expert-down slice:
+  `L0.dense_down.mmvq.b64.r{1,2,4}`,
+  `L5.dense_down.mmvq.b64.r{1,2,4}`, and
+  `L0.expert_down.mmvq.b64.r{1,2,4}`.
+- Correctness: all new Q5_0/Q5_1 MMVQ fuzz tests pass at the existing
+  `rel < 1e-3` tolerance on 704-column model-shaped cases.
+- Focused GPU timestamps with `--iters 128 --target all`: current
+  `L0.dense_down` about 8.27 us vs MMVQ best about 10.33 us; current
+  `L5.dense_down` about 9.34 us vs MMVQ best about 11.69 us; current
+  `L0.expert_down` about 4.27 us vs MMVQ best about 4.89 us.
+- Updated conclusion: Q5_0/Q5_1 MMVQ is correct but not a win. Keep these as
+  bench-only reference targets. Do not route generation through them; the next
+  optimization should move to a different measured bottleneck, likely Q5_K or
+  IQ4_NL MMVQ, global-layer CPU attention, or command/fence overhead if the
+  next full profile points there.
+
 Acceptance criteria:
 
 - Every new quant shader passes fuzz tests at the existing tolerances.
@@ -743,7 +772,44 @@ wins or loses on RADV/RDNA3.
 
 ## Phase 7t - llama.cpp Reference Benchmark Discipline
 
-Status: TODO.
+Status: STARTED. A Nix Vulkan reference is now recorded.
+
+Important: `nixpkgs#llama-cpp` only exposes `BLAS` in this environment. Use
+`nixpkgs#llama-cpp-vulkan`; it reports `Vulkan0: AMD Radeon RX 7800 XT (RADV
+NAVI32)`.
+
+The Gemma4 service flags live in `../nix-lab/hosts/lame/llama.nix`:
+
+- package: `pkgs.llama-cpp-vulkan`
+- `-c 120000`, `-ngl 99`, `--n-cpu-moe 0`, `--kv-unified`
+- `--flash-attn on`
+- `--cache-type-k q8_0`, `--cache-type-v q8_0`
+- `--parallel 1`
+- Gemma chat template: `/opt/ai-lab/templates/new-chat-template-gemma.jinja`
+
+`llama-cli` version `8983 (80afa33)` rejects `--kv-unified`, but the rest of
+the production-like flags work for a CLI probe. The short reference run
+reported about `223.5` prompt tok/s and `85.6` generation tok/s.
+
+Most important finding: llama.cpp's actual decode pipeline for this model is
+not just "better one-row MMVQ." The hot path uses:
+
+- `MUL_MAT_ID_VEC` for Q3_K expert gate/up
+- `MUL_MAT_ID_MUL MUL_MAT_ID_VEC` for expert down with fused scale multiply
+- `FLASH_ATTN_EXT` for attention
+- q8_0 KV cache in the production config
+- fused small ops such as `RMS_NORM_MUL` and `RMS_NORM_MUL_ROPE`
+
+Representative decode timings from the reference:
+
+- `MUL_MAT_ID_VEC q3_K m=1408 n=8 k=2816 n_expert=128`: about 39-46 us
+- `MUL_MAT_ID_MUL MUL_MAT_ID_VEC q5_0 m=2816 n=8 k=704 n_expert=128`:
+  about 36-40 us
+- `MUL_MAT_ID_MUL MUL_MAT_ID_VEC iq4_nl m=2816 n=8 k=704 n_expert=128`:
+  about 27-29 us
+- `MUL_MAT_VEC q6_K m=262144 n=1 k=2816`: about 1.03 ms
+- `FLASH_ATTN_EXT` decode: about 14 us for SWA layer groups and about 30 us
+  for global layer groups
 
 Once per milestone, benchmark the local llama.cpp clone with the same model,
 prompt, max token count, GPU, and driver. Record:
@@ -759,6 +825,20 @@ prompt, max token count, GPU, and driver. Record:
 The reported 80-100 tok/s target may be real, stale, or measured with different
 batching/model flags. Future agents need a hard local reference, not folklore.
 
+Updated next target:
+
+1. Stop broad isolated MMVQ ports unless a reference timing points directly at
+   that tensor type.
+2. Use `llmtoy bench-moe` to track the current top-k expert path while porting
+   llama.cpp's real decode shape: selected experts as one `MUL_MAT_ID_VEC`-style
+   dispatch with `n_expert=128`, `n=8`, and fused expert score multiply for
+   down projections.
+3. Port llama.cpp's `mul_mat_vec_id_*_q8_1_f32` / fused
+   `MUL_MAT_ID_MUL` structure for Q3_K gate/up and Q5_0/IQ4_NL down before
+   more single-matrix shader tuning.
+4. Separately compare llmtoy attention to llama.cpp `FLASH_ATTN_EXT`; the
+   current llmtoy attention path is structurally behind the reference.
+
 ---
 
 ## Sequencing Summary
@@ -767,8 +847,8 @@ batching/model flags. Future agents need a hard local reference, not folklore.
 |-------|--------|---------|-----------------|
 | 7h-7l | DONE | Correctness, Q8_1, GPU norms/RoPE/KV/attention | 3 tok/s -> ~4 tok/s |
 | 7m | STARTED | GPU timestamp profiler | Blocks informed work |
-| 7n | STARTED | Matvec microbench harness | Blocks shader iteration |
-| 7o | TODO | Faithful llama.cpp MMVQ-style matvecs | Main 20x lever |
+| 7n | STARTED | Matvec + MoE microbench harness | Blocks shader iteration |
+| 7o | TODO | Faithful llama.cpp expert-id matvecs | Main MoE lever |
 | 7p | TODO | Real batched prefill / MMQ | Prefill parity |
 | 7q | TODO | Remove proven CPU round trips | Secondary after matvec |
 | 7r | TODO | Descriptor/command/fence reuse | Secondary after matvec |
@@ -793,6 +873,32 @@ systemd-run --user --scope -p MemoryMax=40G --quiet -- \
 ```
 
 - CLI argument order is `generate <model> <prompt>` first, flags after.
+- `bench-moe` baseline on this host:
+  - layer 0 Q3_K/Q5_1: 614.08 us wall, 84.97 us GPU phases per top-8 MoE batch
+  - layer 10 Q3_K/IQ4_NL: 629.70 us wall, 96.81 us GPU phases per top-8 MoE batch
+  - the ~0.53 ms gap is host/descriptor/recording overhead from the current
+    many-dispatch path; see `docs/benchmarks/phase7_gpu.md`
+- Expert-ID prototype status:
+  - `expert_down_id_q5_1_q8_1` and `expert_down_id_iq4_nl_q8_1` pass focused
+    shader tests and benchmark at about 26 us (Q5_1 layer 0) and 38 us
+    (IQ4_NL layer 10) for 8 selected experts.
+  - `expert_gate_up_id_q3_k_q8_1` passes focused shader tests. The current
+    one-pass gate/up variant is about 52 us for 8 selected experts versus
+    about 50 us for the current eight per-expert fused dispatches. Do not wire
+    it into production until the Q3_K inner loop is closer to llama.cpp's
+    `mul_mat_vecq.comp`, or until a production-like integration proves that
+    lower host overhead outweighs the slightly slower GPU phase without adding
+    a duplicate flat gate/up upload.
+  - `LLMTOY_EXPERT_GU_ID=1` enables an opt-in production-like route: flat
+    gate/up upload per layer, no per-expert gate/up duplicate for those layers,
+    one gate/up-ID dispatch, then flat-mid Q8_1 quantization for down-ID. It is
+    correct for `compare --gpu-layers 0:0`. After adding batched flat-mid
+    Q8_1 quantization, layer 0 `bench-moe` improved to about 561 us/iter wall
+    and 94 us/iter GPU phases, but it stays experimental because gate/up-ID is
+    still slower than the current per-expert gate/up GPU phase.
+  - Before enabling any ID path in `runExpertBatch`, add or use a model-backed
+    correctness check that compares real selected-expert intermediates against
+    the existing per-expert path, then run `llmtoy compare --gpu-layers`.
 - The old `scripts/regression_compare.py` workflow is obsolete for GPU work.
   Use `llmtoy compare`, shader fuzz tests, GPU profiles, and direct llama.cpp
   milestone benchmarks.

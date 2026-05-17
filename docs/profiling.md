@@ -70,6 +70,10 @@ then includes the current descriptor, command-buffer, submit, wait, and cleanup
 overhead in each measured iteration. Use it to choose between matvec kernels;
 use full `generate --gpu` only after the microbench shows a real win.
 
+Current experimental targets include bench-only MMVQ variants such as
+`*.mmvq.b64.r1`, `*.mmvq.b64.r2`, and `*.mmvq.b64.r4`. These are comparison
+targets, not production routing.
+
 With `LLMTOY_GPU_PROFILE=1`, the table also prints per-dispatch GPU timestamp
 time and the remaining CPU/submit overhead:
 
@@ -81,6 +85,51 @@ nix develop --command env LLMTOY_GPU_PROFILE=1 ./zig-out/bin/llmtoy bench-matvec
 Use `--reuse-descriptor` to measure the ceiling from reusing a descriptor set
 for one stable matvec binding. This is a bench probe; production routing still
 uses the normal path unless explicitly changed.
+
+## llama.cpp Vulkan Reference
+
+Use the Vulkan package, not the generic package:
+
+```sh
+nix shell nixpkgs#llama-cpp-vulkan -c llama-cli --list-devices
+```
+
+Expected on the target host:
+
+```text
+Vulkan0: AMD Radeon RX 7800 XT (RADV NAVI32)
+```
+
+Enable llama.cpp's Vulkan timestamp logger with:
+
+```sh
+GGML_VK_PERF_LOGGER=1 GGML_VK_PERF_LOGGER_FREQUENCY=1 \
+VK_ICD_FILENAMES=/run/opengl-driver/share/vulkan/icd.d/radeon_icd.x86_64.json \
+nix shell nixpkgs#llama-cpp-vulkan -c llama-cli ...
+```
+
+Cross-check production flags in `../nix-lab/hosts/lame/llama.nix` before
+recording parity numbers.
+
+## MoE GPU Baseline
+
+Use the production expert path microbench when comparing against llama.cpp's
+`MUL_MAT_ID_VEC` / `MUL_MAT_ID_MUL` Vulkan trace:
+
+```sh
+nix develop --command env LLMTOY_GPU_PROFILE=1 ./zig-out/bin/llmtoy \
+  bench-moe /opt/ai-lab/models/mudler/gemma-4-26B-A4B-it-APEX-GGUF/gemma-4-26B-A4B-APEX-I-Mini.gguf \
+  --iters 64 --layer 0
+```
+
+Current baseline on the RX 7800 XT:
+
+- layer 0 Q3_K/Q5_1 top-8 MoE: 614.08 us wall, 84.97 us GPU phases
+- layer 10 Q3_K/IQ4_NL top-8 MoE: 629.70 us wall, 96.81 us GPU phases
+
+The GPU phase timing is useful for shader comparisons; the wall timing exposes
+the current descriptor/command-recording overhead that llama.cpp avoids with its
+expert-id pipeline shape.
 
 ## Sampling Profile
 
