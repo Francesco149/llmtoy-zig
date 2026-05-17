@@ -2,7 +2,7 @@
 
 An educational LLM inference engine written in [Zig](https://ziglang.org/), built incrementally as a learning project. The goal is to understand both Zig and LLM inference from the ground up — starting from the simplest possible implementation and progressing toward a performant, hardware-aware inference engine targeting Gemma 4 and Qwen3.6 MoE models on Linux x86_64.
 
-> **AI-assisted project**: development is done in collaboration with [Claude](https://claude.ai). Commits are co-authored accordingly.
+> **AI-assisted project**: development is done in collaboration with [Claude](https://claude.ai) and OpenAI Codex. Commits are co-authored accordingly.
 
 ## Goals
 
