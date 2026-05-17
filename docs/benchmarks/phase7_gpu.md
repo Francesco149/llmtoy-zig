@@ -605,6 +605,37 @@ subgroup covers `BLOCK_SIZE=64`, but it regressed: current `lm_head` about
 about `1059.47 us`. The experimental target was reverted; keep the safe
 subgroup-plus-shared-memory reduction.
 
+### Q3_K MMVQ scaffold
+
+Started moving the MMVQ framework beyond isolated Q6_K:
+
+- Added `matvec_q3_k_q8_1_mmvq.glsl`, mirroring llama.cpp's
+  `DATA_A_Q3_K` helper with packed16 `hmask/qs` reads, raw byte `scales/d`,
+  Q8_1 activation caching, and the same subgroup-plus-shared-memory reduction
+  used by the Q6_K MMVQ shader.
+- Added bench targets `L5.attn_q.mmvq.b32.r1` and
+  `L5.attn_q.mmvq.b64.r1`.
+
+Correctness:
+
+| Variant | small rel | 2816-col rel |
+|---------|-----------|--------------|
+| b32/r1 | `9.419e-8` | `3.358e-7` |
+| b64/r1 | `1.082e-7` | `1.674e-7` |
+
+Focused timestamp snapshot, 128 iterations:
+
+| Target | GPU us, profiler |
+|--------|------------------|
+| `L5.attn_q` | 43.22 |
+| `L5.attn_q.mmvq.b32.r1` | 64.90 |
+| `L5.attn_q.mmvq.b64.r1` | 42.81 |
+
+`b64/r1` is the first Q3_K MMVQ candidate and is roughly tied/slightly ahead
+of the current shader in this focused run. `b32/r1` is a clear negative. Keep
+the candidate bench-only until repeated runs and a full generation profile show
+a material win.
+
 The submit-count reductions buy ~150–300 µs/token in saved overhead. On
 RX 7800 XT with our shaders the absolute per-submit cost (~150 µs) is
 small relative to the 220 ms of GPU matmul work per token, so each saved

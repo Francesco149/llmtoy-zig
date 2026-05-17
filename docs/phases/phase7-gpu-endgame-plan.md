@@ -296,13 +296,14 @@ nix develop --command ./zig-out/bin/llmtoy bench-matvec <model.gguf> \
 Current targets are `lm_head`, `lm_head.fast`, `lm_head.mmvq.b32.r1`,
 `lm_head.mmvq.b64.r1`, `lm_head.mmvq.b64.r2`, `lm_head.mmvq.b64.r4`,
 `L0.attn_q`, `L0.attn_q.r4`, `L0.attn_v`, `L0.attn_v.r4`, `L3.attn_v`,
-`L5.attn_q`, `L0.dense_down`,
+`L5.attn_q`, `L5.attn_q.mmvq.b32.r1`, `L5.attn_q.mmvq.b64.r1`,
+`L0.dense_down`,
 `L5.dense_down`, `L0.expert_down`, and `L10.expert_down`. They cover Q3_K,
 Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, and IQ4_NL with the target model's actual
 row/column sizes. The `.r4` targets are experimental Q4_K row-batching probes,
-`lm_head.fast` is an experimental Q6_K packed-decode probe, and the
-`lm_head.mmvq.*` targets are early Q6_K MMVQ ports; none is a production route
-until it beats the current path.
+`lm_head.fast` is an experimental Q6_K packed-decode probe, `lm_head.mmvq.*`
+targets are early Q6_K MMVQ ports, and `L5.attn_q.mmvq.*` targets are early
+Q3_K MMVQ ports; none is a production route until it beats the current path.
 
 End-to-end tok/s is too noisy for shader iteration. Add a command or test-only
 binary that runs one GPU kernel shape thousands of times with fixed buffers.
@@ -570,12 +571,31 @@ Completed implementation slices:
 
 Next implementation slice:
 
-1. Start Q3_K/Q4_K MMVQ using the same framework. Q3_K is likely the first
-   target because `L5.attn_q` is the largest non-lm-head GPU matvec in the
-   current microbench table and many attention / FFN gate-up matrices are Q3_K.
-2. Keep current production routing on the existing kernels until a full
+1. Repeat the Q3_K b64/r1 measurement once more after the next shader change;
+   keep it bench-only unless it stays ahead in stable runs.
+2. Port the same framework to Q4_K. Start with `L0.attn_q`/`L0.attn_v`
+   candidates because Q4_K appears in the attention projections and already has
+   a negative local-size-y `.r4` probe to compare against.
+3. Keep current production routing on the existing kernels until a full
    generate profile shows a material token/s improvement, not just a narrow
    isolated `lm_head` win.
+
+Q3_K MMVQ first slice:
+
+- Added `matvec_q3_k_q8_1_mmvq.glsl`, using the same generated-style framework
+  as the Q6_K MMVQ shader.
+- The shader follows llama.cpp's `DATA_A_Q3_K` helper: packed16 `hmask/qs`
+  view, raw byte `scales/d` view, Q8_1 cache, and subgroup-plus-shared-memory
+  reduction.
+- Added bench targets `L5.attn_q.mmvq.b32.r1` and
+  `L5.attn_q.mmvq.b64.r1`.
+- Correctness: b32/r1 `rel=3.358e-7`, b64/r1 `rel=1.674e-7` on 2816-column
+  fuzz.
+- Focused GPU timestamps: current `L5.attn_q` about 43.22 us, b32/r1 about
+  64.90 us, b64/r1 about 42.81 us.
+- Updated conclusion: b64/r1 is a bench-only Q3_K candidate; b32/r1 is a
+  negative. Repeat/tune b64 only if it remains ahead in stable runs, then port
+  the same framework to Q4_K.
 
 Acceptance criteria:
 
