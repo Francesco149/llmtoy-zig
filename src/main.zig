@@ -1,24 +1,24 @@
-const std         = @import("std");
+const std = @import("std");
 const gguf_reader = @import("gguf/reader.zig");
-const vocab_mod   = @import("tokenizer/vocab.zig");
-const bpe         = @import("tokenizer/bpe.zig");
-const chat_tmpl   = @import("tokenizer/chat_template.zig");
-const loader      = @import("model/loader.zig");
-const fwd         = @import("model/forward.zig");
-const kv_mod      = @import("model/kv_cache.zig");
-const sample_mod  = @import("model/sample.zig");
-const tp          = @import("ops/thread_pool.zig");
-const g4_loader   = @import("model/gemma4/loader.zig");
-const g4_fwd      = @import("model/gemma4/forward.zig");
-const g4_kv       = @import("model/gemma4/kv_cache.zig");
-const g4_gpu      = @import("model/gemma4/gpu_weights.zig");
-const g4_weights  = @import("model/gemma4/weights.zig");
-const gpu_ctx     = @import("gpu/context.zig");
-const gpu_matvec  = @import("gpu/matvec.zig");
-const gpu_buffer  = @import("gpu/buffer.zig");
-const vk          = @import("gpu/vk.zig").vk;
-const math_mod    = @import("ops/math.zig");
-const gguf_types  = @import("gguf/types.zig");
+const vocab_mod = @import("tokenizer/vocab.zig");
+const bpe = @import("tokenizer/bpe.zig");
+const chat_tmpl = @import("tokenizer/chat_template.zig");
+const loader = @import("model/loader.zig");
+const fwd = @import("model/forward.zig");
+const kv_mod = @import("model/kv_cache.zig");
+const sample_mod = @import("model/sample.zig");
+const tp = @import("ops/thread_pool.zig");
+const g4_loader = @import("model/gemma4/loader.zig");
+const g4_fwd = @import("model/gemma4/forward.zig");
+const g4_kv = @import("model/gemma4/kv_cache.zig");
+const g4_gpu = @import("model/gemma4/gpu_weights.zig");
+const g4_weights = @import("model/gemma4/weights.zig");
+const gpu_ctx = @import("gpu/context.zig");
+const gpu_matvec = @import("gpu/matvec.zig");
+const gpu_buffer = @import("gpu/buffer.zig");
+const vk = @import("gpu/vk.zig").vk;
+const math_mod = @import("ops/math.zig");
+const gguf_types = @import("gguf/types.zig");
 
 // Pull tests from sub-modules into the test binary.
 comptime {
@@ -38,8 +38,8 @@ comptime {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const io    = init.io;
-    const gpa   = init.gpa;
+    const io = init.io;
+    const gpa = init.gpa;
     const arena = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(arena);
@@ -89,6 +89,22 @@ pub fn main(init: std.process.Init) !void {
             i += 2;
         }
         try cmdBenchMatvec(out, args[2], opts, io, gpa);
+    } else if (std.mem.eql(u8, args[1], "bench-moe")) {
+        if (args.len < 3) {
+            std.debug.print("usage: llmtoy bench-moe <model.gguf> [--iters N] [--layer N]\n", .{});
+            return error.MissingArg;
+        }
+        var opts = MoeBenchOptions{};
+        var i: usize = 3;
+        while (i < args.len) {
+            if (i + 1 >= args.len) break;
+            const flag = args[i];
+            const val = args[i + 1];
+            if (std.mem.eql(u8, flag, "--iters")) opts.iters = try std.fmt.parseInt(u32, val, 10);
+            if (std.mem.eql(u8, flag, "--layer")) opts.layer = try std.fmt.parseInt(usize, val, 10);
+            i += 2;
+        }
+        try cmdBenchMoe(out, args[2], opts, io, gpa);
     } else if (std.mem.eql(u8, args[1], "generate")) {
         if (args.len < 4) {
             std.debug.print(
@@ -98,19 +114,19 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingArg;
         }
         const model_path = args[2];
-        const prompt     = args[3];
+        const prompt = args[3];
 
         // Parse optional flags.
-        var max_tokens:      u32         = 256;
-        var temperature:     f32         = 0.8;
-        var top_p:           f32         = 0.9;
-        var top_k:           u32         = 40;
-        var seed:            u64         = 42;
-        var threads:         u32         = 0; // 0 = auto (getCpuCount)
-        var chat:            bool        = false;
-        var use_gpu:         bool        = false;
-        var stop_token:      ?[]const u8 = null;
-        var gpu_layer_range: ?[2]usize   = null;
+        var max_tokens: u32 = 256;
+        var temperature: f32 = 0.8;
+        var top_p: f32 = 0.9;
+        var top_k: u32 = 40;
+        var seed: u64 = 42;
+        var threads: u32 = 0; // 0 = auto (getCpuCount)
+        var chat: bool = false;
+        var use_gpu: bool = false;
+        var stop_token: ?[]const u8 = null;
+        var gpu_layer_range: ?[2]usize = null;
         var i: usize = 4;
         while (i < args.len) {
             const flag = args[i];
@@ -125,28 +141,28 @@ pub fn main(init: std.process.Init) !void {
                 continue;
             }
             if (i + 1 >= args.len) break;
-            const val  = args[i + 1];
-            if (std.mem.eql(u8, flag, "--max-tokens"))  max_tokens  = try std.fmt.parseInt(u32, val, 10);
+            const val = args[i + 1];
+            if (std.mem.eql(u8, flag, "--max-tokens")) max_tokens = try std.fmt.parseInt(u32, val, 10);
             if (std.mem.eql(u8, flag, "--temperature")) temperature = try std.fmt.parseFloat(f32, val);
-            if (std.mem.eql(u8, flag, "--top-p"))       top_p       = try std.fmt.parseFloat(f32, val);
-            if (std.mem.eql(u8, flag, "--top-k"))       top_k       = try std.fmt.parseInt(u32, val, 10);
-            if (std.mem.eql(u8, flag, "--seed"))        seed        = try std.fmt.parseInt(u64, val, 10);
-            if (std.mem.eql(u8, flag, "--threads"))     threads     = try std.fmt.parseInt(u32, val, 10);
-            if (std.mem.eql(u8, flag, "--stop-token"))  stop_token  = val;
-            if (std.mem.eql(u8, flag, "--gpu-layers"))  gpu_layer_range = try parseLayerRange(val);
+            if (std.mem.eql(u8, flag, "--top-p")) top_p = try std.fmt.parseFloat(f32, val);
+            if (std.mem.eql(u8, flag, "--top-k")) top_k = try std.fmt.parseInt(u32, val, 10);
+            if (std.mem.eql(u8, flag, "--seed")) seed = try std.fmt.parseInt(u64, val, 10);
+            if (std.mem.eql(u8, flag, "--threads")) threads = try std.fmt.parseInt(u32, val, 10);
+            if (std.mem.eql(u8, flag, "--stop-token")) stop_token = val;
+            if (std.mem.eql(u8, flag, "--gpu-layers")) gpu_layer_range = try parseLayerRange(val);
             i += 2;
         }
 
         try cmdGenerate(out, model_path, prompt, .{
-            .max_tokens      = max_tokens,
-            .temperature     = temperature,
-            .top_p           = top_p,
-            .top_k           = top_k,
-            .seed            = seed,
-            .threads         = threads,
-            .chat            = chat,
-            .gpu             = use_gpu,
-            .stop_token      = stop_token,
+            .max_tokens = max_tokens,
+            .temperature = temperature,
+            .top_p = top_p,
+            .top_k = top_k,
+            .seed = seed,
+            .threads = threads,
+            .chat = chat,
+            .gpu = use_gpu,
+            .stop_token = stop_token,
             .gpu_layer_range = gpu_layer_range,
         }, io, gpa);
     } else if (std.mem.eql(u8, args[1], "compare")) {
@@ -158,9 +174,9 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingArg;
         }
         const model_path = args[2];
-        const prompt     = args[3];
+        const prompt = args[3];
         var threads: u32 = 0;
-        var chat:    bool = false;
+        var chat: bool = false;
         var gpu_layer_range: ?[2]usize = null;
         var i: usize = 4;
         while (i < args.len) {
@@ -172,13 +188,13 @@ pub fn main(init: std.process.Init) !void {
             }
             if (i + 1 >= args.len) break;
             const val = args[i + 1];
-            if (std.mem.eql(u8, flag, "--threads"))    threads         = try std.fmt.parseInt(u32, val, 10);
+            if (std.mem.eql(u8, flag, "--threads")) threads = try std.fmt.parseInt(u32, val, 10);
             if (std.mem.eql(u8, flag, "--gpu-layers")) gpu_layer_range = try parseLayerRange(val);
             i += 2;
         }
         try cmdCompare(out, model_path, prompt, .{
-            .threads         = threads,
-            .chat            = chat,
+            .threads = threads,
+            .chat = chat,
             .gpu_layer_range = gpu_layer_range,
         }, io, gpa);
     } else {
@@ -194,6 +210,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\  llmtoy info <model.gguf>               print model metadata and tensor summary
         \\  llmtoy tokenize <model.gguf> <text>    BPE-encode text, print IDs and decoded tokens
         \\  llmtoy bench-matvec <model.gguf> [--iters N] [--target NAME] [--reuse-descriptor]
+        \\  llmtoy bench-moe <model.gguf> [--iters N] [--layer N]
         \\  llmtoy generate <model.gguf> <prompt> [--chat] [--gpu] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N] [--stop-token TOKEN] [--gpu-layers L0:L1]
         \\  llmtoy compare  <model.gguf> <prompt> [--chat] [--threads N] [--gpu-layers L0:L1]
         \\
@@ -202,6 +219,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\  --gpu-layers: restrict GPU to layers L0..L1 inclusive (e.g. 0:14); others use CPU
         \\  compare:      run one CPU and one GPU forward pass, print per-layer residual divergence
         \\  bench-matvec: benchmark current Q8_1 matvec kernels on representative real tensors
+        \\  bench-moe:    benchmark the current top-k expert batch path on real Gemma4 tensors
         \\
     );
 }
@@ -228,13 +246,12 @@ fn cmdGpuInfo(out: *std.Io.Writer) !void {
     };
     defer pipeline.deinit();
 
-    const mat = [16]f32{ 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+    const mat = [16]f32{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
     const vec = [4]f32{ 1, 2, 3, 4 };
     var result = [4]f32{ 0, 0, 0, 0 };
     try gpu_matvec.matvecF32(&ctx, &pipeline, &mat, &vec, &result, 4, 4);
 
-    try out.print("matvec smoke test: [{d:.0}, {d:.0}, {d:.0}, {d:.0}] (expect [1, 2, 3, 4])\n",
-        .{ result[0], result[1], result[2], result[3] });
+    try out.print("matvec smoke test: [{d:.0}, {d:.0}, {d:.0}, {d:.0}] (expect [1, 2, 3, 4])\n", .{ result[0], result[1], result[2], result[3] });
 }
 
 // ── commands ──────────────────────────────────────────────────────────────────
@@ -254,19 +271,19 @@ fn cmdInfo(out: *std.Io.Writer, path: []const u8, io: std.Io, gpa: std.mem.Alloc
     if (reader.metaString("general.architecture")) |arch| {
         try out.print("arch:      {s}\n", .{arch});
 
-        const ctx_key  = try std.fmt.allocPrint(gpa, "{s}.context_length",       .{arch});
+        const ctx_key = try std.fmt.allocPrint(gpa, "{s}.context_length", .{arch});
         defer gpa.free(ctx_key);
-        const emb_key  = try std.fmt.allocPrint(gpa, "{s}.embedding_length",     .{arch});
+        const emb_key = try std.fmt.allocPrint(gpa, "{s}.embedding_length", .{arch});
         defer gpa.free(emb_key);
-        const blk_key  = try std.fmt.allocPrint(gpa, "{s}.block_count",          .{arch});
+        const blk_key = try std.fmt.allocPrint(gpa, "{s}.block_count", .{arch});
         defer gpa.free(blk_key);
         const head_key = try std.fmt.allocPrint(gpa, "{s}.attention.head_count", .{arch});
         defer gpa.free(head_key);
 
-        if (reader.metaU32(ctx_key))  |v| try out.print("ctx_len:   {}\n",  .{v});
-        if (reader.metaU32(emb_key))  |v| try out.print("emb_dim:   {}\n",  .{v});
-        if (reader.metaU32(blk_key))  |v| try out.print("n_layers:  {}\n",  .{v});
-        if (reader.metaU32(head_key)) |v| try out.print("n_heads:   {}\n",  .{v});
+        if (reader.metaU32(ctx_key)) |v| try out.print("ctx_len:   {}\n", .{v});
+        if (reader.metaU32(emb_key)) |v| try out.print("emb_dim:   {}\n", .{v});
+        if (reader.metaU32(blk_key)) |v| try out.print("n_layers:  {}\n", .{v});
+        if (reader.metaU32(head_key)) |v| try out.print("n_heads:   {}\n", .{v});
     }
 
     if (reader.metaString("general.name")) |name| {
@@ -289,7 +306,7 @@ fn cmdInfo(out: *std.Io.Writer, path: []const u8, io: std.Io, gpa: std.mem.Alloc
     var counts = std.AutoHashMap(u32, u32).init(gpa);
     defer counts.deinit();
     for (reader.data.tensors) |tensor| {
-        const key   = @intFromEnum(tensor.type_);
+        const key = @intFromEnum(tensor.type_);
         const entry = try counts.getOrPutValue(key, 0);
         entry.value_ptr.* += 1;
     }
@@ -345,6 +362,11 @@ const MatvecBenchOptions = struct {
     reuse_descriptor: bool = false,
 };
 
+const MoeBenchOptions = struct {
+    iters: u32 = 64,
+    layer: usize = 0,
+};
+
 const BenchPipelines = struct {
     q3_k: gpu_matvec.MatvecPipeline,
     q3_k_mmvq_b32_r1: gpu_matvec.MatvecPipeline,
@@ -356,7 +378,13 @@ const BenchPipelines = struct {
     q4_k_mmvq_b64_r4: gpu_matvec.MatvecPipeline,
     q4_k_r4: gpu_matvec.MatvecPipeline,
     q5_0: gpu_matvec.MatvecPipeline,
+    q5_0_mmvq_b64_r1: gpu_matvec.MatvecPipeline,
+    q5_0_mmvq_b64_r2: gpu_matvec.MatvecPipeline,
+    q5_0_mmvq_b64_r4: gpu_matvec.MatvecPipeline,
     q5_1: gpu_matvec.MatvecPipeline,
+    q5_1_mmvq_b64_r1: gpu_matvec.MatvecPipeline,
+    q5_1_mmvq_b64_r2: gpu_matvec.MatvecPipeline,
+    q5_1_mmvq_b64_r4: gpu_matvec.MatvecPipeline,
     q5_k: gpu_matvec.MatvecPipeline,
     q6_k: gpu_matvec.MatvecPipeline,
     q6_k_fast: gpu_matvec.MatvecPipeline,
@@ -412,8 +440,44 @@ const BenchPipelines = struct {
         errdefer q4_k_r4.deinit();
         var q5_0 = try gpu_matvec.MatvecPipeline.initQ5_0Q8_1(ctx);
         errdefer q5_0.deinit();
+        var q5_0_mmvq_b64_r1 = try gpu_matvec.MatvecPipeline.initQ5_0Q8_1Mmvq(ctx, .{
+            .block_size = 64,
+            .num_rows = 1,
+            .num_cols = 1,
+        });
+        errdefer q5_0_mmvq_b64_r1.deinit();
+        var q5_0_mmvq_b64_r2 = try gpu_matvec.MatvecPipeline.initQ5_0Q8_1Mmvq(ctx, .{
+            .block_size = 64,
+            .num_rows = 2,
+            .num_cols = 1,
+        });
+        errdefer q5_0_mmvq_b64_r2.deinit();
+        var q5_0_mmvq_b64_r4 = try gpu_matvec.MatvecPipeline.initQ5_0Q8_1Mmvq(ctx, .{
+            .block_size = 64,
+            .num_rows = 4,
+            .num_cols = 1,
+        });
+        errdefer q5_0_mmvq_b64_r4.deinit();
         var q5_1 = try gpu_matvec.MatvecPipeline.initQ5_1Q8_1(ctx);
         errdefer q5_1.deinit();
+        var q5_1_mmvq_b64_r1 = try gpu_matvec.MatvecPipeline.initQ5_1Q8_1Mmvq(ctx, .{
+            .block_size = 64,
+            .num_rows = 1,
+            .num_cols = 1,
+        });
+        errdefer q5_1_mmvq_b64_r1.deinit();
+        var q5_1_mmvq_b64_r2 = try gpu_matvec.MatvecPipeline.initQ5_1Q8_1Mmvq(ctx, .{
+            .block_size = 64,
+            .num_rows = 2,
+            .num_cols = 1,
+        });
+        errdefer q5_1_mmvq_b64_r2.deinit();
+        var q5_1_mmvq_b64_r4 = try gpu_matvec.MatvecPipeline.initQ5_1Q8_1Mmvq(ctx, .{
+            .block_size = 64,
+            .num_rows = 4,
+            .num_cols = 1,
+        });
+        errdefer q5_1_mmvq_b64_r4.deinit();
         var q5_k = try gpu_matvec.MatvecPipeline.initQ5KQ8_1(ctx);
         errdefer q5_k.deinit();
         var q6_k = try gpu_matvec.MatvecPipeline.initQ6KQ8_1(ctx);
@@ -449,20 +513,32 @@ const BenchPipelines = struct {
         var quant = try gpu_matvec.QuantizeQ8_1Pipeline.init(ctx);
         errdefer quant.deinit();
         return .{
-            .q3_k = q3_k, .q3_k_mmvq_b32_r1 = q3_k_mmvq_b32_r1,
-            .q3_k_mmvq_b64_r1 = q3_k_mmvq_b64_r1, .q4_k = q4_k,
+            .q3_k = q3_k,
+            .q3_k_mmvq_b32_r1 = q3_k_mmvq_b32_r1,
+            .q3_k_mmvq_b64_r1 = q3_k_mmvq_b64_r1,
+            .q4_k = q4_k,
             .q4_k_mmvq_b32_r1 = q4_k_mmvq_b32_r1,
             .q4_k_mmvq_b64_r1 = q4_k_mmvq_b64_r1,
             .q4_k_mmvq_b64_r2 = q4_k_mmvq_b64_r2,
             .q4_k_mmvq_b64_r4 = q4_k_mmvq_b64_r4,
             .q4_k_r4 = q4_k_r4,
-            .q5_0 = q5_0, .q5_1 = q5_1,
-            .q5_k = q5_k, .q6_k = q6_k, .q6_k_fast = q6_k_fast,
+            .q5_0 = q5_0,
+            .q5_0_mmvq_b64_r1 = q5_0_mmvq_b64_r1,
+            .q5_0_mmvq_b64_r2 = q5_0_mmvq_b64_r2,
+            .q5_0_mmvq_b64_r4 = q5_0_mmvq_b64_r4,
+            .q5_1 = q5_1,
+            .q5_1_mmvq_b64_r1 = q5_1_mmvq_b64_r1,
+            .q5_1_mmvq_b64_r2 = q5_1_mmvq_b64_r2,
+            .q5_1_mmvq_b64_r4 = q5_1_mmvq_b64_r4,
+            .q5_k = q5_k,
+            .q6_k = q6_k,
+            .q6_k_fast = q6_k_fast,
             .q6_k_mmvq_b32_r1 = q6_k_mmvq_b32_r1,
             .q6_k_mmvq_b64_r1 = q6_k_mmvq_b64_r1,
             .q6_k_mmvq_b64_r2 = q6_k_mmvq_b64_r2,
             .q6_k_mmvq_b64_r4 = q6_k_mmvq_b64_r4,
-            .iq4_nl = iq4_nl, .quant = quant,
+            .iq4_nl = iq4_nl,
+            .quant = quant,
         };
     }
 
@@ -476,7 +552,13 @@ const BenchPipelines = struct {
         self.q6_k_fast.deinit();
         self.q6_k.deinit();
         self.q5_k.deinit();
+        self.q5_1_mmvq_b64_r4.deinit();
+        self.q5_1_mmvq_b64_r2.deinit();
+        self.q5_1_mmvq_b64_r1.deinit();
         self.q5_1.deinit();
+        self.q5_0_mmvq_b64_r4.deinit();
+        self.q5_0_mmvq_b64_r2.deinit();
+        self.q5_0_mmvq_b64_r1.deinit();
         self.q5_0.deinit();
         self.q4_k_r4.deinit();
         self.q4_k_mmvq_b64_r4.deinit();
@@ -554,13 +636,372 @@ fn cmdBenchMatvec(
     try benchWithPipelineIfSelected(out, &ctx, &pipes.q3_k_mmvq_b32_r1, &pipes.quant, opts, &ran, "L5.attn_q.mmvq.b32.r1", weights.layers[5].wq, .q3_k, gpa, io);
     try benchWithPipelineIfSelected(out, &ctx, &pipes.q3_k_mmvq_b64_r1, &pipes.quant, opts, &ran, "L5.attn_q.mmvq.b64.r1", weights.layers[5].wq, .q3_k, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L0.dense_down", weights.layers[0].w_down, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q5_1_mmvq_b64_r1, &pipes.quant, opts, &ran, "L0.dense_down.mmvq.b64.r1", weights.layers[0].w_down, .q5_1, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q5_1_mmvq_b64_r2, &pipes.quant, opts, &ran, "L0.dense_down.mmvq.b64.r2", weights.layers[0].w_down, .q5_1, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q5_1_mmvq_b64_r4, &pipes.quant, opts, &ran, "L0.dense_down.mmvq.b64.r4", weights.layers[0].w_down, .q5_1, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L5.dense_down", weights.layers[5].w_down, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q5_0_mmvq_b64_r1, &pipes.quant, opts, &ran, "L5.dense_down.mmvq.b64.r1", weights.layers[5].w_down, .q5_0, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q5_0_mmvq_b64_r2, &pipes.quant, opts, &ran, "L5.dense_down.mmvq.b64.r2", weights.layers[5].w_down, .q5_0, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q5_0_mmvq_b64_r4, &pipes.quant, opts, &ran, "L5.dense_down.mmvq.b64.r4", weights.layers[5].w_down, .q5_0, gpa, io);
     try benchExpertDownIfSelected(out, &ctx, &pipes, opts, &ran, "L0.expert_down", weights.layers[0].down_exps, 0, cfg.d_model, cfg.d_expert, gpa, io);
+    try benchExpertDownWithPipelineIfSelected(out, &ctx, &pipes.q5_1_mmvq_b64_r1, &pipes.quant, opts, &ran, "L0.expert_down.mmvq.b64.r1", weights.layers[0].down_exps, 0, cfg.d_model, cfg.d_expert, .q5_1, gpa, io);
+    try benchExpertDownWithPipelineIfSelected(out, &ctx, &pipes.q5_1_mmvq_b64_r2, &pipes.quant, opts, &ran, "L0.expert_down.mmvq.b64.r2", weights.layers[0].down_exps, 0, cfg.d_model, cfg.d_expert, .q5_1, gpa, io);
+    try benchExpertDownWithPipelineIfSelected(out, &ctx, &pipes.q5_1_mmvq_b64_r4, &pipes.quant, opts, &ran, "L0.expert_down.mmvq.b64.r4", weights.layers[0].down_exps, 0, cfg.d_model, cfg.d_expert, .q5_1, gpa, io);
     try benchExpertDownIfSelected(out, &ctx, &pipes, opts, &ran, "L10.expert_down", weights.layers[10].down_exps, 0, cfg.d_model, cfg.d_expert, gpa, io);
 
     if (ran == 0) {
         try out.print("no matching benchmark target\n", .{});
     }
+}
+
+fn cmdBenchMoe(
+    out: *std.Io.Writer,
+    path: []const u8,
+    opts: MoeBenchOptions,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+) !void {
+    var reader = try gguf_reader.GgufReader.open(path, io, gpa);
+    defer reader.deinit();
+    if (!g4_loader.isGemma4(&reader)) return error.UnsupportedModel;
+
+    const cfg = try g4_loader.configFromGguf(&reader, gpa);
+    if (opts.layer >= cfg.n_layers) return error.InvalidLayer;
+
+    var weights = try g4_loader.loadWeights(&reader, cfg, gpa);
+    defer weights.deinit();
+
+    setOomAdj(500);
+    std.debug.print("uploading weights to GPU VRAM...\n", .{});
+    var gpu_weights = try g4_gpu.GpuWeights.init(&weights, cfg, gpa);
+    defer gpu_weights.deinit();
+
+    const layer = opts.layer;
+    const lw = weights.layers[layer];
+    const top_n = cfg.n_experts_used;
+
+    const moe_in = try gpa.alloc(f32, cfg.d_model);
+    defer gpa.free(moe_in);
+    const router_out = try gpa.alloc(f32, cfg.n_experts);
+    defer gpa.free(router_out);
+    const moe_buf = try gpa.alloc(f32, cfg.d_model);
+    defer gpa.free(moe_buf);
+    const top_idx = try gpa.alloc(usize, top_n);
+    defer gpa.free(top_idx);
+
+    for (moe_in, 0..) |*v, i| {
+        const centered: i32 = @as(i32, @intCast(i % 31)) - 15;
+        v.* = @as(f32, @floatFromInt(centered)) / 16.0;
+    }
+    @memset(router_out, 0.0);
+    for (top_idx, 0..) |*e, i| {
+        e.* = i;
+        router_out[i] = 1.0 / @as(f32, @floatFromInt(top_n));
+    }
+
+    try out.print("GPU MoE batch microbench: layer={} iters={} experts_used={}/{} d_model={} d_expert={}\n", .{
+        layer, opts.iters, top_n, cfg.n_experts, cfg.d_model, cfg.d_expert,
+    });
+    try out.print("  gate_up_type={s} down_type={s}\n", .{
+        lw.gate_up_exps.type_.label(), lw.down_exps.type_.label(),
+    });
+
+    @memset(moe_buf, 0.0);
+    try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf);
+
+    const labels = [_][]const u8{
+        "moe.quantize_input",
+        "moe.fused_gate_up",
+        "moe.quantize_mid",
+        "moe.down",
+        "moe.accum",
+    };
+    var before: [labels.len]gpu_ctx.ProfileStats = undefined;
+    for (labels, 0..) |label, i| before[i] = gpu_weights.ctx.profileStats(label);
+
+    const clk = std.Io.Clock.real;
+    const t0 = clk.now(io);
+    for (0..opts.iters) |_| {
+        @memset(moe_buf, 0.0);
+        try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf);
+    }
+    const t1 = clk.now(io);
+
+    var after: [labels.len]gpu_ctx.ProfileStats = undefined;
+    for (labels, 0..) |label, i| after[i] = gpu_weights.ctx.profileStats(label);
+
+    const ns = t0.durationTo(t1).nanoseconds;
+    const wall_us = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(opts.iters)) / 1000.0;
+    try out.print("{s:28} {s:>10} {s:>12} {s:>12}\n", .{
+        "phase", "dispatches", "avg_us/disp", "avg_us/iter",
+    });
+
+    var gpu_total_ns: u64 = 0;
+    for (labels, 0..) |label, i| {
+        const count_delta = after[i].count - before[i].count;
+        const ns_delta = after[i].total_ns - before[i].total_ns;
+        gpu_total_ns += ns_delta;
+        const per_dispatch = if (count_delta == 0)
+            0.0
+        else
+            @as(f64, @floatFromInt(ns_delta)) / @as(f64, @floatFromInt(count_delta)) / 1000.0;
+        const per_iter = @as(f64, @floatFromInt(ns_delta)) / @as(f64, @floatFromInt(opts.iters)) / 1000.0;
+        try out.print("{s:28} {d:10} {d:12.2} {d:12.2}\n", .{
+            label, count_delta, per_dispatch, per_iter,
+        });
+    }
+
+    const gpu_us = @as(f64, @floatFromInt(gpu_total_ns)) / @as(f64, @floatFromInt(opts.iters)) / 1000.0;
+    try out.print("total wall_us/iter={d:.2} gpu_phase_us/iter={d:.2} host_submit_us/iter={d:.2}\n", .{
+        wall_us, gpu_us, @max(0.0, wall_us - gpu_us),
+    });
+
+    try benchExpertGateUpIdShape(out, &gpu_weights, &lw, cfg, layer, top_idx, opts.iters, io);
+    try benchExpertDownIdShape(out, &gpu_weights, &lw, cfg, layer, top_idx, opts.iters, io);
+}
+
+fn benchExpertGateUpIdShape(
+    out: *std.Io.Writer,
+    gpu_weights: *g4_gpu.GpuWeights,
+    lw: *const g4_weights.Gemma4LayerWeights,
+    cfg: g4_loader.Gemma4Config,
+    layer: usize,
+    top_idx: []const usize,
+    iters: u32,
+    io: std.Io,
+) !void {
+    if (lw.gate_up_exps.type_ != .q3_k) {
+        try out.print("expert-id gate-up shape: unsupported layer={} gate/up type {s}\n", .{
+            layer, lw.gate_up_exps.type_.label(),
+        });
+        return;
+    }
+
+    var pipeline = try gpu_matvec.ExpertGateUpIdPipeline.initQ3KQ8_1(&gpu_weights.ctx);
+    defer pipeline.deinit();
+
+    const flat_session_opt = try gpu_matvec.MatvecSession.initFromRaw(
+        &gpu_weights.ctx,
+        lw.gate_up_exps.data,
+        lw.gate_up_exps.type_,
+        @intCast(cfg.n_experts * 2 * cfg.d_expert),
+        @intCast(cfg.d_model),
+    );
+    var flat_session = flat_session_opt orelse return error.UnsupportedModel;
+    defer flat_session.deinit();
+
+    var ids_host: [16]u32 = undefined;
+    for (top_idx, 0..) |idx, i| ids_host[i] = @intCast(idx);
+    var ids_buf = try uploadDeviceLocalBytes(&gpu_weights.ctx, std.mem.sliceAsBytes(ids_host[0..top_idx.len]), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer ids_buf.deinit();
+
+    const act_f32_buf = try gpu_buffer.GpuBuffer.initHostCoherent(&gpu_weights.ctx, cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer {
+        var b = act_f32_buf;
+        b.unmap();
+        b.deinit();
+    }
+    const act_f32 = try act_f32_buf.mapSlice(f32, cfg.d_model);
+    for (act_f32, 0..) |*v, i| {
+        const centered: i32 = @as(i32, @intCast(i % 31)) - 15;
+        v.* = @as(f32, @floatFromInt(centered)) / 16.0;
+    }
+
+    var act_q8_buf = try gpu_buffer.GpuBuffer.initDeviceLocal(&gpu_weights.ctx, gpu_matvec.q8_1OutBytes(@intCast(cfg.d_model)), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer act_q8_buf.deinit();
+
+    var out_buf = try gpu_buffer.GpuBuffer.initDeviceLocal(&gpu_weights.ctx, top_idx.len * cfg.d_expert * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer out_buf.deinit();
+
+    {
+        const cmd = try gpu_weights.ctx.beginBatch();
+        const ds = try gpu_weights.pl_quantize_q8_1.record(cmd, &act_f32_buf, &act_q8_buf, @intCast(cfg.d_model));
+        try gpu_weights.ctx.submitBatch(cmd);
+        var ds_mut = ds;
+        _ = vk.vkFreeDescriptorSets(gpu_weights.ctx.device, gpu_weights.pl_quantize_q8_1.desc_pool, 1, &ds_mut);
+    }
+
+    {
+        const cmd = try gpu_weights.ctx.beginBatch();
+        const p_gu = gpu_weights.ctx.profileBegin(cmd, "moe.gate_up_id");
+        const ds = try pipeline.record(cmd, &flat_session.mat_buf, &act_q8_buf, &ids_buf, &out_buf, @intCast(cfg.d_expert), @intCast(cfg.d_model), @intCast(top_idx.len));
+        gpu_weights.ctx.profileEnd(cmd, p_gu);
+        try gpu_weights.ctx.submitBatch(cmd);
+        var ds_mut = ds;
+        _ = vk.vkFreeDescriptorSets(gpu_weights.ctx.device, pipeline.desc_pool, 1, &ds_mut);
+    }
+
+    const before = gpu_weights.ctx.profileStats("moe.gate_up_id");
+    const clk = std.Io.Clock.real;
+    const t0 = clk.now(io);
+    for (0..iters) |_| {
+        const cmd = try gpu_weights.ctx.beginBatch();
+        const p_gu = gpu_weights.ctx.profileBegin(cmd, "moe.gate_up_id");
+        const ds = try pipeline.record(cmd, &flat_session.mat_buf, &act_q8_buf, &ids_buf, &out_buf, @intCast(cfg.d_expert), @intCast(cfg.d_model), @intCast(top_idx.len));
+        gpu_weights.ctx.profileEnd(cmd, p_gu);
+        try gpu_weights.ctx.submitBatch(cmd);
+        var ds_mut = ds;
+        _ = vk.vkFreeDescriptorSets(gpu_weights.ctx.device, pipeline.desc_pool, 1, &ds_mut);
+    }
+    const t1 = clk.now(io);
+    const after = gpu_weights.ctx.profileStats("moe.gate_up_id");
+
+    const wall_ns = t0.durationTo(t1).nanoseconds;
+    const wall_us = @as(f64, @floatFromInt(wall_ns)) / @as(f64, @floatFromInt(iters)) / 1000.0;
+    const count_delta = after.count - before.count;
+    const gpu_ns = after.total_ns - before.total_ns;
+    const gpu_us = if (count_delta == 0)
+        0.0
+    else
+        @as(f64, @floatFromInt(gpu_ns)) / @as(f64, @floatFromInt(count_delta)) / 1000.0;
+
+    try out.print("expert-id gate-up shape: type={s} active={} wall_us={d:.2} gpu_us={d:.2} host_us={d:.2}\n", .{
+        lw.gate_up_exps.type_.label(), top_idx.len, wall_us, gpu_us, @max(0.0, wall_us - gpu_us),
+    });
+}
+
+fn benchExpertDownIdShape(
+    out: *std.Io.Writer,
+    gpu_weights: *g4_gpu.GpuWeights,
+    lw: *const g4_weights.Gemma4LayerWeights,
+    cfg: g4_loader.Gemma4Config,
+    layer: usize,
+    top_idx: []const usize,
+    iters: u32,
+    io: std.Io,
+) !void {
+    const down_type_id: u32 = @intFromEnum(lw.down_exps.type_);
+    const down_type_label = lw.down_exps.type_.label();
+    var use_iq4 = layer == 10 or down_type_id == 20 or std.mem.eql(u8, down_type_label, "IQ4_NL");
+    var use_q5_1 = layer == 0 or down_type_id == 7 or std.mem.eql(u8, down_type_label, "Q5_1");
+    if (down_type_id == 20) use_iq4 = true;
+    if (down_type_id == 7) use_q5_1 = true;
+    var pipeline: gpu_matvec.ExpertDownIdPipeline = undefined;
+    if (use_iq4) {
+        pipeline = try gpu_matvec.ExpertDownIdPipeline.initIQ4NLQ8_1(&gpu_weights.ctx);
+    } else if (use_q5_1) {
+        pipeline = try gpu_matvec.ExpertDownIdPipeline.initQ5_1Q8_1(&gpu_weights.ctx);
+    } else {
+        try out.print("expert-id down shape: unsupported layer={} down type {s} ({}) q5={} iq4={}\n", .{
+            layer, lw.down_exps.type_.label(), down_type_id, use_q5_1, use_iq4,
+        });
+        return;
+    }
+    defer pipeline.deinit();
+
+    const flat_session_opt = try gpu_matvec.MatvecSession.initFromRaw(
+        &gpu_weights.ctx,
+        lw.down_exps.data,
+        lw.down_exps.type_,
+        @intCast(cfg.n_experts * cfg.d_model),
+        @intCast(cfg.d_expert),
+    );
+    var flat_session = flat_session_opt orelse return error.UnsupportedModel;
+    defer flat_session.deinit();
+
+    var ids_host: [16]u32 = undefined;
+    for (top_idx, 0..) |idx, i| ids_host[i] = @intCast(idx);
+    var ids_buf = try uploadDeviceLocalBytes(&gpu_weights.ctx, std.mem.sliceAsBytes(ids_host[0..top_idx.len]), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer ids_buf.deinit();
+
+    var scales_host: [16]f32 = undefined;
+    for (top_idx, 0..) |idx, i| {
+        scales_host[i] = lw.down_exps_scale[idx] / @as(f32, @floatFromInt(top_idx.len));
+    }
+    var scales_buf = try uploadDeviceLocalBytes(&gpu_weights.ctx, std.mem.sliceAsBytes(scales_host[0..top_idx.len]), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer scales_buf.deinit();
+
+    const act_f32_buf = try gpu_buffer.GpuBuffer.initHostCoherent(&gpu_weights.ctx, cfg.d_expert * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer {
+        var b = act_f32_buf;
+        b.unmap();
+        b.deinit();
+    }
+    const act_f32 = try act_f32_buf.mapSlice(f32, cfg.d_expert);
+    for (act_f32, 0..) |*v, i| {
+        const centered: i32 = @as(i32, @intCast(i % 29)) - 14;
+        v.* = @as(f32, @floatFromInt(centered)) / 15.0;
+    }
+
+    const q8_slot_bytes = gpu_matvec.q8_1OutBytes(@intCast(cfg.d_expert));
+    var act_q8_buf = try gpu_buffer.GpuBuffer.initDeviceLocal(&gpu_weights.ctx, top_idx.len * q8_slot_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer act_q8_buf.deinit();
+
+    var out_buf = try gpu_buffer.GpuBuffer.initDeviceLocal(&gpu_weights.ctx, top_idx.len * cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer out_buf.deinit();
+
+    {
+        const cmd = try gpu_weights.ctx.beginBatch();
+        var qsets: [16]vk.VkDescriptorSet = undefined;
+        for (0..top_idx.len) |slot| {
+            qsets[slot] = try gpu_weights.pl_quantize_q8_1.recordToOffset(cmd, &act_f32_buf, &act_q8_buf, slot * q8_slot_bytes, q8_slot_bytes, @intCast(cfg.d_expert));
+        }
+        try gpu_weights.ctx.submitBatch(cmd);
+        for (qsets[0..top_idx.len]) |*ds|
+            _ = vk.vkFreeDescriptorSets(gpu_weights.ctx.device, gpu_weights.pl_quantize_q8_1.desc_pool, 1, ds);
+    }
+
+    {
+        const cmd = try gpu_weights.ctx.beginBatch();
+        const p_down = gpu_weights.ctx.profileBegin(cmd, "moe.down_id");
+        const ds = try pipeline.record(cmd, &flat_session.mat_buf, &act_q8_buf, &ids_buf, &scales_buf, &out_buf, @intCast(cfg.d_model), @intCast(cfg.d_expert), @intCast(top_idx.len));
+        gpu_weights.ctx.profileEnd(cmd, p_down);
+        try gpu_weights.ctx.submitBatch(cmd);
+        var ds_mut = ds;
+        _ = vk.vkFreeDescriptorSets(gpu_weights.ctx.device, pipeline.desc_pool, 1, &ds_mut);
+    }
+
+    const before = gpu_weights.ctx.profileStats("moe.down_id");
+    const clk = std.Io.Clock.real;
+    const t0 = clk.now(io);
+    for (0..iters) |_| {
+        const cmd = try gpu_weights.ctx.beginBatch();
+        const p_down = gpu_weights.ctx.profileBegin(cmd, "moe.down_id");
+        const ds = try pipeline.record(cmd, &flat_session.mat_buf, &act_q8_buf, &ids_buf, &scales_buf, &out_buf, @intCast(cfg.d_model), @intCast(cfg.d_expert), @intCast(top_idx.len));
+        gpu_weights.ctx.profileEnd(cmd, p_down);
+        try gpu_weights.ctx.submitBatch(cmd);
+        var ds_mut = ds;
+        _ = vk.vkFreeDescriptorSets(gpu_weights.ctx.device, pipeline.desc_pool, 1, &ds_mut);
+    }
+    const t1 = clk.now(io);
+    const after = gpu_weights.ctx.profileStats("moe.down_id");
+
+    const wall_ns = t0.durationTo(t1).nanoseconds;
+    const wall_us = @as(f64, @floatFromInt(wall_ns)) / @as(f64, @floatFromInt(iters)) / 1000.0;
+    const count_delta = after.count - before.count;
+    const gpu_ns = after.total_ns - before.total_ns;
+    const gpu_us = if (count_delta == 0)
+        0.0
+    else
+        @as(f64, @floatFromInt(gpu_ns)) / @as(f64, @floatFromInt(count_delta)) / 1000.0;
+
+    try out.print("expert-id down shape: type={s} active={} wall_us={d:.2} gpu_us={d:.2} host_us={d:.2}\n", .{
+        lw.down_exps.type_.label(), top_idx.len, wall_us, gpu_us, @max(0.0, wall_us - gpu_us),
+    });
+}
+
+fn uploadDeviceLocalBytes(
+    ctx: *const gpu_ctx.GpuContext,
+    bytes: []const u8,
+    usage: vk.VkBufferUsageFlags,
+) !gpu_buffer.GpuBuffer {
+    var staging = try gpu_buffer.GpuBuffer.initStaging(ctx, bytes.len);
+    defer staging.deinit();
+    try staging.upload(bytes);
+
+    var dst = try gpu_buffer.GpuBuffer.initDeviceLocal(ctx, bytes.len, usage);
+    errdefer dst.deinit();
+
+    const cmd = try ctx.beginBatchCopy();
+    const region = vk.VkBufferCopy{
+        .srcOffset = 0,
+        .dstOffset = 0,
+        .size = bytes.len,
+    };
+    vk.vkCmdCopyBuffer(cmd, staging.handle, dst.handle, 1, &region);
+    try ctx.submitBatchCopy(cmd);
+
+    return dst;
 }
 
 fn benchIfSelected(
@@ -625,6 +1066,36 @@ fn benchExpertDownIfSelected(
     ran.* += 1;
 }
 
+fn benchExpertDownWithPipelineIfSelected(
+    out: *std.Io.Writer,
+    ctx: *const gpu_ctx.GpuContext,
+    pipeline: *const gpu_matvec.MatvecPipeline,
+    quant: *const gpu_matvec.QuantizeQ8_1Pipeline,
+    opts: MatvecBenchOptions,
+    ran: *usize,
+    name: []const u8,
+    flat: g4_weights.RawMatrix,
+    expert: usize,
+    rows: usize,
+    cols: usize,
+    expected_type: gguf_types.GgmlType,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+) !void {
+    if (flat.type_ != expected_type) return;
+    if (opts.target) |t| if (!std.mem.eql(u8, t, name) and !std.mem.eql(u8, t, "all")) return;
+    const row_bytes = math_mod.rowBytes(flat.type_, cols);
+    const per_expert = rows * row_bytes;
+    const mat = g4_weights.RawMatrix{
+        .data = flat.data[expert * per_expert ..][0..per_expert],
+        .type_ = flat.type_,
+        .rows = rows,
+        .cols = cols,
+    };
+    try benchOneMatvecWithPipeline(out, ctx, pipeline, quant, name, mat, opts.iters, opts.reuse_descriptor, gpa, io);
+    ran.* += 1;
+}
+
 fn benchOneMatvec(
     out: *std.Io.Writer,
     ctx: *const gpu_ctx.GpuContext,
@@ -657,8 +1128,7 @@ fn benchOneMatvecWithPipeline(
 ) !void {
     if (mat.cols % 32 != 0) return error.InvalidMatvecShape;
 
-    const session_opt = try gpu_matvec.MatvecSession.initFromRaw(
-        ctx, mat.data, mat.type_, @intCast(mat.rows), @intCast(mat.cols));
+    const session_opt = try gpu_matvec.MatvecSession.initFromRaw(ctx, mat.data, mat.type_, @intCast(mat.rows), @intCast(mat.cols));
     var session = session_opt orelse return error.UnsupportedModel;
     defer session.deinit();
 
@@ -669,14 +1139,11 @@ fn benchOneMatvecWithPipeline(
         v.* = (x - 16.0) / 16.0;
     }
 
-    var vec_buf = try gpu_buffer.GpuBuffer.initHostCoherent(ctx,
-        mat.cols * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    var vec_buf = try gpu_buffer.GpuBuffer.initHostCoherent(ctx, mat.cols * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     defer vec_buf.deinit();
-    var acts_buf = try gpu_buffer.GpuBuffer.initDeviceLocal(ctx,
-        gpu_matvec.q8_1OutBytes(@intCast(mat.cols)), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    var acts_buf = try gpu_buffer.GpuBuffer.initDeviceLocal(ctx, gpu_matvec.q8_1OutBytes(@intCast(mat.cols)), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     defer acts_buf.deinit();
-    var out_buf = try gpu_buffer.GpuBuffer.initHostCoherent(ctx,
-        mat.rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    var out_buf = try gpu_buffer.GpuBuffer.initHostCoherent(ctx, mat.rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     defer out_buf.deinit();
 
     try vec_buf.upload(std.mem.sliceAsBytes(vec));
@@ -692,8 +1159,7 @@ fn benchOneMatvecWithPipeline(
 
     {
         const cmd = try ctx.beginBatch();
-        const ds = try pl.record(cmd, &session.mat_buf, &acts_buf, &out_buf,
-            @intCast(mat.rows), @intCast(mat.cols));
+        const ds = try pl.record(cmd, &session.mat_buf, &acts_buf, &out_buf, @intCast(mat.rows), @intCast(mat.cols));
         try ctx.submitBatch(cmd);
         var ds_mut = ds;
         _ = vk.vkFreeDescriptorSets(ctx.device, pl.desc_pool, 1, &ds_mut);
@@ -715,8 +1181,7 @@ fn benchOneMatvecWithPipeline(
         const ds = if (persistent_dset) |dset| blk: {
             pl.recordDescriptor(cmd, dset, @intCast(mat.rows), @intCast(mat.cols));
             break :blk dset;
-        } else try pl.record(cmd, &session.mat_buf, &acts_buf, &out_buf,
-            @intCast(mat.rows), @intCast(mat.cols));
+        } else try pl.record(cmd, &session.mat_buf, &acts_buf, &out_buf, @intCast(mat.rows), @intCast(mat.cols));
         ctx.profileEnd(cmd, p_mv);
         try ctx.submitBatch(cmd);
         if (persistent_dset == null) {
@@ -753,13 +1218,13 @@ fn cmdTokenize(out: *std.Io.Writer, path: []const u8, text: []const u8, io: std.
         vocab.model, vocab.tokens.len, vocab.merge_rank.count(),
     });
 
-    const ids     = try bpe.encode(text, &vocab, gpa);
+    const ids = try bpe.encode(text, &vocab, gpa);
     defer gpa.free(ids);
     const decoded = try bpe.decode(ids, &vocab, gpa);
     defer gpa.free(decoded);
 
     try out.print("input:   \"{s}\"\n", .{text});
-    try out.print("ids:     {any}\n",   .{ids});
+    try out.print("ids:     {any}\n", .{ids});
     try out.print("decoded: \"{s}\"\n", .{decoded});
 
     try out.print("\ntokens:\n", .{});
@@ -769,18 +1234,18 @@ fn cmdTokenize(out: *std.Io.Writer, path: []const u8, text: []const u8, io: std.
 }
 
 const GenerateOptions = struct {
-    max_tokens:      u32         = 256,
-    temperature:     f32         = 0.8,
-    top_p:           f32         = 0.9,
-    top_k:           u32         = 40,
-    seed:            u64         = 42,
-    threads:         u32         = 0, // 0 = auto
-    chat:            bool        = false,
-    gpu:             bool        = false,
+    max_tokens: u32 = 256,
+    temperature: f32 = 0.8,
+    top_p: f32 = 0.9,
+    top_k: u32 = 40,
+    seed: u64 = 42,
+    threads: u32 = 0, // 0 = auto
+    chat: bool = false,
+    gpu: bool = false,
     // Override the auto-detected EOT token. null = use vocab.eot_token_id.
-    stop_token:      ?[]const u8 = null,
+    stop_token: ?[]const u8 = null,
     // Restrict GPU to layers [start..=end] inclusive; null = all layers.
-    gpu_layer_range: ?[2]usize   = null,
+    gpu_layer_range: ?[2]usize = null,
 };
 
 fn cmdGenerate(
@@ -810,8 +1275,7 @@ fn cmdGenerate(
         }
         break :blk vocab.eot_token_id;
     };
-    if (stop_id) |id| std.debug.print("  stop token: {} '{s}'\n",
-        .{ id, if (id < vocab.tokens.len) vocab.tokens[id] else "?" });
+    if (stop_id) |id| std.debug.print("  stop token: {} '{s}'\n", .{ id, if (id < vocab.tokens.len) vocab.tokens[id] else "?" });
 
     const rendered_prompt = if (opts.chat) blk: {
         const messages = [_]chat_tmpl.Message{.{ .role = .user, .content = prompt }};
@@ -833,8 +1297,8 @@ fn cmdGenerate(
     const rng = prng.random();
     const params = sample_mod.SampleParams{
         .temperature = opts.temperature,
-        .top_p       = opts.top_p,
-        .top_k       = opts.top_k,
+        .top_p = opts.top_p,
+        .top_k = opts.top_k,
     };
 
     try out.print("{s}", .{prompt_text});
@@ -844,8 +1308,7 @@ fn cmdGenerate(
         const g4cfg = try g4_loader.configFromGguf(&reader, gpa);
         std.debug.print(
             "  [Gemma4] layers={} heads={} d_model={} experts={}/{} vocab={}\n",
-            .{ g4cfg.n_layers, g4cfg.n_heads, g4cfg.d_model,
-               g4cfg.n_experts, g4cfg.n_experts_used, g4cfg.vocab_size },
+            .{ g4cfg.n_layers, g4cfg.n_heads, g4cfg.d_model, g4cfg.n_experts, g4cfg.n_experts_used, g4cfg.vocab_size },
         );
         var weights = try g4_loader.loadWeights(&reader, g4cfg, gpa);
         defer weights.deinit();
@@ -871,8 +1334,7 @@ fn cmdGenerate(
 
         const max_seq: usize = @min(g4cfg.max_seq_len, 4096);
         if (gpu_weights) |*gw| gw.initKvVram(g4cfg, max_seq) catch |e| {
-            std.debug.print("KV VRAM alloc failed ({s}), continuing without GPU KV cache\n",
-                .{@errorName(e)});
+            std.debug.print("KV VRAM alloc failed ({s}), continuing without GPU KV cache\n", .{@errorName(e)});
         };
         const gpu_ptr: ?*const g4_gpu.GpuWeights = if (gpu_weights != null) &gpu_weights.? else null;
         var kv = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
@@ -893,8 +1355,14 @@ fn cmdGenerate(
         while (n_gen < opts.max_tokens) : (n_gen += 1) {
             const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
             gpa.free(last_logits);
-            if (next_tok == vocab.eos_token_id) { last_logits = &.{}; break; }
-            if (stop_id != null and next_tok == stop_id.?) { last_logits = &.{}; break; }
+            if (next_tok == vocab.eos_token_id) {
+                last_logits = &.{};
+                break;
+            }
+            if (stop_id != null and next_tok == stop_id.?) {
+                last_logits = &.{};
+                break;
+            }
             var tok_buf: [64]u8 = undefined;
             const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
             try out.writeAll(tok_buf[0..tok_len]);
@@ -931,8 +1399,14 @@ fn cmdGenerate(
         while (n_gen < opts.max_tokens) : (n_gen += 1) {
             const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
             gpa.free(last_logits);
-            if (next_tok == vocab.eos_token_id) { last_logits = &.{}; break; }
-            if (stop_id != null and next_tok == stop_id.?) { last_logits = &.{}; break; }
+            if (next_tok == vocab.eos_token_id) {
+                last_logits = &.{};
+                break;
+            }
+            if (stop_id != null and next_tok == stop_id.?) {
+                last_logits = &.{};
+                break;
+            }
             var tok_buf: [64]u8 = undefined;
             const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
             try out.writeAll(tok_buf[0..tok_len]);
@@ -952,8 +1426,7 @@ fn cmdGenerate(
 // victim rather than system services or the Claude session. Silently ignores
 // failures (non-root processes may not be allowed to raise the adj).
 fn setOomAdj(adj: i32) void {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/oom_score_adj",
-        .{ .ACCMODE = .WRONLY }, 0) catch return;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/oom_score_adj", .{ .ACCMODE = .WRONLY }, 0) catch return;
     defer _ = std.os.linux.close(fd);
     var buf: [12]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{}\n", .{adj}) catch return;
@@ -985,9 +1458,9 @@ fn parseLayerRange(s: []const u8) !?[2]usize {
 // ── compare command ───────────────────────────────────────────────────────────
 
 const CompareOptions = struct {
-    threads:         u32        = 0,
-    chat:            bool       = false,
-    gpu_layer_range: ?[2]usize  = null,
+    threads: u32 = 0,
+    chat: bool = false,
+    gpu_layer_range: ?[2]usize = null,
 };
 
 /// Run one forward pass on CPU and one on GPU for the first prompt token,
@@ -1025,8 +1498,7 @@ fn cmdCompare(
     if (prompt_ids.len == 0) return error.EmptyPrompt;
 
     const g4cfg = try g4_loader.configFromGguf(&reader, gpa);
-    std.debug.print("  [Gemma4] layers={} d_model={} experts={}/{}\n",
-        .{ g4cfg.n_layers, g4cfg.d_model, g4cfg.n_experts, g4cfg.n_experts_used });
+    std.debug.print("  [Gemma4] layers={} d_model={} experts={}/{}\n", .{ g4cfg.n_layers, g4cfg.d_model, g4cfg.n_experts, g4cfg.n_experts_used });
 
     var weights = try g4_loader.loadWeights(&reader, g4cfg, gpa);
     defer weights.deinit();
@@ -1044,7 +1516,7 @@ fn cmdCompare(
     defer gpu_weights.deinit();
     const gpu_ptr = &gpu_weights;
 
-    const d  = g4cfg.d_model;
+    const d = g4cfg.d_model;
     const nl = g4cfg.n_layers;
 
     // Allocate flat backing storage for taps; slice into per-layer views.
@@ -1064,22 +1536,19 @@ fn cmdCompare(
     const cmp_token = prompt_ids[0];
     const max_seq: usize = @min(g4cfg.max_seq_len, 4096);
     gpu_weights.initKvVram(g4cfg, max_seq) catch |e| {
-        std.debug.print("KV VRAM alloc failed ({s}), continuing without GPU KV cache\n",
-            .{@errorName(e)});
+        std.debug.print("KV VRAM alloc failed ({s}), continuing without GPU KV cache\n", .{@errorName(e)});
     };
 
     std.debug.print("running CPU forward pass (token={})...\n", .{cmp_token});
     var kv_cpu = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
     defer kv_cpu.deinit();
-    const cpu_logits = try g4_fwd.forwardOne(
-        cmp_token, 0, &kv_cpu, &weights, g4cfg, pool, gpa, null, cpu_taps, null);
+    const cpu_logits = try g4_fwd.forwardOne(cmp_token, 0, &kv_cpu, &weights, g4cfg, pool, gpa, null, cpu_taps, null);
     defer gpa.free(cpu_logits);
 
     std.debug.print("running GPU forward pass...\n", .{});
     var kv_gpu = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
     defer kv_gpu.deinit();
-    const gpu_logits = try g4_fwd.forwardOne(
-        cmp_token, 0, &kv_gpu, &weights, g4cfg, pool, gpa, gpu_ptr, gpu_taps, opts.gpu_layer_range);
+    const gpu_logits = try g4_fwd.forwardOne(cmp_token, 0, &kv_gpu, &weights, g4cfg, pool, gpa, gpu_ptr, gpu_taps, opts.gpu_layer_range);
     defer gpa.free(gpu_logits);
 
     // ── per-layer residual comparison ─────────────────────────────────────────
@@ -1104,16 +1573,21 @@ fn cmdCompare(
             const d_ = @abs(c - g);
             if (d_ > max_abs) max_abs = d_;
             if (@abs(c) > max_ref) max_ref = @abs(c);
-            if (c > cpu_am_v) { cpu_am_v = c; cpu_am = i; }
-            if (g > gpu_am_v) { gpu_am_v = g; gpu_am = i; }
+            if (c > cpu_am_v) {
+                cpu_am_v = c;
+                cpu_am = i;
+            }
+            if (g > gpu_am_v) {
+                gpu_am_v = g;
+                gpu_am = i;
+            }
         }
 
         const rel = max_abs / (max_ref + 1e-6);
         const ok = (cpu_am == gpu_am);
         if (!ok and first_fail == null) first_fail = l;
 
-        try out.print("layer {:>3}  max|D|={d:.5}  rel={d:.3}%  argmax={s}\n",
-            .{ l, max_abs, rel * 100.0, if (ok) "ok" else "FAIL" });
+        try out.print("layer {:>3}  max|D|={d:.5}  rel={d:.3}%  argmax={s}\n", .{ l, max_abs, rel * 100.0, if (ok) "ok" else "FAIL" });
     }
 
     if (first_fail) |l| {
@@ -1134,8 +1608,16 @@ fn cmdCompare(
         var best_val: f32 = -std.math.inf(f32);
         for (cpu_logits, 0..) |v, i| {
             var dup = false;
-            for (cpu_top[0..k]) |p| { if (p.id == i) { dup = true; break; } }
-            if (!dup and v > best_val) { best_val = v; best_id = i; }
+            for (cpu_top[0..k]) |p| {
+                if (p.id == i) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup and v > best_val) {
+                best_val = v;
+                best_id = i;
+            }
         }
         cpu_top[k] = .{ .id = best_id, .val = best_val };
     }
@@ -1145,8 +1627,16 @@ fn cmdCompare(
         var best_val: f32 = -std.math.inf(f32);
         for (gpu_logits, 0..) |v, i| {
             var dup = false;
-            for (gpu_top[0..k]) |p| { if (p.id == i) { dup = true; break; } }
-            if (!dup and v > best_val) { best_val = v; best_id = i; }
+            for (gpu_top[0..k]) |p| {
+                if (p.id == i) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup and v > best_val) {
+                best_val = v;
+                best_id = i;
+            }
         }
         gpu_top[k] = .{ .id = best_id, .val = best_val };
     }
@@ -1160,8 +1650,7 @@ fn cmdCompare(
     if (cpu_top[0].id == gpu_top[0].id) {
         try out.print("final argmax: {} (match)\n", .{cpu_top[0].id});
     } else {
-        try out.print("final argmax: CPU={} GPU={} (MISMATCH)\n",
-            .{ cpu_top[0].id, gpu_top[0].id });
+        try out.print("final argmax: CPU={} GPU={} (MISMATCH)\n", .{ cpu_top[0].id, gpu_top[0].id });
     }
     try out.flush();
 }

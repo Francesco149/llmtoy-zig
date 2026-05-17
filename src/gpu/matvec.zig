@@ -102,9 +102,19 @@ pub const MatvecPipeline = struct {
         return initFromSpv(ctx, &shaders.matvec_q5_0_q8_1, 1);
     }
 
+    pub fn initQ5_0Q8_1Mmvq(ctx: *const GpuContext, spec: MmvqSpec) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_q5_0_q8_1_mmvq.len % 4 == 0);
+        return initFromSpvMmvq(ctx, &shaders.matvec_q5_0_q8_1_mmvq, spec);
+    }
+
     pub fn initQ5_1Q8_1(ctx: *const GpuContext) !MatvecPipeline {
         comptime std.debug.assert(shaders.matvec_q5_1_q8_1.len % 4 == 0);
         return initFromSpv(ctx, &shaders.matvec_q5_1_q8_1, 1);
+    }
+
+    pub fn initQ5_1Q8_1Mmvq(ctx: *const GpuContext, spec: MmvqSpec) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_q5_1_q8_1_mmvq.len % 4 == 0);
+        return initFromSpvMmvq(ctx, &shaders.matvec_q5_1_q8_1_mmvq, spec);
     }
 
     pub fn initQ6KQ8_1(ctx: *const GpuContext) !MatvecPipeline {
@@ -139,8 +149,8 @@ pub const MatvecPipeline = struct {
     fn initFromSpvMmvq(ctx: *const GpuContext, spv: anytype, spec: MmvqSpec) !MatvecPipeline {
         const map_entries = [_]vk.VkSpecializationMapEntry{
             .{ .constantID = 0, .offset = @offsetOf(MmvqSpec, "block_size"), .size = @sizeOf(u32) },
-            .{ .constantID = 1, .offset = @offsetOf(MmvqSpec, "num_rows"),   .size = @sizeOf(u32) },
-            .{ .constantID = 2, .offset = @offsetOf(MmvqSpec, "num_cols"),   .size = @sizeOf(u32) },
+            .{ .constantID = 1, .offset = @offsetOf(MmvqSpec, "num_rows"), .size = @sizeOf(u32) },
+            .{ .constantID = 2, .offset = @offsetOf(MmvqSpec, "num_cols"), .size = @sizeOf(u32) },
         };
         const spec_info = vk.VkSpecializationInfo{
             .mapEntryCount = map_entries.len,
@@ -323,12 +333,10 @@ pub const MatvecPipeline = struct {
         cols: u32,
     ) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
 
         const pc = PushConst{ .rows = rows, .cols = cols };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(PushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(PushConst), &pc);
 
         const groups = (rows + self.rows_per_workgroup - 1) / self.rows_per_workgroup;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
@@ -365,9 +373,9 @@ pub const MatvecPipeline = struct {
             return error.VkDescriptorSetAllocFailed;
 
         const buf_infos = [3]vk.VkDescriptorBufferInfo{
-            .{ .buffer = mat_buf.handle, .offset = 0,          .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = vec_buf.handle, .offset = 0,          .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = out_handle,     .offset = out_offset,  .range = out_range        },
+            .{ .buffer = mat_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = vec_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = out_handle, .offset = out_offset, .range = out_range },
         };
         const writes = [3]vk.VkWriteDescriptorSet{
             mkWrite(dset, 0, &buf_infos[0]),
@@ -377,12 +385,10 @@ pub const MatvecPipeline = struct {
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
 
         const pc = PushConst{ .rows = rows, .cols = cols };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(PushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(PushConst), &pc);
 
         const groups = (rows + self.rows_per_workgroup - 1) / self.rows_per_workgroup;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
@@ -437,12 +443,10 @@ pub const MatvecPipeline = struct {
         const cmd = try ctx.beginBatch();
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
 
         const pc = PushConst{ .rows = rows, .cols = cols };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(PushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(PushConst), &pc);
 
         const groups = (rows + self.rows_per_workgroup - 1) / self.rows_per_workgroup;
         const p_mv = ctx.profileBegin(cmd, "matvec.run");
@@ -531,7 +535,7 @@ pub const MatvecSession = struct {
     // Upload any GPU-supported quant type. Returns null for unsupported types.
     pub fn initFromRaw(ctx: *const GpuContext, mat_data: []const u8, mat_type: GgmlType, rows: u32, cols: u32) !?MatvecSession {
         return switch (mat_type) {
-            .f32  => try initBytes(ctx, mat_data, rows, cols),
+            .f32 => try initBytes(ctx, mat_data, rows, cols),
             .q8_0 => try initQ8_0(ctx, mat_data, rows, cols),
             .q3_k => try initQ3K(ctx, mat_data, rows, cols),
             .q4_k => try initQ4K(ctx, mat_data, rows, cols),
@@ -540,7 +544,7 @@ pub const MatvecSession = struct {
             .q6_k => try initQ6K(ctx, mat_data, rows, cols),
             .q5_k => try initQ5K(ctx, mat_data, rows, cols),
             .iq4_nl => try initIQ4NL(ctx, mat_data, rows, cols),
-            else  => null,
+            else => null,
         };
     }
 
@@ -557,8 +561,7 @@ pub const MatvecSession = struct {
         defer staging.deinit();
         try staging.upload(mat_bytes);
 
-        var mat_buf = try GpuBuffer.initDeviceLocal(ctx, mat_bytes.len,
-            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        var mat_buf = try GpuBuffer.initDeviceLocal(ctx, mat_bytes.len, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         errdefer mat_buf.deinit();
         try ctx.copyBuffer(staging.handle, mat_buf.handle, mat_bytes.len);
 
@@ -607,11 +610,9 @@ pub const MatvecSession = struct {
         vec: []const f32,
         out: []f32,
     ) !void {
-        var vb = try GpuBuffer.initHostCoherent(ctx, self.cols * @sizeOf(f32),
-            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        var vb = try GpuBuffer.initHostCoherent(ctx, self.cols * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         defer vb.deinit();
-        var ob = try GpuBuffer.initHostCoherent(ctx, self.rows * @sizeOf(f32),
-            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        var ob = try GpuBuffer.initHostCoherent(ctx, self.rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         defer ob.deinit();
         return self.run(ctx, pipeline, &vb, &ob, vec, out);
     }
@@ -624,11 +625,11 @@ pub const MatvecSession = struct {
 // in one dispatch, eliminating the CPU roundtrip between gate/up and down.
 // 4 bindings: 0=gate_mat  1=up_mat  2=vec_in  3=vec_out
 pub const FusedGateUpPipeline = struct {
-    pipeline:   vk.VkPipeline,
-    layout:     vk.VkPipelineLayout,
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
     dset_layout: vk.VkDescriptorSetLayout,
-    desc_pool:  vk.VkDescriptorPool,
-    device:     vk.VkDevice,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
     rows_per_workgroup: u32,
 
     pub fn init(ctx: *const GpuContext) !FusedGateUpPipeline {
@@ -652,8 +653,10 @@ pub const FusedGateUpPipeline = struct {
         };
         const dsl_ci = vk.VkDescriptorSetLayoutCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .pNext = null, .flags = 0,
-            .bindingCount = bindings.len, .pBindings = &bindings,
+            .pNext = null,
+            .flags = 0,
+            .bindingCount = bindings.len,
+            .pBindings = &bindings,
         };
         var dset_layout: vk.VkDescriptorSetLayout = null;
         if (vk.vkCreateDescriptorSetLayout(dev, &dsl_ci, null, &dset_layout) != vk.VK_SUCCESS)
@@ -661,13 +664,18 @@ pub const FusedGateUpPipeline = struct {
         errdefer vk.vkDestroyDescriptorSetLayout(dev, dset_layout, null);
 
         const pc_range = vk.VkPushConstantRange{
-            .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = @sizeOf(PushConst),
+            .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0,
+            .size = @sizeOf(PushConst),
         };
         const layout_ci = vk.VkPipelineLayoutCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .pNext = null, .flags = 0,
-            .setLayoutCount = 1, .pSetLayouts = &dset_layout,
-            .pushConstantRangeCount = 1, .pPushConstantRanges = &pc_range,
+            .pNext = null,
+            .flags = 0,
+            .setLayoutCount = 1,
+            .pSetLayouts = &dset_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &pc_range,
         };
         var layout: vk.VkPipelineLayout = null;
         if (vk.vkCreatePipelineLayout(dev, &layout_ci, null, &layout) != vk.VK_SUCCESS)
@@ -676,7 +684,10 @@ pub const FusedGateUpPipeline = struct {
 
         const shader_ci = vk.VkShaderModuleCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            .pNext = null, .flags = 0, .codeSize = spv.len, .pCode = @ptrCast(spv),
+            .pNext = null,
+            .flags = 0,
+            .codeSize = spv.len,
+            .pCode = @ptrCast(spv),
         };
         var shader_mod: vk.VkShaderModule = null;
         if (vk.vkCreateShaderModule(dev, &shader_ci, null, &shader_mod) != vk.VK_SUCCESS)
@@ -685,14 +696,21 @@ pub const FusedGateUpPipeline = struct {
 
         const stage = vk.VkPipelineShaderStageCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = null, .flags = 0,
+            .pNext = null,
+            .flags = 0,
             .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = shader_mod, .pName = "main", .pSpecializationInfo = null,
+            .module = shader_mod,
+            .pName = "main",
+            .pSpecializationInfo = null,
         };
         const pipeline_ci = vk.VkComputePipelineCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .pNext = null, .flags = 0, .stage = stage, .layout = layout,
-            .basePipelineHandle = null, .basePipelineIndex = -1,
+            .pNext = null,
+            .flags = 0,
+            .stage = stage,
+            .layout = layout,
+            .basePipelineHandle = null,
+            .basePipelineIndex = -1,
         };
         var pipeline: vk.VkPipeline = null;
         if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
@@ -701,21 +719,27 @@ pub const FusedGateUpPipeline = struct {
 
         // 16 sets: one per active expert per layer (n_experts_used = 8 typical)
         const pool_size = vk.VkDescriptorPoolSize{
-            .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4 * 16,
+            .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 4 * 16,
         };
         const pool_ci = vk.VkDescriptorPoolCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = null,
             .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = 16, .poolSizeCount = 1, .pPoolSizes = &pool_size,
+            .maxSets = 16,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
         };
         var desc_pool: vk.VkDescriptorPool = null;
         if (vk.vkCreateDescriptorPool(dev, &pool_ci, null, &desc_pool) != vk.VK_SUCCESS)
             return error.VkDescriptorPoolFailed;
 
         return .{
-            .pipeline = pipeline, .layout = layout,
-            .dset_layout = dset_layout, .desc_pool = desc_pool, .device = dev,
+            .pipeline = pipeline,
+            .layout = layout,
+            .dset_layout = dset_layout,
+            .desc_pool = desc_pool,
+            .device = dev,
             .rows_per_workgroup = rows_per_workgroup,
         };
     }
@@ -726,17 +750,19 @@ pub const FusedGateUpPipeline = struct {
         self: *const FusedGateUpPipeline,
         cmd: vk.VkCommandBuffer,
         gate_buf: *const GpuBuffer,
-        up_buf:   *const GpuBuffer,
-        vec_buf:  *const GpuBuffer,
-        out_buf:  *const GpuBuffer,
+        up_buf: *const GpuBuffer,
+        vec_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
         rows: u32,
         cols: u32,
     ) !vk.VkDescriptorSet {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null, .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
         if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
@@ -744,9 +770,9 @@ pub const FusedGateUpPipeline = struct {
 
         const buf_infos = [4]vk.VkDescriptorBufferInfo{
             .{ .buffer = gate_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = up_buf.handle,   .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = vec_buf.handle,  .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = out_buf.handle,  .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = up_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = vec_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = out_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         };
         const writes = [4]vk.VkWriteDescriptorSet{
             mkWrite(dset, 0, &buf_infos[0]), mkWrite(dset, 1, &buf_infos[1]),
@@ -755,11 +781,9 @@ pub const FusedGateUpPipeline = struct {
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = PushConst{ .rows = rows, .cols = cols };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(PushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(PushConst), &pc);
         const groups = (rows + self.rows_per_workgroup - 1) / self.rows_per_workgroup;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
 
@@ -780,11 +804,11 @@ pub const FusedGateUpPipeline = struct {
 // Eliminates CPU roundtrip for expert output accumulation.
 // Bindings: 0=inputs (n×d_model f32), 1=scales (n f32), 2=output (d_model f32, +=)
 pub const AccumPipeline = struct {
-    pipeline:    vk.VkPipeline,
-    layout:      vk.VkPipelineLayout,
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
     dset_layout: vk.VkDescriptorSetLayout,
-    desc_pool:   vk.VkDescriptorPool,
-    device:      vk.VkDevice,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
 
     pub fn init(ctx: *const GpuContext) !AccumPipeline {
         comptime std.debug.assert(shaders.expert_accum.len % 4 == 0);
@@ -795,8 +819,10 @@ pub const AccumPipeline = struct {
         };
         const dsl_ci = vk.VkDescriptorSetLayoutCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .pNext = null, .flags = 0,
-            .bindingCount = bindings.len, .pBindings = &bindings,
+            .pNext = null,
+            .flags = 0,
+            .bindingCount = bindings.len,
+            .pBindings = &bindings,
         };
         var dset_layout: vk.VkDescriptorSetLayout = null;
         if (vk.vkCreateDescriptorSetLayout(dev, &dsl_ci, null, &dset_layout) != vk.VK_SUCCESS)
@@ -804,13 +830,18 @@ pub const AccumPipeline = struct {
         errdefer vk.vkDestroyDescriptorSetLayout(dev, dset_layout, null);
 
         const pc_range = vk.VkPushConstantRange{
-            .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = @sizeOf(PushConst),
+            .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0,
+            .size = @sizeOf(PushConst),
         };
         const layout_ci = vk.VkPipelineLayoutCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .pNext = null, .flags = 0,
-            .setLayoutCount = 1, .pSetLayouts = &dset_layout,
-            .pushConstantRangeCount = 1, .pPushConstantRanges = &pc_range,
+            .pNext = null,
+            .flags = 0,
+            .setLayoutCount = 1,
+            .pSetLayouts = &dset_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &pc_range,
         };
         var layout: vk.VkPipelineLayout = null;
         if (vk.vkCreatePipelineLayout(dev, &layout_ci, null, &layout) != vk.VK_SUCCESS)
@@ -821,7 +852,10 @@ pub const AccumPipeline = struct {
         std.debug.assert(@intFromPtr(spv) % 4 == 0);
         const shader_ci = vk.VkShaderModuleCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            .pNext = null, .flags = 0, .codeSize = spv.len, .pCode = @ptrCast(spv),
+            .pNext = null,
+            .flags = 0,
+            .codeSize = spv.len,
+            .pCode = @ptrCast(spv),
         };
         var shader_mod: vk.VkShaderModule = null;
         if (vk.vkCreateShaderModule(dev, &shader_ci, null, &shader_mod) != vk.VK_SUCCESS)
@@ -830,14 +864,21 @@ pub const AccumPipeline = struct {
 
         const stage = vk.VkPipelineShaderStageCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = null, .flags = 0,
+            .pNext = null,
+            .flags = 0,
             .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = shader_mod, .pName = "main", .pSpecializationInfo = null,
+            .module = shader_mod,
+            .pName = "main",
+            .pSpecializationInfo = null,
         };
         const pipeline_ci = vk.VkComputePipelineCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .pNext = null, .flags = 0, .stage = stage, .layout = layout,
-            .basePipelineHandle = null, .basePipelineIndex = -1,
+            .pNext = null,
+            .flags = 0,
+            .stage = stage,
+            .layout = layout,
+            .basePipelineHandle = null,
+            .basePipelineIndex = -1,
         };
         var pipeline: vk.VkPipeline = null;
         if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
@@ -845,21 +886,27 @@ pub const AccumPipeline = struct {
         errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
         const pool_size = vk.VkDescriptorPoolSize{
-            .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 3 * 4,
+            .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 3 * 4,
         };
         const pool_ci = vk.VkDescriptorPoolCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = null,
             .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = 4, .poolSizeCount = 1, .pPoolSizes = &pool_size,
+            .maxSets = 4,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
         };
         var desc_pool: vk.VkDescriptorPool = null;
         if (vk.vkCreateDescriptorPool(dev, &pool_ci, null, &desc_pool) != vk.VK_SUCCESS)
             return error.VkDescriptorPoolFailed;
 
         return .{
-            .pipeline = pipeline, .layout = layout,
-            .dset_layout = dset_layout, .desc_pool = desc_pool, .device = dev,
+            .pipeline = pipeline,
+            .layout = layout,
+            .dset_layout = dset_layout,
+            .desc_pool = desc_pool,
+            .device = dev,
         };
     }
 
@@ -875,8 +922,10 @@ pub const AccumPipeline = struct {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null, .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
         if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
@@ -885,7 +934,7 @@ pub const AccumPipeline = struct {
         const buf_infos = [3]vk.VkDescriptorBufferInfo{
             .{ .buffer = inputs_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
             .{ .buffer = scales_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = out_buf.handle,    .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = out_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         };
         const writes = [3]vk.VkWriteDescriptorSet{
             mkWrite(dset, 0, &buf_infos[0]),
@@ -895,12 +944,10 @@ pub const AccumPipeline = struct {
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         // PushConst: rows=d_model, cols=n (reuses the 2×u32 push constant struct)
         const pc = PushConst{ .rows = d_model, .cols = n };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(PushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(PushConst), &pc);
         const groups = (d_model + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
 
@@ -926,13 +973,14 @@ pub const AccumPipeline = struct {
 // Push constant: { uint ncols; }.
 
 const QuantizePushConst = extern struct { ncols: u32 };
+const QuantizeBatchedPushConst = extern struct { ncols: u32, n_active: u32 };
 
 pub const QuantizeQ8_1Pipeline = struct {
-    pipeline:    vk.VkPipeline,
-    layout:      vk.VkPipelineLayout,
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
     dset_layout: vk.VkDescriptorSetLayout,
-    desc_pool:   vk.VkDescriptorPool,
-    device:      vk.VkDevice,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
 
     pub fn init(ctx: *const GpuContext) !QuantizeQ8_1Pipeline {
         comptime std.debug.assert(shaders.quantize_q8_1.len % 4 == 0);
@@ -943,8 +991,10 @@ pub const QuantizeQ8_1Pipeline = struct {
         };
         const dsl_ci = vk.VkDescriptorSetLayoutCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .pNext = null, .flags = 0,
-            .bindingCount = bindings.len, .pBindings = &bindings,
+            .pNext = null,
+            .flags = 0,
+            .bindingCount = bindings.len,
+            .pBindings = &bindings,
         };
         var dset_layout: vk.VkDescriptorSetLayout = null;
         if (vk.vkCreateDescriptorSetLayout(dev, &dsl_ci, null, &dset_layout) != vk.VK_SUCCESS)
@@ -953,13 +1003,17 @@ pub const QuantizeQ8_1Pipeline = struct {
 
         const pc_range = vk.VkPushConstantRange{
             .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            .offset = 0, .size = @sizeOf(QuantizePushConst),
+            .offset = 0,
+            .size = @sizeOf(QuantizePushConst),
         };
         const layout_ci = vk.VkPipelineLayoutCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .pNext = null, .flags = 0,
-            .setLayoutCount = 1, .pSetLayouts = &dset_layout,
-            .pushConstantRangeCount = 1, .pPushConstantRanges = &pc_range,
+            .pNext = null,
+            .flags = 0,
+            .setLayoutCount = 1,
+            .pSetLayouts = &dset_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &pc_range,
         };
         var layout: vk.VkPipelineLayout = null;
         if (vk.vkCreatePipelineLayout(dev, &layout_ci, null, &layout) != vk.VK_SUCCESS)
@@ -970,7 +1024,10 @@ pub const QuantizeQ8_1Pipeline = struct {
         std.debug.assert(@intFromPtr(spv) % 4 == 0);
         const shader_ci = vk.VkShaderModuleCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            .pNext = null, .flags = 0, .codeSize = spv.len, .pCode = @ptrCast(spv),
+            .pNext = null,
+            .flags = 0,
+            .codeSize = spv.len,
+            .pCode = @ptrCast(spv),
         };
         var shader_mod: vk.VkShaderModule = null;
         if (vk.vkCreateShaderModule(dev, &shader_ci, null, &shader_mod) != vk.VK_SUCCESS)
@@ -979,14 +1036,21 @@ pub const QuantizeQ8_1Pipeline = struct {
 
         const stage = vk.VkPipelineShaderStageCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = null, .flags = 0,
+            .pNext = null,
+            .flags = 0,
             .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = shader_mod, .pName = "main", .pSpecializationInfo = null,
+            .module = shader_mod,
+            .pName = "main",
+            .pSpecializationInfo = null,
         };
         const pipeline_ci = vk.VkComputePipelineCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .pNext = null, .flags = 0, .stage = stage, .layout = layout,
-            .basePipelineHandle = null, .basePipelineIndex = -1,
+            .pNext = null,
+            .flags = 0,
+            .stage = stage,
+            .layout = layout,
+            .basePipelineHandle = null,
+            .basePipelineIndex = -1,
         };
         var pipeline: vk.VkPipeline = null;
         if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
@@ -994,21 +1058,27 @@ pub const QuantizeQ8_1Pipeline = struct {
         errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
         const pool_size = vk.VkDescriptorPoolSize{
-            .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 * 16,
+            .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 2 * 16,
         };
         const pool_ci = vk.VkDescriptorPoolCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = null,
             .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = 16, .poolSizeCount = 1, .pPoolSizes = &pool_size,
+            .maxSets = 16,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
         };
         var desc_pool: vk.VkDescriptorPool = null;
         if (vk.vkCreateDescriptorPool(dev, &pool_ci, null, &desc_pool) != vk.VK_SUCCESS)
             return error.VkDescriptorPoolFailed;
 
         return .{
-            .pipeline = pipeline, .layout = layout,
-            .dset_layout = dset_layout, .desc_pool = desc_pool, .device = dev,
+            .pipeline = pipeline,
+            .layout = layout,
+            .dset_layout = dset_layout,
+            .desc_pool = desc_pool,
+            .device = dev,
         };
     }
 
@@ -1016,7 +1086,7 @@ pub const QuantizeQ8_1Pipeline = struct {
     pub fn record(
         self: *const QuantizeQ8_1Pipeline,
         cmd: vk.VkCommandBuffer,
-        in_buf:  *const GpuBuffer,
+        in_buf: *const GpuBuffer,
         out_buf: *const GpuBuffer,
         ncols: u32,
     ) !vk.VkDescriptorSet {
@@ -1024,15 +1094,17 @@ pub const QuantizeQ8_1Pipeline = struct {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null, .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
         if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
 
         const buf_infos = [2]vk.VkDescriptorBufferInfo{
-            .{ .buffer = in_buf.handle,  .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = in_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
             .{ .buffer = out_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         };
         const writes = [2]vk.VkWriteDescriptorSet{
@@ -1042,12 +1114,96 @@ pub const QuantizeQ8_1Pipeline = struct {
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = QuantizePushConst{ .ncols = ncols };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(QuantizePushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(QuantizePushConst), &pc);
         // One workgroup per 128-element x4 group (32 threads each).
+        const groups = (ncols + 127) / 128;
+        vk.vkCmdDispatch(cmd, groups, 1, 1);
+
+        return dset;
+    }
+
+    pub fn recordToOffset(
+        self: *const QuantizeQ8_1Pipeline,
+        cmd: vk.VkCommandBuffer,
+        in_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+        out_offset: u64,
+        out_range: u64,
+        ncols: u32,
+    ) !vk.VkDescriptorSet {
+        std.debug.assert(ncols % 4 == 0);
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [2]vk.VkDescriptorBufferInfo{
+            .{ .buffer = in_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = out_buf.handle, .offset = out_offset, .range = out_range },
+        };
+        const writes = [2]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+        };
+        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
+        const pc = QuantizePushConst{ .ncols = ncols };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(QuantizePushConst), &pc);
+        const groups = (ncols + 127) / 128;
+        vk.vkCmdDispatch(cmd, groups, 1, 1);
+
+        return dset;
+    }
+
+    pub fn recordRangeToOffset(
+        self: *const QuantizeQ8_1Pipeline,
+        cmd: vk.VkCommandBuffer,
+        in_buf: *const GpuBuffer,
+        in_offset: u64,
+        in_range: u64,
+        out_buf: *const GpuBuffer,
+        out_offset: u64,
+        out_range: u64,
+        ncols: u32,
+    ) !vk.VkDescriptorSet {
+        std.debug.assert(ncols % 4 == 0);
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [2]vk.VkDescriptorBufferInfo{
+            .{ .buffer = in_buf.handle, .offset = in_offset, .range = in_range },
+            .{ .buffer = out_buf.handle, .offset = out_offset, .range = out_range },
+        };
+        const writes = [2]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+        };
+        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
+        const pc = QuantizePushConst{ .ncols = ncols };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(QuantizePushConst), &pc);
         const groups = (ncols + 127) / 128;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
 
@@ -1068,6 +1224,244 @@ pub fn q8_1OutBytes(ncols: u32) u32 {
     return ((ncols + 127) / 128) * @as(u32, dq.Q8_1_X4_BYTES);
 }
 
+pub const QuantizeQ8_1BatchedPipeline = struct {
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !QuantizeQ8_1BatchedPipeline {
+        comptime std.debug.assert(shaders.quantize_q8_1_batched.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.quantize_q8_1_batched, 2, @sizeOf(QuantizeBatchedPushConst), 16);
+        return .{
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn record(
+        self: *const QuantizeQ8_1BatchedPipeline,
+        cmd: vk.VkCommandBuffer,
+        in_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+        ncols: u32,
+        active: u32,
+    ) !vk.VkDescriptorSet {
+        std.debug.assert(ncols % 4 == 0);
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [2]vk.VkDescriptorBufferInfo{
+            .{ .buffer = in_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = out_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [2]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+        };
+        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
+        const pc = QuantizeBatchedPushConst{ .ncols = ncols, .n_active = active };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(QuantizeBatchedPushConst), &pc);
+        const groups_x = (ncols + 127) / 128;
+        vk.vkCmdDispatch(cmd, groups_x, active, 1);
+
+        return dset;
+    }
+
+    pub fn deinit(self: *QuantizeQ8_1BatchedPipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
+const ExpertGateUpIdPushConst = extern struct {
+    rows: u32,
+    cols: u32,
+    n_active: u32,
+};
+
+pub const ExpertGateUpIdPipeline = struct {
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
+
+    pub fn initQ3KQ8_1(ctx: *const GpuContext) !ExpertGateUpIdPipeline {
+        comptime std.debug.assert(shaders.expert_gate_up_id_q3_k_q8_1.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.expert_gate_up_id_q3_k_q8_1, 4, @sizeOf(ExpertGateUpIdPushConst), 16);
+        return .{
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn record(
+        self: *const ExpertGateUpIdPipeline,
+        cmd: vk.VkCommandBuffer,
+        weights_buf: *const GpuBuffer,
+        acts_buf: *const GpuBuffer,
+        ids_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+        rows: u32,
+        cols: u32,
+        active: u32,
+    ) !vk.VkDescriptorSet {
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [4]vk.VkDescriptorBufferInfo{
+            .{ .buffer = weights_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = acts_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = ids_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = out_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [4]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+            mkWrite(dset, 2, &buf_infos[2]),
+            mkWrite(dset, 3, &buf_infos[3]),
+        };
+        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
+        const pc = ExpertGateUpIdPushConst{ .rows = rows, .cols = cols, .n_active = active };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ExpertGateUpIdPushConst), &pc);
+        vk.vkCmdDispatch(cmd, rows, active, 1);
+
+        return dset;
+    }
+
+    pub fn deinit(self: *ExpertGateUpIdPipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
+const ExpertDownIdPushConst = extern struct {
+    rows: u32,
+    cols: u32,
+    n_active: u32,
+};
+
+pub const ExpertDownIdPipeline = struct {
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
+
+    pub fn initQ5_1Q8_1(ctx: *const GpuContext) !ExpertDownIdPipeline {
+        comptime std.debug.assert(shaders.expert_down_id_q5_1_q8_1.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.expert_down_id_q5_1_q8_1);
+    }
+
+    pub fn initIQ4NLQ8_1(ctx: *const GpuContext) !ExpertDownIdPipeline {
+        comptime std.debug.assert(shaders.expert_down_id_iq4_nl_q8_1.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.expert_down_id_iq4_nl_q8_1);
+    }
+
+    fn initFromSpv(ctx: *const GpuContext, spv: anytype) !ExpertDownIdPipeline {
+        const built = try buildSimplePipeline(ctx, spv, 5, @sizeOf(ExpertDownIdPushConst), 8);
+        return .{
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn record(
+        self: *const ExpertDownIdPipeline,
+        cmd: vk.VkCommandBuffer,
+        weights_buf: *const GpuBuffer,
+        acts_buf: *const GpuBuffer,
+        ids_buf: *const GpuBuffer,
+        scales_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+        rows: u32,
+        cols: u32,
+        active: u32,
+    ) !vk.VkDescriptorSet {
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [5]vk.VkDescriptorBufferInfo{
+            .{ .buffer = weights_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = acts_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = ids_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = scales_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = out_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [5]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+            mkWrite(dset, 2, &buf_infos[2]),
+            mkWrite(dset, 3, &buf_infos[3]),
+            mkWrite(dset, 4, &buf_infos[4]),
+        };
+        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
+        const pc = ExpertDownIdPushConst{ .rows = rows, .cols = cols, .n_active = active };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ExpertDownIdPushConst), &pc);
+        vk.vkCmdDispatch(cmd, rows, active, 1);
+
+        return dset;
+    }
+
+    pub fn deinit(self: *ExpertDownIdPipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
 // ── RmsnormPipeline ───────────────────────────────────────────────────────────
 //
 // Per-row RMS normalization: y[i] = x[i] * rms_inv * (bias + w[i])
@@ -1084,11 +1478,11 @@ const RmsnormPushConst = extern struct {
 };
 
 pub const RmsnormPipeline = struct {
-    pipeline:    vk.VkPipeline,
-    layout:      vk.VkPipelineLayout,
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
     dset_layout: vk.VkDescriptorSetLayout,
-    desc_pool:   vk.VkDescriptorPool,
-    device:      vk.VkDevice,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
 
     pub fn init(ctx: *const GpuContext) !RmsnormPipeline {
         comptime std.debug.assert(shaders.rmsnorm.len % 4 == 0);
@@ -1099,8 +1493,10 @@ pub const RmsnormPipeline = struct {
         };
         const dsl_ci = vk.VkDescriptorSetLayoutCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .pNext = null, .flags = 0,
-            .bindingCount = bindings.len, .pBindings = &bindings,
+            .pNext = null,
+            .flags = 0,
+            .bindingCount = bindings.len,
+            .pBindings = &bindings,
         };
         var dset_layout: vk.VkDescriptorSetLayout = null;
         if (vk.vkCreateDescriptorSetLayout(dev, &dsl_ci, null, &dset_layout) != vk.VK_SUCCESS)
@@ -1109,13 +1505,17 @@ pub const RmsnormPipeline = struct {
 
         const pc_range = vk.VkPushConstantRange{
             .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            .offset = 0, .size = @sizeOf(RmsnormPushConst),
+            .offset = 0,
+            .size = @sizeOf(RmsnormPushConst),
         };
         const layout_ci = vk.VkPipelineLayoutCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .pNext = null, .flags = 0,
-            .setLayoutCount = 1, .pSetLayouts = &dset_layout,
-            .pushConstantRangeCount = 1, .pPushConstantRanges = &pc_range,
+            .pNext = null,
+            .flags = 0,
+            .setLayoutCount = 1,
+            .pSetLayouts = &dset_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &pc_range,
         };
         var layout: vk.VkPipelineLayout = null;
         if (vk.vkCreatePipelineLayout(dev, &layout_ci, null, &layout) != vk.VK_SUCCESS)
@@ -1125,7 +1525,10 @@ pub const RmsnormPipeline = struct {
         const spv = &shaders.rmsnorm;
         const shader_ci = vk.VkShaderModuleCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            .pNext = null, .flags = 0, .codeSize = spv.len, .pCode = @ptrCast(spv),
+            .pNext = null,
+            .flags = 0,
+            .codeSize = spv.len,
+            .pCode = @ptrCast(spv),
         };
         var shader_mod: vk.VkShaderModule = null;
         if (vk.vkCreateShaderModule(dev, &shader_ci, null, &shader_mod) != vk.VK_SUCCESS)
@@ -1134,14 +1537,21 @@ pub const RmsnormPipeline = struct {
 
         const stage = vk.VkPipelineShaderStageCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = null, .flags = 0,
+            .pNext = null,
+            .flags = 0,
             .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = shader_mod, .pName = "main", .pSpecializationInfo = null,
+            .module = shader_mod,
+            .pName = "main",
+            .pSpecializationInfo = null,
         };
         const pipeline_ci = vk.VkComputePipelineCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .pNext = null, .flags = 0, .stage = stage, .layout = layout,
-            .basePipelineHandle = null, .basePipelineIndex = -1,
+            .pNext = null,
+            .flags = 0,
+            .stage = stage,
+            .layout = layout,
+            .basePipelineHandle = null,
+            .basePipelineIndex = -1,
         };
         var pipeline: vk.VkPipeline = null;
         if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
@@ -1149,21 +1559,27 @@ pub const RmsnormPipeline = struct {
         errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
         const pool_size = vk.VkDescriptorPoolSize{
-            .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 3 * 32,
+            .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 3 * 32,
         };
         const pool_ci = vk.VkDescriptorPoolCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = null,
             .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = 32, .poolSizeCount = 1, .pPoolSizes = &pool_size,
+            .maxSets = 32,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
         };
         var desc_pool: vk.VkDescriptorPool = null;
         if (vk.vkCreateDescriptorPool(dev, &pool_ci, null, &desc_pool) != vk.VK_SUCCESS)
             return error.VkDescriptorPoolFailed;
 
         return .{
-            .pipeline = pipeline, .layout = layout,
-            .dset_layout = dset_layout, .desc_pool = desc_pool, .device = dev,
+            .pipeline = pipeline,
+            .layout = layout,
+            .dset_layout = dset_layout,
+            .desc_pool = desc_pool,
+            .device = dev,
         };
     }
 
@@ -1181,8 +1597,10 @@ pub const RmsnormPipeline = struct {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null, .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
         if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
@@ -1201,15 +1619,14 @@ pub const RmsnormPipeline = struct {
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
 
         const pc = RmsnormPushConst{
-            .n = n, .eps = eps,
+            .n = n,
+            .eps = eps,
             .weight_offset = if (weight_offset) 1 else 0,
         };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(RmsnormPushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(RmsnormPushConst), &pc);
         vk.vkCmdDispatch(cmd, 1, 1, 1);
 
         return dset;
@@ -1242,11 +1659,11 @@ const RmsnormPerHeadPushConst = extern struct {
 };
 
 pub const RmsnormPerHeadPipeline = struct {
-    pipeline:    vk.VkPipeline,
-    layout:      vk.VkPipelineLayout,
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
     dset_layout: vk.VkDescriptorSetLayout,
-    desc_pool:   vk.VkDescriptorPool,
-    device:      vk.VkDevice,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
 
     pub fn init(ctx: *const GpuContext) !RmsnormPerHeadPipeline {
         comptime std.debug.assert(shaders.rmsnorm_perhead.len % 4 == 0);
@@ -1257,8 +1674,10 @@ pub const RmsnormPerHeadPipeline = struct {
         };
         const dsl_ci = vk.VkDescriptorSetLayoutCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .pNext = null, .flags = 0,
-            .bindingCount = bindings.len, .pBindings = &bindings,
+            .pNext = null,
+            .flags = 0,
+            .bindingCount = bindings.len,
+            .pBindings = &bindings,
         };
         var dset_layout: vk.VkDescriptorSetLayout = null;
         if (vk.vkCreateDescriptorSetLayout(dev, &dsl_ci, null, &dset_layout) != vk.VK_SUCCESS)
@@ -1267,13 +1686,17 @@ pub const RmsnormPerHeadPipeline = struct {
 
         const pc_range = vk.VkPushConstantRange{
             .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            .offset = 0, .size = @sizeOf(RmsnormPerHeadPushConst),
+            .offset = 0,
+            .size = @sizeOf(RmsnormPerHeadPushConst),
         };
         const layout_ci = vk.VkPipelineLayoutCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .pNext = null, .flags = 0,
-            .setLayoutCount = 1, .pSetLayouts = &dset_layout,
-            .pushConstantRangeCount = 1, .pPushConstantRanges = &pc_range,
+            .pNext = null,
+            .flags = 0,
+            .setLayoutCount = 1,
+            .pSetLayouts = &dset_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &pc_range,
         };
         var layout: vk.VkPipelineLayout = null;
         if (vk.vkCreatePipelineLayout(dev, &layout_ci, null, &layout) != vk.VK_SUCCESS)
@@ -1283,7 +1706,10 @@ pub const RmsnormPerHeadPipeline = struct {
         const spv = &shaders.rmsnorm_perhead;
         const shader_ci = vk.VkShaderModuleCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            .pNext = null, .flags = 0, .codeSize = spv.len, .pCode = @ptrCast(spv),
+            .pNext = null,
+            .flags = 0,
+            .codeSize = spv.len,
+            .pCode = @ptrCast(spv),
         };
         var shader_mod: vk.VkShaderModule = null;
         if (vk.vkCreateShaderModule(dev, &shader_ci, null, &shader_mod) != vk.VK_SUCCESS)
@@ -1292,14 +1718,21 @@ pub const RmsnormPerHeadPipeline = struct {
 
         const stage = vk.VkPipelineShaderStageCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = null, .flags = 0,
+            .pNext = null,
+            .flags = 0,
             .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = shader_mod, .pName = "main", .pSpecializationInfo = null,
+            .module = shader_mod,
+            .pName = "main",
+            .pSpecializationInfo = null,
         };
         const pipeline_ci = vk.VkComputePipelineCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .pNext = null, .flags = 0, .stage = stage, .layout = layout,
-            .basePipelineHandle = null, .basePipelineIndex = -1,
+            .pNext = null,
+            .flags = 0,
+            .stage = stage,
+            .layout = layout,
+            .basePipelineHandle = null,
+            .basePipelineIndex = -1,
         };
         var pipeline: vk.VkPipeline = null;
         if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
@@ -1307,21 +1740,27 @@ pub const RmsnormPerHeadPipeline = struct {
         errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
         const pool_size = vk.VkDescriptorPoolSize{
-            .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 3 * 32,
+            .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 3 * 32,
         };
         const pool_ci = vk.VkDescriptorPoolCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = null,
             .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = 32, .poolSizeCount = 1, .pPoolSizes = &pool_size,
+            .maxSets = 32,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
         };
         var desc_pool: vk.VkDescriptorPool = null;
         if (vk.vkCreateDescriptorPool(dev, &pool_ci, null, &desc_pool) != vk.VK_SUCCESS)
             return error.VkDescriptorPoolFailed;
 
         return .{
-            .pipeline = pipeline, .layout = layout,
-            .dset_layout = dset_layout, .desc_pool = desc_pool, .device = dev,
+            .pipeline = pipeline,
+            .layout = layout,
+            .dset_layout = dset_layout,
+            .desc_pool = desc_pool,
+            .device = dev,
         };
     }
 
@@ -1329,7 +1768,7 @@ pub const RmsnormPerHeadPipeline = struct {
         self: *const RmsnormPerHeadPipeline,
         cmd: vk.VkCommandBuffer,
         x_buf: *const GpuBuffer,
-        w_buf: *const GpuBuffer,  // may equal x_buf when use_weight==false (unread)
+        w_buf: *const GpuBuffer, // may equal x_buf when use_weight==false (unread)
         y_buf: *const GpuBuffer,
         n_heads: u32,
         head_dim: u32,
@@ -1341,8 +1780,10 @@ pub const RmsnormPerHeadPipeline = struct {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null, .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
         if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
@@ -1361,16 +1802,15 @@ pub const RmsnormPerHeadPipeline = struct {
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
 
         const pc = RmsnormPerHeadPushConst{
-            .head_dim = head_dim, .eps = eps,
+            .head_dim = head_dim,
+            .eps = eps,
             .weight_offset = if (weight_offset) 1 else 0,
-            .use_weight    = if (use_weight)    1 else 0,
+            .use_weight = if (use_weight) 1 else 0,
         };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(RmsnormPerHeadPushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(RmsnormPerHeadPushConst), &pc);
         vk.vkCmdDispatch(cmd, n_heads, 1, 1);
 
         return dset;
@@ -1406,15 +1846,18 @@ fn buildSimplePipeline(
 } {
     const dev = ctx.device;
 
-    // Variable-size descriptor binding list (max 4 for our shaders).
-    std.debug.assert(n_bindings >= 1 and n_bindings <= 4);
-    var bindings_buf: [4]vk.VkDescriptorSetLayoutBinding = undefined;
+    // Variable-size descriptor binding list. Expert-id kernels need five
+    // buffers: weights, activations, ids, scales, output.
+    std.debug.assert(n_bindings >= 1 and n_bindings <= 5);
+    var bindings_buf: [5]vk.VkDescriptorSetLayoutBinding = undefined;
     var b: u32 = 0;
     while (b < n_bindings) : (b += 1) bindings_buf[b] = mkStorageBuf(b);
     const dsl_ci = vk.VkDescriptorSetLayoutCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .pNext = null, .flags = 0,
-        .bindingCount = n_bindings, .pBindings = &bindings_buf,
+        .pNext = null,
+        .flags = 0,
+        .bindingCount = n_bindings,
+        .pBindings = &bindings_buf,
     };
     var dset_layout: vk.VkDescriptorSetLayout = null;
     if (vk.vkCreateDescriptorSetLayout(dev, &dsl_ci, null, &dset_layout) != vk.VK_SUCCESS)
@@ -1422,13 +1865,18 @@ fn buildSimplePipeline(
     errdefer vk.vkDestroyDescriptorSetLayout(dev, dset_layout, null);
 
     const pc_range = vk.VkPushConstantRange{
-        .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = pc_size,
+        .stageFlags = vk.VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = pc_size,
     };
     const layout_ci = vk.VkPipelineLayoutCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .pNext = null, .flags = 0,
-        .setLayoutCount = 1, .pSetLayouts = &dset_layout,
-        .pushConstantRangeCount = 1, .pPushConstantRanges = &pc_range,
+        .pNext = null,
+        .flags = 0,
+        .setLayoutCount = 1,
+        .pSetLayouts = &dset_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pc_range,
     };
     var layout: vk.VkPipelineLayout = null;
     if (vk.vkCreatePipelineLayout(dev, &layout_ci, null, &layout) != vk.VK_SUCCESS)
@@ -1437,7 +1885,10 @@ fn buildSimplePipeline(
 
     const shader_ci = vk.VkShaderModuleCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .pNext = null, .flags = 0, .codeSize = spv.len, .pCode = @ptrCast(spv),
+        .pNext = null,
+        .flags = 0,
+        .codeSize = spv.len,
+        .pCode = @ptrCast(spv),
     };
     var shader_mod: vk.VkShaderModule = null;
     if (vk.vkCreateShaderModule(dev, &shader_ci, null, &shader_mod) != vk.VK_SUCCESS)
@@ -1446,13 +1897,21 @@ fn buildSimplePipeline(
 
     const stage = vk.VkPipelineShaderStageCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .pNext = null, .flags = 0, .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
-        .module = shader_mod, .pName = "main", .pSpecializationInfo = null,
+        .pNext = null,
+        .flags = 0,
+        .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = shader_mod,
+        .pName = "main",
+        .pSpecializationInfo = null,
     };
     const pipeline_ci = vk.VkComputePipelineCreateInfo{
         .sType = vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .pNext = null, .flags = 0, .stage = stage, .layout = layout,
-        .basePipelineHandle = null, .basePipelineIndex = -1,
+        .pNext = null,
+        .flags = 0,
+        .stage = stage,
+        .layout = layout,
+        .basePipelineHandle = null,
+        .basePipelineIndex = -1,
     };
     var pipeline: vk.VkPipeline = null;
     if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
@@ -1467,31 +1926,37 @@ fn buildSimplePipeline(
         .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = null,
         .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-        .maxSets = max_sets, .poolSizeCount = 1, .pPoolSizes = &pool_size,
+        .maxSets = max_sets,
+        .poolSizeCount = 1,
+        .pPoolSizes = &pool_size,
     };
     var desc_pool: vk.VkDescriptorPool = null;
     if (vk.vkCreateDescriptorPool(dev, &pool_ci, null, &desc_pool) != vk.VK_SUCCESS)
         return error.VkDescriptorPoolFailed;
 
     return .{
-        .pipeline = pipeline, .layout = layout,
-        .dset_layout = dset_layout, .desc_pool = desc_pool,
+        .pipeline = pipeline,
+        .layout = layout,
+        .dset_layout = dset_layout,
+        .desc_pool = desc_pool,
     };
 }
 
 pub const ElemAddPipeline = struct {
-    pipeline:    vk.VkPipeline,
-    layout:      vk.VkPipelineLayout,
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
     dset_layout: vk.VkDescriptorSetLayout,
-    desc_pool:   vk.VkDescriptorPool,
-    device:      vk.VkDevice,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
 
     pub fn init(ctx: *const GpuContext) !ElemAddPipeline {
         comptime std.debug.assert(shaders.elem_add.len % 4 == 0);
         const built = try buildSimplePipeline(ctx, &shaders.elem_add, 2, @sizeOf(ElemPushConst), 32);
         return .{
-            .pipeline = built.pipeline, .layout = built.layout,
-            .dset_layout = built.dset_layout, .desc_pool = built.desc_pool,
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
             .device = ctx.device,
         };
     }
@@ -1506,8 +1971,10 @@ pub const ElemAddPipeline = struct {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null, .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
         if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
@@ -1524,11 +1991,9 @@ pub const ElemAddPipeline = struct {
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = ElemPushConst{ .n = n };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(ElemPushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ElemPushConst), &pc);
         const groups = (n + 255) / 256;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
         return dset;
@@ -1543,18 +2008,20 @@ pub const ElemAddPipeline = struct {
 };
 
 pub const ElemScalePipeline = struct {
-    pipeline:    vk.VkPipeline,
-    layout:      vk.VkPipelineLayout,
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
     dset_layout: vk.VkDescriptorSetLayout,
-    desc_pool:   vk.VkDescriptorPool,
-    device:      vk.VkDevice,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
 
     pub fn init(ctx: *const GpuContext) !ElemScalePipeline {
         comptime std.debug.assert(shaders.elem_scale.len % 4 == 0);
         const built = try buildSimplePipeline(ctx, &shaders.elem_scale, 1, @sizeOf(ElemScalePushConst), 32);
         return .{
-            .pipeline = built.pipeline, .layout = built.layout,
-            .dset_layout = built.dset_layout, .desc_pool = built.desc_pool,
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
             .device = ctx.device,
         };
     }
@@ -1569,25 +2036,27 @@ pub const ElemScalePipeline = struct {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null, .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
         if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
 
         const buf_info = vk.VkDescriptorBufferInfo{
-            .buffer = x_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE,
+            .buffer = x_buf.handle,
+            .offset = 0,
+            .range = vk.VK_WHOLE_SIZE,
         };
         const write = mkWrite(dset, 0, &buf_info);
         vk.vkUpdateDescriptorSets(dev, 1, &write, 0, null);
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = ElemScalePushConst{ .n = n, .s = s };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(ElemScalePushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ElemScalePushConst), &pc);
         const groups = (n + 255) / 256;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
         return dset;
@@ -1609,18 +2078,20 @@ pub const ElemScalePipeline = struct {
 // matvecs and the w_down matvec.
 
 pub const GeluMulPipeline = struct {
-    pipeline:    vk.VkPipeline,
-    layout:      vk.VkPipelineLayout,
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
     dset_layout: vk.VkDescriptorSetLayout,
-    desc_pool:   vk.VkDescriptorPool,
-    device:      vk.VkDevice,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
 
     pub fn init(ctx: *const GpuContext) !GeluMulPipeline {
         comptime std.debug.assert(shaders.gelu_mul.len % 4 == 0);
         const built = try buildSimplePipeline(ctx, &shaders.gelu_mul, 2, @sizeOf(ElemPushConst), 32);
         return .{
-            .pipeline = built.pipeline, .layout = built.layout,
-            .dset_layout = built.dset_layout, .desc_pool = built.desc_pool,
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
             .device = ctx.device,
         };
     }
@@ -1635,8 +2106,10 @@ pub const GeluMulPipeline = struct {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null, .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
         if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
@@ -1653,11 +2126,9 @@ pub const GeluMulPipeline = struct {
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = ElemPushConst{ .n = n };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(ElemPushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ElemPushConst), &pc);
         const groups = (n + 255) / 256;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
         return dset;
@@ -1683,18 +2154,20 @@ const RopeTablePushConst = extern struct { pos: u32, head_dim: u32 };
 const RopeThetaPushConst = extern struct { pos: u32, head_dim: u32, theta: f32 };
 
 pub const RopeNeoxTablePipeline = struct {
-    pipeline:    vk.VkPipeline,
-    layout:      vk.VkPipelineLayout,
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
     dset_layout: vk.VkDescriptorSetLayout,
-    desc_pool:   vk.VkDescriptorPool,
-    device:      vk.VkDevice,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
 
     pub fn init(ctx: *const GpuContext) !RopeNeoxTablePipeline {
         comptime std.debug.assert(shaders.rope_neox_table.len % 4 == 0);
         const built = try buildSimplePipeline(ctx, &shaders.rope_neox_table, 2, @sizeOf(RopeTablePushConst), 64);
         return .{
-            .pipeline = built.pipeline, .layout = built.layout,
-            .dset_layout = built.dset_layout, .desc_pool = built.desc_pool,
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
             .device = ctx.device,
         };
     }
@@ -1712,14 +2185,16 @@ pub const RopeNeoxTablePipeline = struct {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null, .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
         if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
         const buf_infos = [2]vk.VkDescriptorBufferInfo{
-            .{ .buffer = vec_buf.handle,   .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = vec_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
             .{ .buffer = freqs_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         };
         const writes = [2]vk.VkWriteDescriptorSet{
@@ -1729,11 +2204,9 @@ pub const RopeNeoxTablePipeline = struct {
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = RopeTablePushConst{ .pos = pos, .head_dim = head_dim };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(RopeTablePushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(RopeTablePushConst), &pc);
         vk.vkCmdDispatch(cmd, n_heads, 1, 1);
         return dset;
     }
@@ -1747,18 +2220,20 @@ pub const RopeNeoxTablePipeline = struct {
 };
 
 pub const RopeNeoxThetaPipeline = struct {
-    pipeline:    vk.VkPipeline,
-    layout:      vk.VkPipelineLayout,
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
     dset_layout: vk.VkDescriptorSetLayout,
-    desc_pool:   vk.VkDescriptorPool,
-    device:      vk.VkDevice,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
 
     pub fn init(ctx: *const GpuContext) !RopeNeoxThetaPipeline {
         comptime std.debug.assert(shaders.rope_neox_theta.len % 4 == 0);
         const built = try buildSimplePipeline(ctx, &shaders.rope_neox_theta, 1, @sizeOf(RopeThetaPushConst), 64);
         return .{
-            .pipeline = built.pipeline, .layout = built.layout,
-            .dset_layout = built.dset_layout, .desc_pool = built.desc_pool,
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
             .device = ctx.device,
         };
     }
@@ -1776,24 +2251,26 @@ pub const RopeNeoxThetaPipeline = struct {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null, .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
         if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
         const buf_info = vk.VkDescriptorBufferInfo{
-            .buffer = vec_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE,
+            .buffer = vec_buf.handle,
+            .offset = 0,
+            .range = vk.VK_WHOLE_SIZE,
         };
         const write = mkWrite(dset, 0, &buf_info);
         vk.vkUpdateDescriptorSets(dev, 1, &write, 0, null);
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = RopeThetaPushConst{ .pos = pos, .head_dim = head_dim, .theta = theta };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(RopeThetaPushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(RopeThetaPushConst), &pc);
         vk.vkCmdDispatch(cmd, n_heads, 1, 1);
         return dset;
     }
@@ -1820,38 +2297,39 @@ pub const RopeNeoxThetaPipeline = struct {
 //   out     — [n_heads, head_dim] f32      (== attn_concat in forward.zig)
 
 const AttnQkSoftmaxPushConst = extern struct {
-    seq:         u32,
-    win_len:     u32,
-    head_dim:    u32,
-    n_kv_heads:  u32,
-    n_q_per_kv:  u32,
-    cap:         u32,
-    scale:       f32,
+    seq: u32,
+    win_len: u32,
+    head_dim: u32,
+    n_kv_heads: u32,
+    n_q_per_kv: u32,
+    cap: u32,
+    scale: f32,
 };
 
 const AttnAvPushConst = extern struct {
-    seq:         u32,
-    win_len:     u32,
-    head_dim:    u32,
-    n_kv_heads:  u32,
-    n_q_per_kv:  u32,
-    cap:         u32,
+    seq: u32,
+    win_len: u32,
+    head_dim: u32,
+    n_kv_heads: u32,
+    n_q_per_kv: u32,
+    cap: u32,
 };
 
 pub const AttnQkSoftmaxPipeline = struct {
-    pipeline:    vk.VkPipeline,
-    layout:      vk.VkPipelineLayout,
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
     dset_layout: vk.VkDescriptorSetLayout,
-    desc_pool:   vk.VkDescriptorPool,
-    device:      vk.VkDevice,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
 
     pub fn init(ctx: *const GpuContext) !AttnQkSoftmaxPipeline {
         comptime std.debug.assert(shaders.attn_qk_softmax.len % 4 == 0);
-        const built = try buildSimplePipeline(ctx, &shaders.attn_qk_softmax, 3,
-            @sizeOf(AttnQkSoftmaxPushConst), 32);
+        const built = try buildSimplePipeline(ctx, &shaders.attn_qk_softmax, 3, @sizeOf(AttnQkSoftmaxPushConst), 32);
         return .{
-            .pipeline = built.pipeline, .layout = built.layout,
-            .dset_layout = built.dset_layout, .desc_pool = built.desc_pool,
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
             .device = ctx.device,
         };
     }
@@ -1863,23 +2341,29 @@ pub const AttnQkSoftmaxPipeline = struct {
         k_buf: *const GpuBuffer,
         scores_buf: *const GpuBuffer,
         n_heads: u32,
-        seq: u32, win_len: u32, head_dim: u32,
-        n_kv_heads: u32, n_q_per_kv: u32, cap: u32,
+        seq: u32,
+        win_len: u32,
+        head_dim: u32,
+        n_kv_heads: u32,
+        n_q_per_kv: u32,
+        cap: u32,
         scale: f32,
     ) !vk.VkDescriptorSet {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null, .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
         if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
 
         const buf_infos = [3]vk.VkDescriptorBufferInfo{
-            .{ .buffer = q_buf.handle,      .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = k_buf.handle,      .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = q_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = k_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
             .{ .buffer = scores_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         };
         const writes = [3]vk.VkWriteDescriptorSet{
@@ -1890,15 +2374,17 @@ pub const AttnQkSoftmaxPipeline = struct {
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = AttnQkSoftmaxPushConst{
-            .seq = seq, .win_len = win_len, .head_dim = head_dim,
-            .n_kv_heads = n_kv_heads, .n_q_per_kv = n_q_per_kv,
-            .cap = cap, .scale = scale,
+            .seq = seq,
+            .win_len = win_len,
+            .head_dim = head_dim,
+            .n_kv_heads = n_kv_heads,
+            .n_q_per_kv = n_q_per_kv,
+            .cap = cap,
+            .scale = scale,
         };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(AttnQkSoftmaxPushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(AttnQkSoftmaxPushConst), &pc);
         vk.vkCmdDispatch(cmd, n_heads, 1, 1);
         return dset;
     }
@@ -1912,19 +2398,20 @@ pub const AttnQkSoftmaxPipeline = struct {
 };
 
 pub const AttnAvPipeline = struct {
-    pipeline:    vk.VkPipeline,
-    layout:      vk.VkPipelineLayout,
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
     dset_layout: vk.VkDescriptorSetLayout,
-    desc_pool:   vk.VkDescriptorPool,
-    device:      vk.VkDevice,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
 
     pub fn init(ctx: *const GpuContext) !AttnAvPipeline {
         comptime std.debug.assert(shaders.attn_av.len % 4 == 0);
-        const built = try buildSimplePipeline(ctx, &shaders.attn_av, 3,
-            @sizeOf(AttnAvPushConst), 32);
+        const built = try buildSimplePipeline(ctx, &shaders.attn_av, 3, @sizeOf(AttnAvPushConst), 32);
         return .{
-            .pipeline = built.pipeline, .layout = built.layout,
-            .dset_layout = built.dset_layout, .desc_pool = built.desc_pool,
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
             .device = ctx.device,
         };
     }
@@ -1936,14 +2423,20 @@ pub const AttnAvPipeline = struct {
         v_buf: *const GpuBuffer,
         out_buf: *const GpuBuffer,
         n_heads: u32,
-        seq: u32, win_len: u32, head_dim: u32,
-        n_kv_heads: u32, n_q_per_kv: u32, cap: u32,
+        seq: u32,
+        win_len: u32,
+        head_dim: u32,
+        n_kv_heads: u32,
+        n_q_per_kv: u32,
+        cap: u32,
     ) !vk.VkDescriptorSet {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext = null, .descriptorPool = self.desc_pool,
-            .descriptorSetCount = 1, .pSetLayouts = &self.dset_layout,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
         if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
@@ -1951,8 +2444,8 @@ pub const AttnAvPipeline = struct {
 
         const buf_infos = [3]vk.VkDescriptorBufferInfo{
             .{ .buffer = scores_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = v_buf.handle,      .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = out_buf.handle,    .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = v_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = out_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         };
         const writes = [3]vk.VkWriteDescriptorSet{
             mkWrite(dset, 0, &buf_infos[0]),
@@ -1962,14 +2455,16 @@ pub const AttnAvPipeline = struct {
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
 
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
-        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            self.layout, 0, 1, &dset, 0, null);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = AttnAvPushConst{
-            .seq = seq, .win_len = win_len, .head_dim = head_dim,
-            .n_kv_heads = n_kv_heads, .n_q_per_kv = n_q_per_kv, .cap = cap,
+            .seq = seq,
+            .win_len = win_len,
+            .head_dim = head_dim,
+            .n_kv_heads = n_kv_heads,
+            .n_q_per_kv = n_q_per_kv,
+            .cap = cap,
         };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0, @sizeOf(AttnAvPushConst), &pc);
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(AttnAvPushConst), &pc);
         vk.vkCmdDispatch(cmd, n_heads, 1, 1);
         return dset;
     }
@@ -2131,13 +2626,23 @@ test "gpu matvec Q3_K positive q3" {
 
     const blk_size = 110;
     var mat_bytes: [blk_size]u8 = [_]u8{0} ** blk_size;
-    @memset(mat_bytes[0..32], 0xFF);    // hmask: all hi bits set
-    mat_bytes[32] = 0x01;              // qs[0]: lo2=1 at shift=0 for element 0
+    @memset(mat_bytes[0..32], 0xFF); // hmask: all hi bits set
+    mat_bytes[32] = 0x01; // qs[0]: lo2=1 at shift=0 for element 0
     // scales: sc[0]=33, sc[1..15]=32
-    mat_bytes[96] = 0x01; mat_bytes[97] = 0x00; mat_bytes[98] = 0x00; mat_bytes[99] = 0x00;
-    mat_bytes[100] = 0x00; mat_bytes[101] = 0x00; mat_bytes[102] = 0x00; mat_bytes[103] = 0x00;
-    mat_bytes[104] = 0xAA; mat_bytes[105] = 0xAA; mat_bytes[106] = 0xAA; mat_bytes[107] = 0xAA;
-    mat_bytes[108] = 0x00; mat_bytes[109] = 0x3C; // d = f16(1.0)
+    mat_bytes[96] = 0x01;
+    mat_bytes[97] = 0x00;
+    mat_bytes[98] = 0x00;
+    mat_bytes[99] = 0x00;
+    mat_bytes[100] = 0x00;
+    mat_bytes[101] = 0x00;
+    mat_bytes[102] = 0x00;
+    mat_bytes[103] = 0x00;
+    mat_bytes[104] = 0xAA;
+    mat_bytes[105] = 0xAA;
+    mat_bytes[106] = 0xAA;
+    mat_bytes[107] = 0xAA;
+    mat_bytes[108] = 0x00;
+    mat_bytes[109] = 0x3C; // d = f16(1.0)
 
     var vec: [256]f32 = [_]f32{1.0} ** 256;
     var out: [1]f32 = .{0.0};
@@ -2174,10 +2679,20 @@ test "gpu matvec Q3_K negative q3" {
     var mat_bytes: [blk_size]u8 = [_]u8{0} ** blk_size;
     // hmask = 0, qs = 0  →  hi_bit=0, lo2=0  →  q3 = -4 for all elements
     // scales: all sc[i] = 33
-    mat_bytes[96] = 0x11; mat_bytes[97] = 0x11; mat_bytes[98] = 0x11; mat_bytes[99] = 0x11;
-    mat_bytes[100] = 0x11; mat_bytes[101] = 0x11; mat_bytes[102] = 0x11; mat_bytes[103] = 0x11;
-    mat_bytes[104] = 0xAA; mat_bytes[105] = 0xAA; mat_bytes[106] = 0xAA; mat_bytes[107] = 0xAA;
-    mat_bytes[108] = 0x00; mat_bytes[109] = 0x3C; // d = f16(1.0)
+    mat_bytes[96] = 0x11;
+    mat_bytes[97] = 0x11;
+    mat_bytes[98] = 0x11;
+    mat_bytes[99] = 0x11;
+    mat_bytes[100] = 0x11;
+    mat_bytes[101] = 0x11;
+    mat_bytes[102] = 0x11;
+    mat_bytes[103] = 0x11;
+    mat_bytes[104] = 0xAA;
+    mat_bytes[105] = 0xAA;
+    mat_bytes[106] = 0xAA;
+    mat_bytes[107] = 0xAA;
+    mat_bytes[108] = 0x00;
+    mat_bytes[109] = 0x3C; // d = f16(1.0)
 
     var vec: [256]f32 = [_]f32{1.0} ** 256;
     var out: [1]f32 = .{0.0};
@@ -2206,7 +2721,8 @@ test "gpu matvec Q4_K scale" {
     defer pipeline.deinit();
 
     var mat_bytes: [144]u8 = [_]u8{0} ** 144;
-    mat_bytes[0] = 0x00; mat_bytes[1] = 0x3C; // d = f16(1.0)
+    mat_bytes[0] = 0x00;
+    mat_bytes[1] = 0x3C; // d = f16(1.0)
     // dmin at [2..3] = 0.0 (already zero)
     mat_bytes[4] = 0x01; // scales[0]: sc[0] = 1 (j=0 → sc = scales[0] & 0x3F)
     @memset(mat_bytes[16..48], 0x11); // qs chunk 0: lo nibble = 1 for all 32 bytes
@@ -2237,7 +2753,8 @@ test "gpu matvec Q4_K min" {
 
     var mat_bytes: [144]u8 = [_]u8{0} ** 144;
     // d at [0..1] = 0.0 (already zero)
-    mat_bytes[2] = 0x00; mat_bytes[3] = 0x3C; // dmin = f16(1.0)
+    mat_bytes[2] = 0x00;
+    mat_bytes[3] = 0x3C; // dmin = f16(1.0)
     mat_bytes[8] = 0x02; // scales[4]: mn[0] = 2 (j=0 → mn = scales[4] & 0x3F)
     // qs = all 0 (already zero) → q_lo = q_hi = 0
 
@@ -2268,7 +2785,8 @@ test "gpu matvec Q5_1 scale" {
     defer pipeline.deinit();
 
     var mat_bytes: [24]u8 = [_]u8{0} ** 24;
-    mat_bytes[0] = 0x00; mat_bytes[1] = 0x3C; // d = f16(1.0)
+    mat_bytes[0] = 0x00;
+    mat_bytes[1] = 0x3C; // d = f16(1.0)
     // m at [2..3] = 0.0 (already zero)
     // qh at [4..7] = 0 (already zero) — no 5th bits
     mat_bytes[8] = 0x01; // qs[0]: lo nibble=1 for element 0
@@ -2299,7 +2817,8 @@ test "gpu matvec Q5_1 addend" {
 
     var mat_bytes: [24]u8 = [_]u8{0} ** 24;
     // d at [0..1] = 0.0 (already zero)
-    mat_bytes[2] = 0x00; mat_bytes[3] = 0x3C; // m = f16(1.0)
+    mat_bytes[2] = 0x00;
+    mat_bytes[3] = 0x3C; // m = f16(1.0)
 
     var vec: [32]f32 = [_]f32{1.0} ** 32;
     var out: [1]f32 = .{0.0};
@@ -2326,7 +2845,8 @@ test "gpu matvec Q5_1 fifth bit" {
     defer pipeline.deinit();
 
     var mat_bytes: [24]u8 = [_]u8{0} ** 24;
-    mat_bytes[0] = 0x00; mat_bytes[1] = 0x3C; // d = f16(1.0)
+    mat_bytes[0] = 0x00;
+    mat_bytes[1] = 0x3C; // d = f16(1.0)
     // m=0, qs=0 — only element 0 gets a 5th bit via qh
     mat_bytes[4] = 0x01; // qh low byte: bit 0 set → 5th bit of element 0
 
@@ -2356,7 +2876,8 @@ test "gpu matvec Q5_0 symmetric" {
     defer pipeline.deinit();
 
     var mat_bytes: [22]u8 = [_]u8{0} ** 22;
-    mat_bytes[0] = 0x00; mat_bytes[1] = 0x3C; // d = f16(1.0)
+    mat_bytes[0] = 0x00;
+    mat_bytes[1] = 0x3C; // d = f16(1.0)
 
     var vec: [32]f32 = [_]f32{1.0} ** 32;
     var out: [1]f32 = .{0.0};
@@ -2384,7 +2905,8 @@ test "gpu matvec Q5_0 lo nibble" {
     defer pipeline.deinit();
 
     var mat_bytes: [22]u8 = [_]u8{0} ** 22;
-    mat_bytes[0] = 0x00; mat_bytes[1] = 0x3C; // d = f16(1.0)
+    mat_bytes[0] = 0x00;
+    mat_bytes[1] = 0x3C; // d = f16(1.0)
     mat_bytes[6] = 0x01; // qs[0]: lo nibble=1 → element 0; hi nibble=0 → element 16
 
     var vec: [32]f32 = [_]f32{1.0} ** 32;
@@ -2413,7 +2935,8 @@ test "gpu matvec Q5_0 fifth bit" {
     defer pipeline.deinit();
 
     var mat_bytes: [22]u8 = [_]u8{0} ** 22;
-    mat_bytes[0] = 0x00; mat_bytes[1] = 0x3C; // d = f16(1.0)
+    mat_bytes[0] = 0x00;
+    mat_bytes[1] = 0x3C; // d = f16(1.0)
     mat_bytes[2] = 0x01; // qh byte 0, bit 0 → 5th bit of element 0
 
     var vec: [32]f32 = [_]f32{1.0} ** 32;
@@ -2450,10 +2973,20 @@ test "gpu fused gate-up Q3_K correctness" {
     var mat_bytes: [blk_size]u8 = [_]u8{0} ** blk_size;
     @memset(mat_bytes[0..32], 0xFF);
     mat_bytes[32] = 0x01;
-    mat_bytes[96] = 0x01; mat_bytes[97] = 0x00; mat_bytes[98] = 0x00; mat_bytes[99] = 0x00;
-    mat_bytes[100] = 0x00; mat_bytes[101] = 0x00; mat_bytes[102] = 0x00; mat_bytes[103] = 0x00;
-    mat_bytes[104] = 0xAA; mat_bytes[105] = 0xAA; mat_bytes[106] = 0xAA; mat_bytes[107] = 0xAA;
-    mat_bytes[108] = 0x00; mat_bytes[109] = 0x3C; // d = f16(1.0)
+    mat_bytes[96] = 0x01;
+    mat_bytes[97] = 0x00;
+    mat_bytes[98] = 0x00;
+    mat_bytes[99] = 0x00;
+    mat_bytes[100] = 0x00;
+    mat_bytes[101] = 0x00;
+    mat_bytes[102] = 0x00;
+    mat_bytes[103] = 0x00;
+    mat_bytes[104] = 0xAA;
+    mat_bytes[105] = 0xAA;
+    mat_bytes[106] = 0xAA;
+    mat_bytes[107] = 0xAA;
+    mat_bytes[108] = 0x00;
+    mat_bytes[109] = 0x3C; // d = f16(1.0)
 
     const usage = vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     var gate_buf = try GpuBuffer.initHostCoherent(&gpu, blk_size, usage);
@@ -2484,6 +3017,78 @@ test "gpu fused gate-up Q3_K correctness" {
     try std.testing.expectApproxEqAbs(result[0], 0.841, 0.01);
 }
 
+test "gpu expert-id gate-up Q3_K x Q8_1 correctness" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    var pl = ExpertGateUpIdPipeline.initQ3KQ8_1(&gpu) catch |e| {
+        std.debug.print("expert gate-up id pipeline init failed: {}\n", .{e});
+        return;
+    };
+    defer pl.deinit();
+    var quant = try QuantizeQ8_1Pipeline.init(&gpu);
+    defer quant.deinit();
+
+    const blk_size = 110;
+    const n_experts = 3;
+    const rows = 1;
+    const cols = 256;
+    const flat_size = n_experts * 2 * rows * blk_size;
+    var mat_bytes: [flat_size]u8 = [_]u8{0} ** flat_size;
+    for (0..n_experts) |e| for (0..2) |which| {
+        const off = (e * 2 + which) * blk_size;
+        @memset(mat_bytes[off..][0..32], 0xFF);
+        mat_bytes[off + 32] = 0x01;
+        mat_bytes[off + 96] = 0x01;
+        mat_bytes[off + 104] = 0xAA;
+        mat_bytes[off + 105] = 0xAA;
+        mat_bytes[off + 106] = 0xAA;
+        mat_bytes[off + 107] = 0xAA;
+        mat_bytes[off + 108] = 0x00;
+        mat_bytes[off + 109] = 0x3C; // d = f16(1.0)
+    };
+
+    const usage = vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    var weight_buf = try GpuBuffer.initHostCoherent(&gpu, flat_size, usage);
+    defer weight_buf.deinit();
+    try weight_buf.upload(&mat_bytes);
+
+    const ids = [2]u32{ 2, 0 };
+    var ids_buf = try GpuBuffer.initHostCoherent(&gpu, ids.len * @sizeOf(u32), usage);
+    defer ids_buf.deinit();
+    try ids_buf.upload(std.mem.sliceAsBytes(&ids));
+
+    var vec_buf = try GpuBuffer.initHostCoherent(&gpu, cols * @sizeOf(f32), usage);
+    defer vec_buf.deinit();
+    var vec: [cols]f32 = [_]f32{1.0} ** cols;
+    try vec_buf.upload(std.mem.sliceAsBytes(&vec));
+
+    var q8_buf = try GpuBuffer.initHostCoherent(&gpu, q8_1OutBytes(cols), usage);
+    defer q8_buf.deinit();
+    var out_buf = try GpuBuffer.initHostCoherent(&gpu, ids.len * rows * @sizeOf(f32), usage);
+    defer out_buf.deinit();
+
+    {
+        const cmd = try gpu.beginBatch();
+        var qds = try quant.record(cmd, &vec_buf, &q8_buf, cols);
+        GpuContext.recordShaderBarrier(cmd);
+        var ds = try pl.record(cmd, &weight_buf, &q8_buf, &ids_buf, &out_buf, rows, cols, ids.len);
+        try gpu.submitBatch(cmd);
+        _ = vk.vkFreeDescriptorSets(gpu.device, quant.desc_pool, 1, &qds);
+        _ = vk.vkFreeDescriptorSets(gpu.device, pl.desc_pool, 1, &ds);
+    }
+
+    var result: [ids.len]f32 = .{ 0.0, 0.0 };
+    try out_buf.download(std.mem.sliceAsBytes(&result));
+    for (result) |v| {
+        try std.testing.expectApproxEqAbs(v, 0.841, 0.01);
+    }
+}
+
 test "gpu expert accum correctness" {
     // n=2 experts, d_model=4.
     // inputs = [[1,2,3,4],[5,6,7,8]], scales = [2.0, 3.0].
@@ -2508,9 +3113,9 @@ test "gpu expert accum correctness" {
     const scales = [2]f32{ 2.0, 3.0 };
 
     const usage = vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    var in_buf  = try GpuBuffer.initHostCoherent(&gpu, inputs.len * @sizeOf(f32), usage);
+    var in_buf = try GpuBuffer.initHostCoherent(&gpu, inputs.len * @sizeOf(f32), usage);
     defer in_buf.deinit();
-    var sc_buf  = try GpuBuffer.initHostCoherent(&gpu, scales.len * @sizeOf(f32), usage);
+    var sc_buf = try GpuBuffer.initHostCoherent(&gpu, scales.len * @sizeOf(f32), usage);
     defer sc_buf.deinit();
     var out_buf = try GpuBuffer.initHostCoherent(&gpu, d_model * @sizeOf(f32), usage);
     defer out_buf.deinit();
@@ -2557,11 +3162,11 @@ fn fuzzQuantMatvec(
     defer gpu.deinit();
 
     var prng = std.Random.DefaultPrng.init(seed);
-    const r  = prng.random();
+    const r = prng.random();
     const al = std.testing.allocator;
 
-    const blk_bytes  = math_mod.rowBytes(tag, cols);
-    const total_mat  = rows * blk_bytes;
+    const blk_bytes = math_mod.rowBytes(tag, cols);
+    const total_mat = rows * blk_bytes;
     const mat = try al.alloc(u8, total_mat);
     defer al.free(mat);
     for (mat) |*b| b.* = r.int(u8);
@@ -2577,10 +3182,12 @@ fn fuzzQuantMatvec(
     const small_d_le: [2]u8 = .{ 0xCD, 0x21 }; // f16 ≈ 0.012
     for (0..rows) |i| for (0..blocks_per_row) |b| {
         const off = (i * blocks_per_row + b) * blk_bytes;
-        mat[off + 0] = small_d_le[0]; mat[off + 1] = small_d_le[1];
+        mat[off + 0] = small_d_le[0];
+        mat[off + 1] = small_d_le[1];
         // Q5_1 / Q4_K / Q5_K all have a second f16 at [2..3]
         if (tag == .q5_1 or tag == .q4_k or tag == .q5_k) {
-            mat[off + 2] = small_d_le[0]; mat[off + 3] = small_d_le[1];
+            mat[off + 2] = small_d_le[0];
+            mat[off + 3] = small_d_le[1];
         }
     };
 
@@ -2613,30 +3220,134 @@ fn fuzzQuantMatvec(
         if (@abs(c) > max_ref) max_ref = @abs(c);
     }
     const rel = max_abs / (max_ref + 1e-6);
-    std.debug.print("{s} fuzz rows={} cols={}  max|D|={d:.6}  rel={e:.3}\n",
-        .{ tag.label(), rows, cols, max_abs, rel });
+    std.debug.print("{s} fuzz rows={} cols={}  max|D|={d:.6}  rel={e:.3}\n", .{ tag.label(), rows, cols, max_abs, rel });
     try std.testing.expect(rel < 1e-4);
 }
 
 test "gpu matvec Q8_0 fuzz" {
-    try fuzzQuantMatvec(.q8_0,
-        MatvecPipeline.initQ8_0, MatvecSession.initQ8_0, 32, 256, 1);
+    try fuzzQuantMatvec(.q8_0, MatvecPipeline.initQ8_0, MatvecSession.initQ8_0, 32, 256, 1);
 }
 test "gpu matvec Q5_0 fuzz" {
-    try fuzzQuantMatvec(.q5_0,
-        MatvecPipeline.initQ5_0, MatvecSession.initQ5_0, 32, 256, 2);
+    try fuzzQuantMatvec(.q5_0, MatvecPipeline.initQ5_0, MatvecSession.initQ5_0, 32, 256, 2);
 }
 test "gpu matvec Q5_1 fuzz" {
-    try fuzzQuantMatvec(.q5_1,
-        MatvecPipeline.initQ5_1, MatvecSession.initQ5_1, 32, 256, 3);
+    try fuzzQuantMatvec(.q5_1, MatvecPipeline.initQ5_1, MatvecSession.initQ5_1, 32, 256, 3);
 }
+
+test "gpu expert-id down Q5_1 x Q8_1 fuzz" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    const al = std.testing.allocator;
+    const n_experts: usize = 3;
+    const active: usize = 2;
+    const rows: usize = 8;
+    const cols: usize = 256;
+    const row_bytes = math_mod.rowBytes(.q5_1, cols);
+
+    var prng = std.Random.DefaultPrng.init(0xE1D5_0001);
+    const r = prng.random();
+
+    const mat = try al.alloc(u8, n_experts * rows * row_bytes);
+    defer al.free(mat);
+    for (mat) |*b| b.* = r.int(u8);
+
+    const small_d_le: [2]u8 = .{ 0xCD, 0x21 };
+    const blocks_per_row = cols / 32;
+    for (0..n_experts * rows) |i| for (0..blocks_per_row) |b| {
+        const off = (i * blocks_per_row + b) * 24;
+        mat[off + 0] = small_d_le[0];
+        mat[off + 1] = small_d_le[1];
+        mat[off + 2] = small_d_le[0];
+        mat[off + 3] = small_d_le[1];
+    };
+
+    const vec = try al.alloc(f32, cols);
+    defer al.free(vec);
+    for (vec) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+
+    const q8_1_basic = try al.alloc(u8, (cols / 32) * dq.Q8_1_BLOCK_BYTES);
+    defer al.free(q8_1_basic);
+    dq.quantizeQ8_1(vec, q8_1_basic);
+
+    const vec_q8_rounded = try al.alloc(f32, cols);
+    defer al.free(vec_q8_rounded);
+    dq.dequantQ8_1(q8_1_basic, vec_q8_rounded);
+
+    const q8_1_x4 = try al.alloc(u8, q8_1_basic.len);
+    defer al.free(q8_1_x4);
+    dq.packQ8_1_x4(q8_1_basic, q8_1_x4);
+    const q8_1_x4_all = try al.alloc(u8, active * q8_1_x4.len);
+    defer al.free(q8_1_x4_all);
+    for (0..active) |slot| {
+        @memcpy(q8_1_x4_all[slot * q8_1_x4.len ..][0..q8_1_x4.len], q8_1_x4);
+    }
+
+    const ids = [_]u32{ 2, 0 };
+    const scales = [_]f32{ 0.25, -0.75 };
+
+    const cpu_out = try al.alloc(f32, active * rows);
+    defer al.free(cpu_out);
+    const row_buf = try al.alloc(f32, cols);
+    defer al.free(row_buf);
+    for (ids, 0..) |expert_id, slot| {
+        const e: usize = @intCast(expert_id);
+        const expert_mat = mat[e * rows * row_bytes ..][0 .. rows * row_bytes];
+        math_mod.quantMatvec(cpu_out[slot * rows ..][0..rows], expert_mat, .q5_1, vec_q8_rounded, rows, cols, row_buf);
+        for (cpu_out[slot * rows ..][0..rows]) |*v| v.* *= scales[slot];
+    }
+
+    var pipeline = try ExpertDownIdPipeline.initQ5_1Q8_1(&gpu);
+    defer pipeline.deinit();
+    var session = try MatvecSession.initQ5_1(&gpu, mat, @intCast(n_experts * rows), @intCast(cols));
+    defer session.deinit();
+
+    var acts_buf = try GpuBuffer.initHostCoherent(&gpu, q8_1_x4_all.len, @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer acts_buf.deinit();
+    try acts_buf.upload(q8_1_x4_all);
+
+    var ids_buf = try GpuBuffer.initHostCoherent(&gpu, ids.len * @sizeOf(u32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer ids_buf.deinit();
+    try ids_buf.upload(std.mem.sliceAsBytes(&ids));
+
+    var scales_buf = try GpuBuffer.initHostCoherent(&gpu, scales.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer scales_buf.deinit();
+    try scales_buf.upload(std.mem.sliceAsBytes(&scales));
+
+    var out_buf = try GpuBuffer.initHostCoherent(&gpu, active * rows * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer out_buf.deinit();
+
+    const cmd = try gpu.beginBatch();
+    const ds = try pipeline.record(cmd, &session.mat_buf, &acts_buf, &ids_buf, &scales_buf, &out_buf, @intCast(rows), @intCast(cols), @intCast(active));
+    try gpu.submitBatch(cmd);
+    var ds_mut = ds;
+    _ = vk.vkFreeDescriptorSets(gpu.device, pipeline.desc_pool, 1, &ds_mut);
+
+    const gpu_out = try al.alloc(f32, active * rows);
+    defer al.free(gpu_out);
+    try out_buf.download(std.mem.sliceAsBytes(gpu_out));
+
+    var max_abs: f32 = 0.0;
+    var max_ref: f32 = 0.0;
+    for (cpu_out, gpu_out) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs) max_abs = d;
+        if (@abs(c) > max_ref) max_ref = @abs(c);
+    }
+    const rel = max_abs / (max_ref + 1e-6);
+    std.debug.print("expert-id Q5_1×Q8_1 fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs, rel });
+    try std.testing.expect(rel < 1e-3);
+}
+
 test "gpu matvec Q4_K fuzz" {
-    try fuzzQuantMatvec(.q4_k,
-        MatvecPipeline.initQ4K, MatvecSession.initQ4K, 32, 512, 4);
+    try fuzzQuantMatvec(.q4_k, MatvecPipeline.initQ4K, MatvecSession.initQ4K, 32, 512, 4);
 }
 test "gpu matvec Q3_K fuzz" {
-    try fuzzQuantMatvec(.q3_k,
-        MatvecPipeline.initQ3K, MatvecSession.initQ3K, 32, 512, 5);
+    try fuzzQuantMatvec(.q3_k, MatvecPipeline.initQ3K, MatvecSession.initQ3K, 32, 512, 5);
 }
 
 // ── Q8_1 quantization fuzz test ───────────────────────────────────────────────
@@ -2651,13 +3362,11 @@ fn runQuantizeShader(ctx: *const GpuContext, in: []const f32, out_x4: []u8) !voi
     var pl = try QuantizeQ8_1Pipeline.init(ctx);
     defer pl.deinit();
 
-    var in_buf  = try GpuBuffer.initHostCoherent(ctx, in.len * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var in_buf = try GpuBuffer.initHostCoherent(ctx, in.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer in_buf.deinit();
     try in_buf.upload(std.mem.sliceAsBytes(in));
 
-    var out_buf = try GpuBuffer.initHostCoherent(ctx, out_x4.len,
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var out_buf = try GpuBuffer.initHostCoherent(ctx, out_x4.len, @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer out_buf.deinit();
 
     const cmd = try ctx.beginBatch();
@@ -2715,8 +3424,7 @@ test "gpu quantize_q8_1 round-trip" {
             try std.testing.expect(e <= tol);
         }
     }
-    std.debug.print("Q8_1 quantize round-trip n={}  max|D|={d:.6}  amax={d:.6}\n",
-        .{ n, max_abs, max_amax });
+    std.debug.print("Q8_1 quantize round-trip n={}  max|D|={d:.6}  amax={d:.6}\n", .{ n, max_abs, max_amax });
 }
 
 // ── Q4_K × Q8_1 integer-dot matvec fuzz test ──────────────────────────────────
@@ -2762,8 +3470,10 @@ fn fuzzQ4KQ8_1(
     const blocks_per_row = cols / 256;
     for (0..rows) |i| for (0..blocks_per_row) |b| {
         const off = (i * blocks_per_row + b) * blk_bytes_q4k;
-        mat[off + 0] = small_d_le[0]; mat[off + 1] = small_d_le[1]; // d
-        mat[off + 2] = small_d_le[0]; mat[off + 3] = small_d_le[1]; // dmin
+        mat[off + 0] = small_d_le[0];
+        mat[off + 1] = small_d_le[1]; // d
+        mat[off + 2] = small_d_le[0];
+        mat[off + 3] = small_d_le[1]; // dmin
     };
 
     const vec = try al.alloc(f32, cols);
@@ -2796,18 +3506,15 @@ fn fuzzQ4KQ8_1(
     var session = try MatvecSession.initQ4K(&gpu, mat, @intCast(rows), @intCast(cols));
     defer session.deinit();
 
-    var acts_buf = try GpuBuffer.initHostCoherent(&gpu, q8_1_x4.len,
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var acts_buf = try GpuBuffer.initHostCoherent(&gpu, q8_1_x4.len, @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer acts_buf.deinit();
     try acts_buf.upload(q8_1_x4);
 
-    var out_buf = try GpuBuffer.initHostCoherent(&gpu, rows * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var out_buf = try GpuBuffer.initHostCoherent(&gpu, rows * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer out_buf.deinit();
 
     const cmd = try gpu.beginBatch();
-    _ = try pipeline.record(cmd, &session.mat_buf, &acts_buf, &out_buf,
-        @intCast(rows), @intCast(cols));
+    _ = try pipeline.record(cmd, &session.mat_buf, &acts_buf, &out_buf, @intCast(rows), @intCast(cols));
     try gpu.submitBatch(cmd);
 
     const gpu_out = try al.alloc(f32, rows);
@@ -2822,8 +3529,7 @@ fn fuzzQ4KQ8_1(
         if (@abs(c) > max_ref) max_ref = @abs(c);
     }
     const rel = max_abs / (max_ref + 1e-6);
-    std.debug.print("{s} fuzz rows={} cols={}  max|D|={d:.6}  rel={e:.3}\n",
-        .{ label, rows, cols, max_abs, rel });
+    std.debug.print("{s} fuzz rows={} cols={}  max|D|={d:.6}  rel={e:.3}\n", .{ label, rows, cols, max_abs, rel });
     try std.testing.expect(rel < 1e-3);
 }
 
@@ -2959,18 +3665,15 @@ fn fuzzQ3KQ8_1(rows: usize, cols: usize, seed: u64) !void {
     var session = try MatvecSession.initQ3K(&gpu, mat, @intCast(rows), @intCast(cols));
     defer session.deinit();
 
-    var acts_buf = try GpuBuffer.initHostCoherent(&gpu, q8_1_x4.len,
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var acts_buf = try GpuBuffer.initHostCoherent(&gpu, q8_1_x4.len, @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer acts_buf.deinit();
     try acts_buf.upload(q8_1_x4);
 
-    var out_buf = try GpuBuffer.initHostCoherent(&gpu, rows * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var out_buf = try GpuBuffer.initHostCoherent(&gpu, rows * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer out_buf.deinit();
 
     const cmd = try gpu.beginBatch();
-    _ = try pipeline.record(cmd, &session.mat_buf, &acts_buf, &out_buf,
-        @intCast(rows), @intCast(cols));
+    _ = try pipeline.record(cmd, &session.mat_buf, &acts_buf, &out_buf, @intCast(rows), @intCast(cols));
     try gpu.submitBatch(cmd);
 
     const gpu_out = try al.alloc(f32, rows);
@@ -2985,8 +3688,7 @@ fn fuzzQ3KQ8_1(rows: usize, cols: usize, seed: u64) !void {
         if (@abs(c) > max_ref) max_ref = @abs(c);
     }
     const rel = max_abs / (max_ref + 1e-6);
-    std.debug.print("Q3_K×Q8_1 fuzz rows={} cols={}  max|D|={d:.6}  rel={e:.3}\n",
-        .{ rows, cols, max_abs, rel });
+    std.debug.print("Q3_K×Q8_1 fuzz rows={} cols={}  max|D|={d:.6}  rel={e:.3}\n", .{ rows, cols, max_abs, rel });
     try std.testing.expect(rel < 1e-3);
 }
 
@@ -3073,18 +3775,15 @@ fn fuzzQuantQ8_1(
     var session = try initSession(&gpu, mat, @intCast(rows), @intCast(cols));
     defer session.deinit();
 
-    var acts_buf = try GpuBuffer.initHostCoherent(&gpu, q8_1_x4.len,
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var acts_buf = try GpuBuffer.initHostCoherent(&gpu, q8_1_x4.len, @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer acts_buf.deinit();
     try acts_buf.upload(q8_1_x4);
 
-    var out_buf = try GpuBuffer.initHostCoherent(&gpu, rows * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var out_buf = try GpuBuffer.initHostCoherent(&gpu, rows * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer out_buf.deinit();
 
     const cmd = try gpu.beginBatch();
-    _ = try pipeline.record(cmd, &session.mat_buf, &acts_buf, &out_buf,
-        @intCast(rows), @intCast(cols));
+    _ = try pipeline.record(cmd, &session.mat_buf, &acts_buf, &out_buf, @intCast(rows), @intCast(cols));
     try gpu.submitBatch(cmd);
 
     const gpu_out = try al.alloc(f32, rows);
@@ -3099,48 +3798,119 @@ fn fuzzQuantQ8_1(
         if (@abs(c) > max_ref) max_ref = @abs(c);
     }
     const rel = max_abs / (max_ref + 1e-6);
-    std.debug.print("{s}×Q8_1 fuzz rows={} cols={}  max|D|={d:.6}  rel={e:.3}\n",
-        .{ tag.label(), rows, cols, max_abs, rel });
+    std.debug.print("{s}×Q8_1 fuzz rows={} cols={}  max|D|={d:.6}  rel={e:.3}\n", .{ tag.label(), rows, cols, max_abs, rel });
     try std.testing.expect(rel < 1e-3);
 }
 
 test "gpu matvec Q5_0 × Q8_1 fuzz small" {
     // cols=32 is fine — only 32-aligned, no 256 requirement (Q5_0 has 32-elem blocks).
-    try fuzzQuantQ8_1(.q5_0, 22, 32,
-        MatvecPipeline.initQ5_0Q8_1, MatvecSession.initQ5_0, 32, 256, 41);
+    try fuzzQuantQ8_1(.q5_0, 22, 32, MatvecPipeline.initQ5_0Q8_1, MatvecSession.initQ5_0, 32, 256, 41);
 }
 test "gpu matvec Q5_0 × Q8_1 fuzz model-sized" {
     // d_expert = 704 — closest analogue to a Gemma4 expert down cols.
-    try fuzzQuantQ8_1(.q5_0, 22, 32,
-        MatvecPipeline.initQ5_0Q8_1, MatvecSession.initQ5_0, 64, 704, 43);
+    try fuzzQuantQ8_1(.q5_0, 22, 32, MatvecPipeline.initQ5_0Q8_1, MatvecSession.initQ5_0, 64, 704, 43);
 }
 test "gpu matvec Q5_1 × Q8_1 fuzz small" {
-    try fuzzQuantQ8_1(.q5_1, 24, 32,
-        MatvecPipeline.initQ5_1Q8_1, MatvecSession.initQ5_1, 32, 256, 47);
+    try fuzzQuantQ8_1(.q5_1, 24, 32, MatvecPipeline.initQ5_1Q8_1, MatvecSession.initQ5_1, 32, 256, 47);
 }
 test "gpu matvec Q5_1 × Q8_1 fuzz model-sized" {
-    try fuzzQuantQ8_1(.q5_1, 24, 32,
-        MatvecPipeline.initQ5_1Q8_1, MatvecSession.initQ5_1, 64, 704, 53);
+    try fuzzQuantQ8_1(.q5_1, 24, 32, MatvecPipeline.initQ5_1Q8_1, MatvecSession.initQ5_1, 64, 704, 53);
+}
+
+fn initQ5_0Q8_1MmvqB64R1(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ5_0Q8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 1,
+        .num_cols = 1,
+    });
+}
+
+fn initQ5_0Q8_1MmvqB64R2(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ5_0Q8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 2,
+        .num_cols = 1,
+    });
+}
+
+fn initQ5_0Q8_1MmvqB64R4(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ5_0Q8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 4,
+        .num_cols = 1,
+    });
+}
+
+fn initQ5_1Q8_1MmvqB64R1(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ5_1Q8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 1,
+        .num_cols = 1,
+    });
+}
+
+fn initQ5_1Q8_1MmvqB64R2(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ5_1Q8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 2,
+        .num_cols = 1,
+    });
+}
+
+fn initQ5_1Q8_1MmvqB64R4(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ5_1Q8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 4,
+        .num_cols = 1,
+    });
+}
+
+test "gpu matvec Q5_0 × Q8_1 MMVQ b64 r1 fuzz small" {
+    try fuzzQuantQ8_1(.q5_0, 22, 32, initQ5_0Q8_1MmvqB64R1, MatvecSession.initQ5_0, 32, 256, 90);
+}
+
+test "gpu matvec Q5_0 × Q8_1 MMVQ b64 r1 fuzz model-sized" {
+    try fuzzQuantQ8_1(.q5_0, 22, 32, initQ5_0Q8_1MmvqB64R1, MatvecSession.initQ5_0, 64, 704, 91);
+}
+
+test "gpu matvec Q5_0 × Q8_1 MMVQ b64 r2 fuzz model-sized" {
+    try fuzzQuantQ8_1(.q5_0, 22, 32, initQ5_0Q8_1MmvqB64R2, MatvecSession.initQ5_0, 64, 704, 94);
+}
+
+test "gpu matvec Q5_0 × Q8_1 MMVQ b64 r4 fuzz model-sized" {
+    try fuzzQuantQ8_1(.q5_0, 22, 32, initQ5_0Q8_1MmvqB64R4, MatvecSession.initQ5_0, 64, 704, 95);
+}
+
+test "gpu matvec Q5_1 × Q8_1 MMVQ b64 r1 fuzz small" {
+    try fuzzQuantQ8_1(.q5_1, 24, 32, initQ5_1Q8_1MmvqB64R1, MatvecSession.initQ5_1, 32, 256, 92);
+}
+
+test "gpu matvec Q5_1 × Q8_1 MMVQ b64 r1 fuzz model-sized" {
+    try fuzzQuantQ8_1(.q5_1, 24, 32, initQ5_1Q8_1MmvqB64R1, MatvecSession.initQ5_1, 64, 704, 93);
+}
+
+test "gpu matvec Q5_1 × Q8_1 MMVQ b64 r2 fuzz model-sized" {
+    try fuzzQuantQ8_1(.q5_1, 24, 32, initQ5_1Q8_1MmvqB64R2, MatvecSession.initQ5_1, 64, 704, 96);
+}
+
+test "gpu matvec Q5_1 × Q8_1 MMVQ b64 r4 fuzz model-sized" {
+    try fuzzQuantQ8_1(.q5_1, 24, 32, initQ5_1Q8_1MmvqB64R4, MatvecSession.initQ5_1, 64, 704, 97);
 }
 
 test "gpu matvec Q6_K × Q8_1 fuzz small" {
-    try fuzzQuantQ8_1(.q6_k, 210, 256,
-        MatvecPipeline.initQ6KQ8_1, MatvecSession.initQ6K, 32, 256, 59);
+    try fuzzQuantQ8_1(.q6_k, 210, 256, MatvecPipeline.initQ6KQ8_1, MatvecSession.initQ6K, 32, 256, 59);
 }
 
 test "gpu matvec Q6_K × Q8_1 fuzz lm-head-shaped cols" {
-    try fuzzQuantQ8_1(.q6_k, 210, 256,
-        MatvecPipeline.initQ6KQ8_1, MatvecSession.initQ6K, 64, 2816, 61);
+    try fuzzQuantQ8_1(.q6_k, 210, 256, MatvecPipeline.initQ6KQ8_1, MatvecSession.initQ6K, 64, 2816, 61);
 }
 
 test "gpu matvec Q6_K × Q8_1 fast fuzz small" {
-    try fuzzQuantQ8_1(.q6_k, 210, 256,
-        MatvecPipeline.initQ6KQ8_1Fast, MatvecSession.initQ6K, 32, 256, 63);
+    try fuzzQuantQ8_1(.q6_k, 210, 256, MatvecPipeline.initQ6KQ8_1Fast, MatvecSession.initQ6K, 32, 256, 63);
 }
 
 test "gpu matvec Q6_K × Q8_1 fast fuzz lm-head-shaped cols" {
-    try fuzzQuantQ8_1(.q6_k, 210, 256,
-        MatvecPipeline.initQ6KQ8_1Fast, MatvecSession.initQ6K, 64, 2816, 65);
+    try fuzzQuantQ8_1(.q6_k, 210, 256, MatvecPipeline.initQ6KQ8_1Fast, MatvecSession.initQ6K, 64, 2816, 65);
 }
 
 fn initQ6KQ8_1MmvqB32R1(ctx: *const GpuContext) !MatvecPipeline {
@@ -3192,73 +3962,59 @@ fn initQ3KQ8_1MmvqB64R1(ctx: *const GpuContext) !MatvecPipeline {
 }
 
 test "gpu matvec Q3_K × Q8_1 MMVQ b32 r1 fuzz small" {
-    try fuzzQuantQ8_1(.q3_k, 110, 256,
-        initQ3KQ8_1MmvqB32R1, MatvecSession.initQ3K, 32, 256, 80);
+    try fuzzQuantQ8_1(.q3_k, 110, 256, initQ3KQ8_1MmvqB32R1, MatvecSession.initQ3K, 32, 256, 80);
 }
 
 test "gpu matvec Q3_K × Q8_1 MMVQ b32 r1 fuzz lm-head-shaped cols" {
-    try fuzzQuantQ8_1(.q3_k, 110, 256,
-        initQ3KQ8_1MmvqB32R1, MatvecSession.initQ3K, 64, 2816, 82);
+    try fuzzQuantQ8_1(.q3_k, 110, 256, initQ3KQ8_1MmvqB32R1, MatvecSession.initQ3K, 64, 2816, 82);
 }
 
 test "gpu matvec Q3_K × Q8_1 MMVQ b64 r1 fuzz small" {
-    try fuzzQuantQ8_1(.q3_k, 110, 256,
-        initQ3KQ8_1MmvqB64R1, MatvecSession.initQ3K, 32, 256, 81);
+    try fuzzQuantQ8_1(.q3_k, 110, 256, initQ3KQ8_1MmvqB64R1, MatvecSession.initQ3K, 32, 256, 81);
 }
 
 test "gpu matvec Q3_K × Q8_1 MMVQ b64 r1 fuzz lm-head-shaped cols" {
-    try fuzzQuantQ8_1(.q3_k, 110, 256,
-        initQ3KQ8_1MmvqB64R1, MatvecSession.initQ3K, 64, 2816, 83);
+    try fuzzQuantQ8_1(.q3_k, 110, 256, initQ3KQ8_1MmvqB64R1, MatvecSession.initQ3K, 64, 2816, 83);
 }
 
 test "gpu matvec Q6_K × Q8_1 MMVQ b32 r1 fuzz small" {
-    try fuzzQuantQ8_1(.q6_k, 210, 256,
-        initQ6KQ8_1MmvqB32R1, MatvecSession.initQ6K, 32, 256, 67);
+    try fuzzQuantQ8_1(.q6_k, 210, 256, initQ6KQ8_1MmvqB32R1, MatvecSession.initQ6K, 32, 256, 67);
 }
 
 test "gpu matvec Q6_K × Q8_1 MMVQ b32 r1 fuzz lm-head-shaped cols" {
-    try fuzzQuantQ8_1(.q6_k, 210, 256,
-        initQ6KQ8_1MmvqB32R1, MatvecSession.initQ6K, 64, 2816, 69);
+    try fuzzQuantQ8_1(.q6_k, 210, 256, initQ6KQ8_1MmvqB32R1, MatvecSession.initQ6K, 64, 2816, 69);
 }
 
 test "gpu matvec Q6_K × Q8_1 MMVQ b64 r1 fuzz small" {
-    try fuzzQuantQ8_1(.q6_k, 210, 256,
-        initQ6KQ8_1MmvqB64R1, MatvecSession.initQ6K, 32, 256, 71);
+    try fuzzQuantQ8_1(.q6_k, 210, 256, initQ6KQ8_1MmvqB64R1, MatvecSession.initQ6K, 32, 256, 71);
 }
 
 test "gpu matvec Q6_K × Q8_1 MMVQ b64 r1 fuzz lm-head-shaped cols" {
-    try fuzzQuantQ8_1(.q6_k, 210, 256,
-        initQ6KQ8_1MmvqB64R1, MatvecSession.initQ6K, 64, 2816, 73);
+    try fuzzQuantQ8_1(.q6_k, 210, 256, initQ6KQ8_1MmvqB64R1, MatvecSession.initQ6K, 64, 2816, 73);
 }
 
 test "gpu matvec Q6_K × Q8_1 MMVQ b64 r2 fuzz lm-head-shaped cols" {
-    try fuzzQuantQ8_1(.q6_k, 210, 256,
-        initQ6KQ8_1MmvqB64R2, MatvecSession.initQ6K, 64, 2816, 75);
+    try fuzzQuantQ8_1(.q6_k, 210, 256, initQ6KQ8_1MmvqB64R2, MatvecSession.initQ6K, 64, 2816, 75);
 }
 
 test "gpu matvec Q6_K × Q8_1 MMVQ b64 r4 fuzz lm-head-shaped cols" {
-    try fuzzQuantQ8_1(.q6_k, 210, 256,
-        initQ6KQ8_1MmvqB64R4, MatvecSession.initQ6K, 64, 2816, 77);
+    try fuzzQuantQ8_1(.q6_k, 210, 256, initQ6KQ8_1MmvqB64R4, MatvecSession.initQ6K, 64, 2816, 77);
 }
 
 test "gpu matvec Q5_K × Q8_1 fuzz small" {
-    try fuzzQuantQ8_1(.q5_k, 176, 256,
-        MatvecPipeline.initQ5KQ8_1, MatvecSession.initQ5K, 32, 256, 73);
+    try fuzzQuantQ8_1(.q5_k, 176, 256, MatvecPipeline.initQ5KQ8_1, MatvecSession.initQ5K, 32, 256, 73);
 }
 
 test "gpu matvec Q5_K × Q8_1 fuzz attn-v-shaped cols" {
-    try fuzzQuantQ8_1(.q5_k, 176, 256,
-        MatvecPipeline.initQ5KQ8_1, MatvecSession.initQ5K, 64, 2816, 79);
+    try fuzzQuantQ8_1(.q5_k, 176, 256, MatvecPipeline.initQ5KQ8_1, MatvecSession.initQ5K, 64, 2816, 79);
 }
 
 test "gpu matvec IQ4_NL × Q8_1 fuzz small" {
-    try fuzzQuantQ8_1(.iq4_nl, 18, 32,
-        MatvecPipeline.initIQ4NLQ8_1, MatvecSession.initIQ4NL, 32, 256, 67);
+    try fuzzQuantQ8_1(.iq4_nl, 18, 32, MatvecPipeline.initIQ4NLQ8_1, MatvecSession.initIQ4NL, 32, 256, 67);
 }
 
 test "gpu matvec IQ4_NL × Q8_1 fuzz expert-down-shaped" {
-    try fuzzQuantQ8_1(.iq4_nl, 18, 32,
-        MatvecPipeline.initIQ4NLQ8_1, MatvecSession.initIQ4NL, 64, 704, 71);
+    try fuzzQuantQ8_1(.iq4_nl, 18, 32, MatvecPipeline.initIQ4NLQ8_1, MatvecSession.initIQ4NL, 64, 704, 71);
 }
 
 // ── rmsnorm fuzz test ─────────────────────────────────────────────────────────
@@ -3273,18 +4029,15 @@ fn runRmsnormShader(
     var pl = try RmsnormPipeline.init(gpu);
     defer pl.deinit();
 
-    var x_buf = try GpuBuffer.initHostCoherent(gpu, x.len * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var x_buf = try GpuBuffer.initHostCoherent(gpu, x.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer x_buf.deinit();
     try x_buf.upload(std.mem.sliceAsBytes(x));
 
-    var w_buf = try GpuBuffer.initHostCoherent(gpu, w.len * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var w_buf = try GpuBuffer.initHostCoherent(gpu, w.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer w_buf.deinit();
     try w_buf.upload(std.mem.sliceAsBytes(w));
 
-    var y_buf = try GpuBuffer.initHostCoherent(gpu, out.len * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var y_buf = try GpuBuffer.initHostCoherent(gpu, out.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer y_buf.deinit();
 
     const cmd = try gpu.beginBatch();
@@ -3305,10 +4058,14 @@ fn fuzzRmsnorm(n: usize, seed: u64, weight_offset: bool) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
 
-    const x = try al.alloc(f32, n);    defer al.free(x);
-    const w = try al.alloc(f32, n);    defer al.free(w);
-    const cpu_out = try al.alloc(f32, n); defer al.free(cpu_out);
-    const gpu_out = try al.alloc(f32, n); defer al.free(gpu_out);
+    const x = try al.alloc(f32, n);
+    defer al.free(x);
+    const w = try al.alloc(f32, n);
+    defer al.free(w);
+    const cpu_out = try al.alloc(f32, n);
+    defer al.free(cpu_out);
+    const gpu_out = try al.alloc(f32, n);
+    defer al.free(gpu_out);
 
     for (x) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
     for (w) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
@@ -3331,19 +4088,18 @@ fn fuzzRmsnorm(n: usize, seed: u64, weight_offset: bool) !void {
         if (@abs(c) > max_ref) max_ref = @abs(c);
     }
     const rel = max_abs / (max_ref + 1e-6);
-    std.debug.print("rmsnorm fuzz n={} bias={} max|D|={d:.6} rel={e:.3}\n",
-        .{ n, weight_offset, max_abs, rel });
+    std.debug.print("rmsnorm fuzz n={} bias={} max|D|={d:.6} rel={e:.3}\n", .{ n, weight_offset, max_abs, rel });
     try std.testing.expect(rel < 1e-5);
 }
 
 test "gpu rmsnorm n=512 fuzz" {
-    try fuzzRmsnorm(512, 71, false);  // head_dim_global
+    try fuzzRmsnorm(512, 71, false); // head_dim_global
 }
 test "gpu rmsnorm n=2816 fuzz" {
     try fuzzRmsnorm(2816, 73, false); // d_model
 }
 test "gpu rmsnorm n=2816 fuzz with (1+w) convention" {
-    try fuzzRmsnorm(2816, 79, true);  // exercise the weight_offset path
+    try fuzzRmsnorm(2816, 79, true); // exercise the weight_offset path
 }
 
 // ── rmsnorm_perhead fuzz test ─────────────────────────────────────────────────
@@ -3362,30 +4118,29 @@ fn runRmsnormPerHeadShader(
     var pl = try RmsnormPerHeadPipeline.init(gpu);
     defer pl.deinit();
 
-    var x_buf = try GpuBuffer.initHostCoherent(gpu, x.len * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var x_buf = try GpuBuffer.initHostCoherent(gpu, x.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer x_buf.deinit();
     try x_buf.upload(std.mem.sliceAsBytes(x));
 
-    var w_buf = try GpuBuffer.initHostCoherent(gpu, w.len * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var w_buf = try GpuBuffer.initHostCoherent(gpu, w.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer w_buf.deinit();
     try w_buf.upload(std.mem.sliceAsBytes(w));
 
-    var y_buf = try GpuBuffer.initHostCoherent(gpu, out.len * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var y_buf = try GpuBuffer.initHostCoherent(gpu, out.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer y_buf.deinit();
 
     const cmd = try gpu.beginBatch();
-    _ = try pl.record(cmd, &x_buf, &w_buf, &y_buf,
-        n_heads, head_dim, eps, weight_offset, use_weight);
+    _ = try pl.record(cmd, &x_buf, &w_buf, &y_buf, n_heads, head_dim, eps, weight_offset, use_weight);
     try gpu.submitBatch(cmd);
     try y_buf.download(std.mem.sliceAsBytes(out));
 }
 
 fn fuzzRmsnormPerHead(
-    n_heads: u32, head_dim: u32, seed: u64,
-    weight_offset: bool, use_weight: bool,
+    n_heads: u32,
+    head_dim: u32,
+    seed: u64,
+    weight_offset: bool,
+    use_weight: bool,
 ) !void {
     const ctx = GpuContext.init() catch |e| {
         std.debug.print("gpu init failed: {}\n", .{e});
@@ -3399,10 +4154,14 @@ fn fuzzRmsnormPerHead(
     const r = prng.random();
 
     const n_total = @as(usize, n_heads) * @as(usize, head_dim);
-    const x = try al.alloc(f32, n_total);   defer al.free(x);
-    const w = try al.alloc(f32, head_dim);  defer al.free(w);
-    const cpu_out = try al.alloc(f32, n_total); defer al.free(cpu_out);
-    const gpu_out = try al.alloc(f32, n_total); defer al.free(gpu_out);
+    const x = try al.alloc(f32, n_total);
+    defer al.free(x);
+    const w = try al.alloc(f32, head_dim);
+    defer al.free(w);
+    const cpu_out = try al.alloc(f32, n_total);
+    defer al.free(cpu_out);
+    const gpu_out = try al.alloc(f32, n_total);
+    defer al.free(gpu_out);
 
     for (x) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
     for (w) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
@@ -3420,8 +4179,7 @@ fn fuzzRmsnormPerHead(
         }
     }
 
-    try runRmsnormPerHeadShader(&gpu, x, w, n_heads, head_dim,
-        eps, weight_offset, use_weight, gpu_out);
+    try runRmsnormPerHeadShader(&gpu, x, w, n_heads, head_dim, eps, weight_offset, use_weight, gpu_out);
 
     var max_abs: f32 = 0.0;
     var max_ref: f32 = 0.0;
@@ -3431,9 +4189,7 @@ fn fuzzRmsnormPerHead(
         if (@abs(c) > max_ref) max_ref = @abs(c);
     }
     const rel = max_abs / (max_ref + 1e-6);
-    std.debug.print(
-        "rmsnorm_perhead fuzz n_heads={} hd={} bias={} use_w={} max|D|={d:.6} rel={e:.3}\n",
-        .{ n_heads, head_dim, weight_offset, use_weight, max_abs, rel });
+    std.debug.print("rmsnorm_perhead fuzz n_heads={} hd={} bias={} use_w={} max|D|={d:.6} rel={e:.3}\n", .{ n_heads, head_dim, weight_offset, use_weight, max_abs, rel });
     try std.testing.expect(rel < 1e-5);
 }
 
@@ -3450,10 +4206,16 @@ test "gpu rmsnorm_perhead n_heads=4 hd=256 no weight (V rmsnormRaw)" {
 // ── attn_qk_softmax + attn_av fuzz tests ──────────────────────────────────────
 
 fn cpuAttn(
-    q: []const f32, k: []const f32, v: []const f32,
-    scores_out: []f32, out: []f32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32,
-    win_len: u32, scale: f32,
+    q: []const f32,
+    k: []const f32,
+    v: []const f32,
+    scores_out: []f32,
+    out: []f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    win_len: u32,
+    scale: f32,
 ) void {
     const n_q_per_kv = n_heads / n_kv_heads;
     for (0..n_heads) |h| {
@@ -3470,7 +4232,10 @@ fn cpuAttn(
             if (s > mx) mx = s;
         }
         var sum: f32 = 0.0;
-        for (sc) |*s| { s.* = @exp(s.* - mx); sum += s.*; }
+        for (sc) |*s| {
+            s.* = @exp(s.* - mx);
+            sum += s.*;
+        }
         const inv = 1.0 / sum;
         for (sc) |*s| s.* *= inv;
 
@@ -3485,7 +4250,11 @@ fn cpuAttn(
 }
 
 fn fuzzAttn(
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, win_len: u32, seed: u64,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    win_len: u32,
+    seed: u64,
 ) !void {
     const ctx = GpuContext.init() catch |e| {
         std.debug.print("gpu init failed: {}\n", .{e});
@@ -3503,18 +4272,25 @@ fn fuzzAttn(
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
 
-    const q_len  = @as(usize, n_heads)    * @as(usize, head_dim);
-    const kv_len = @as(usize, win_len)    * @as(usize, n_kv_heads) * @as(usize, head_dim);
-    const sc_len = @as(usize, n_heads)    * @as(usize, win_len);
+    const q_len = @as(usize, n_heads) * @as(usize, head_dim);
+    const kv_len = @as(usize, win_len) * @as(usize, n_kv_heads) * @as(usize, head_dim);
+    const sc_len = @as(usize, n_heads) * @as(usize, win_len);
     const out_len = q_len;
 
-    const q  = try al.alloc(f32, q_len);  defer al.free(q);
-    const k  = try al.alloc(f32, kv_len); defer al.free(k);
-    const v  = try al.alloc(f32, kv_len); defer al.free(v);
-    const sc_cpu  = try al.alloc(f32, sc_len);  defer al.free(sc_cpu);
-    const sc_gpu  = try al.alloc(f32, sc_len);  defer al.free(sc_gpu);
-    const out_cpu = try al.alloc(f32, out_len); defer al.free(out_cpu);
-    const out_gpu = try al.alloc(f32, out_len); defer al.free(out_gpu);
+    const q = try al.alloc(f32, q_len);
+    defer al.free(q);
+    const k = try al.alloc(f32, kv_len);
+    defer al.free(k);
+    const v = try al.alloc(f32, kv_len);
+    defer al.free(v);
+    const sc_cpu = try al.alloc(f32, sc_len);
+    defer al.free(sc_cpu);
+    const sc_gpu = try al.alloc(f32, sc_len);
+    defer al.free(sc_gpu);
+    const out_cpu = try al.alloc(f32, out_len);
+    defer al.free(out_cpu);
+    const out_gpu = try al.alloc(f32, out_len);
+    defer al.free(out_gpu);
 
     for (q) |*x| x.* = (r.float(f32) - 0.5) * 2.0;
     for (k) |*x| x.* = (r.float(f32) - 0.5) * 2.0;
@@ -3529,15 +4305,15 @@ fn fuzzAttn(
     const n_q_per_kv: u32 = n_heads / n_kv_heads;
 
     const usage: vk.VkBufferUsageFlags = @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    var q_buf  = try GpuBuffer.initHostCoherent(&gpu, q_len  * @sizeOf(f32), usage);
+    var q_buf = try GpuBuffer.initHostCoherent(&gpu, q_len * @sizeOf(f32), usage);
     defer q_buf.deinit();
-    var k_buf  = try GpuBuffer.initHostCoherent(&gpu, kv_len * @sizeOf(f32), usage);
+    var k_buf = try GpuBuffer.initHostCoherent(&gpu, kv_len * @sizeOf(f32), usage);
     defer k_buf.deinit();
-    var v_buf  = try GpuBuffer.initHostCoherent(&gpu, kv_len * @sizeOf(f32), usage);
+    var v_buf = try GpuBuffer.initHostCoherent(&gpu, kv_len * @sizeOf(f32), usage);
     defer v_buf.deinit();
     var sc_buf = try GpuBuffer.initHostCoherent(&gpu, sc_len * @sizeOf(f32), usage);
     defer sc_buf.deinit();
-    var o_buf  = try GpuBuffer.initHostCoherent(&gpu, out_len * @sizeOf(f32), usage);
+    var o_buf = try GpuBuffer.initHostCoherent(&gpu, out_len * @sizeOf(f32), usage);
     defer o_buf.deinit();
 
     try q_buf.upload(std.mem.sliceAsBytes(q));
@@ -3545,23 +4321,23 @@ fn fuzzAttn(
     try v_buf.upload(std.mem.sliceAsBytes(v));
 
     const cmd = try gpu.beginBatch();
-    _ = try pl_qk.record(cmd, &q_buf, &k_buf, &sc_buf,
-        n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
+    _ = try pl_qk.record(cmd, &q_buf, &k_buf, &sc_buf, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
     GpuContext.recordShaderBarrier(cmd);
-    _ = try pl_av.record(cmd, &sc_buf, &v_buf, &o_buf,
-        n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap);
+    _ = try pl_av.record(cmd, &sc_buf, &v_buf, &o_buf, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap);
     try gpu.submitBatch(cmd);
 
     try sc_buf.download(std.mem.sliceAsBytes(sc_gpu));
     try o_buf.download(std.mem.sliceAsBytes(out_gpu));
 
-    var sc_max: f32 = 0; var sc_ref: f32 = 0;
+    var sc_max: f32 = 0;
+    var sc_ref: f32 = 0;
     for (sc_cpu, sc_gpu) |c, g| {
         const d = @abs(c - g);
         if (d > sc_max) sc_max = d;
         if (@abs(c) > sc_ref) sc_ref = @abs(c);
     }
-    var ov_max: f32 = 0; var ov_ref: f32 = 0;
+    var ov_max: f32 = 0;
+    var ov_ref: f32 = 0;
     for (out_cpu, out_gpu) |c, g| {
         const d = @abs(c - g);
         if (d > ov_max) ov_max = d;
@@ -3569,9 +4345,7 @@ fn fuzzAttn(
     }
     const sc_rel = sc_max / (sc_ref + 1e-6);
     const ov_rel = ov_max / (ov_ref + 1e-6);
-    std.debug.print(
-        "attn fuzz nh={} nkv={} hd={} win={} scores rel={e:.3} out rel={e:.3}\n",
-        .{ n_heads, n_kv_heads, head_dim, win_len, sc_rel, ov_rel });
+    std.debug.print("attn fuzz nh={} nkv={} hd={} win={} scores rel={e:.3} out rel={e:.3}\n", .{ n_heads, n_kv_heads, head_dim, win_len, sc_rel, ov_rel });
     try std.testing.expect(sc_rel < 1e-4);
     try std.testing.expect(ov_rel < 1e-4);
 }
@@ -3602,9 +4376,12 @@ test "gpu elem_add fuzz" {
 
     const al = std.testing.allocator;
     const n: usize = 2816;
-    const a = try al.alloc(f32, n); defer al.free(a);
-    const b = try al.alloc(f32, n); defer al.free(b);
-    const expected = try al.alloc(f32, n); defer al.free(expected);
+    const a = try al.alloc(f32, n);
+    defer al.free(a);
+    const b = try al.alloc(f32, n);
+    defer al.free(b);
+    const expected = try al.alloc(f32, n);
+    defer al.free(expected);
     var prng = std.Random.DefaultPrng.init(81);
     const r = prng.random();
     for (a, b, expected) |*ai, *bi, *ei| {
@@ -3615,11 +4392,9 @@ test "gpu elem_add fuzz" {
 
     var pl = try ElemAddPipeline.init(&gpu);
     defer pl.deinit();
-    var a_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var a_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer a_buf.deinit();
-    var b_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var b_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer b_buf.deinit();
     try a_buf.upload(std.mem.sliceAsBytes(a));
     try b_buf.upload(std.mem.sliceAsBytes(b));
@@ -3628,7 +4403,8 @@ test "gpu elem_add fuzz" {
     _ = try pl.record(cmd, &a_buf, &b_buf, @intCast(n));
     try gpu.submitBatch(cmd);
 
-    const got = try al.alloc(f32, n); defer al.free(got);
+    const got = try al.alloc(f32, n);
+    defer al.free(got);
     try a_buf.download(std.mem.sliceAsBytes(got));
     for (got, expected) |g, e| try std.testing.expectApproxEqAbs(e, g, 1e-6);
 }
@@ -3650,8 +4426,10 @@ test "gpu rope_neox_theta fuzz" {
     const theta: f32 = 10000.0;
     const total = n_heads * head_dim;
 
-    const vec = try al.alloc(f32, total); defer al.free(vec);
-    const cpu_out = try al.alloc(f32, total); defer al.free(cpu_out);
+    const vec = try al.alloc(f32, total);
+    defer al.free(vec);
+    const cpu_out = try al.alloc(f32, total);
+    defer al.free(cpu_out);
     var prng = std.Random.DefaultPrng.init(91);
     const r = prng.random();
     for (vec) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
@@ -3661,15 +4439,15 @@ test "gpu rope_neox_theta fuzz" {
 
     var pl = try RopeNeoxThetaPipeline.init(&gpu);
     defer pl.deinit();
-    var vec_buf = try GpuBuffer.initHostCoherent(&gpu, total * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var vec_buf = try GpuBuffer.initHostCoherent(&gpu, total * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer vec_buf.deinit();
     try vec_buf.upload(std.mem.sliceAsBytes(vec));
     const cmd = try gpu.beginBatch();
     _ = try pl.record(cmd, &vec_buf, @intCast(pos), @intCast(head_dim), theta, @intCast(n_heads));
     try gpu.submitBatch(cmd);
 
-    const gpu_out = try al.alloc(f32, total); defer al.free(gpu_out);
+    const gpu_out = try al.alloc(f32, total);
+    defer al.free(gpu_out);
     try vec_buf.download(std.mem.sliceAsBytes(gpu_out));
     var max_abs: f32 = 0.0;
     var max_ref: f32 = 0.0;
@@ -3679,8 +4457,7 @@ test "gpu rope_neox_theta fuzz" {
         if (@abs(c) > max_ref) max_ref = @abs(c);
     }
     const rel = max_abs / (max_ref + 1e-6);
-    std.debug.print("rope_neox_theta fuzz n_heads={} hd={} pos={} max|D|={d:.6} rel={e:.3}\n",
-        .{ n_heads, head_dim, pos, max_abs, rel });
+    std.debug.print("rope_neox_theta fuzz n_heads={} hd={} pos={} max|D|={d:.6} rel={e:.3}\n", .{ n_heads, head_dim, pos, max_abs, rel });
     try std.testing.expect(rel < 1e-5);
 }
 
@@ -3700,16 +4477,18 @@ test "gpu rope_neox_table fuzz" {
     const pos: usize = 7;
     const total = n_heads * head_dim;
 
-    const vec = try al.alloc(f32, total); defer al.free(vec);
-    const cpu_out = try al.alloc(f32, total); defer al.free(cpu_out);
-    const freqs = try al.alloc(f32, head_dim / 2); defer al.free(freqs);
+    const vec = try al.alloc(f32, total);
+    defer al.free(vec);
+    const cpu_out = try al.alloc(f32, total);
+    defer al.free(cpu_out);
+    const freqs = try al.alloc(f32, head_dim / 2);
+    defer al.free(freqs);
     var prng = std.Random.DefaultPrng.init(97);
     const r = prng.random();
     for (vec) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
     // Generate plausible inverse-frequency values (≈ 1/theta^(2i/dim) shape).
     for (freqs, 0..) |*f, i|
-        f.* = 1.0 / std.math.pow(f32, 10000.0,
-            @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(head_dim)));
+        f.* = 1.0 / std.math.pow(f32, 10000.0, @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(head_dim)));
 
     @memcpy(cpu_out, vec);
     for (0..n_heads) |h|
@@ -3717,12 +4496,10 @@ test "gpu rope_neox_table fuzz" {
 
     var pl = try RopeNeoxTablePipeline.init(&gpu);
     defer pl.deinit();
-    var vec_buf = try GpuBuffer.initHostCoherent(&gpu, total * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var vec_buf = try GpuBuffer.initHostCoherent(&gpu, total * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer vec_buf.deinit();
     try vec_buf.upload(std.mem.sliceAsBytes(vec));
-    var freqs_buf = try GpuBuffer.initHostCoherent(&gpu, freqs.len * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var freqs_buf = try GpuBuffer.initHostCoherent(&gpu, freqs.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer freqs_buf.deinit();
     try freqs_buf.upload(std.mem.sliceAsBytes(freqs));
 
@@ -3730,7 +4507,8 @@ test "gpu rope_neox_table fuzz" {
     _ = try pl.record(cmd, &vec_buf, &freqs_buf, @intCast(pos), @intCast(head_dim), @intCast(n_heads));
     try gpu.submitBatch(cmd);
 
-    const gpu_out = try al.alloc(f32, total); defer al.free(gpu_out);
+    const gpu_out = try al.alloc(f32, total);
+    defer al.free(gpu_out);
     try vec_buf.download(std.mem.sliceAsBytes(gpu_out));
     var max_abs: f32 = 0.0;
     var max_ref: f32 = 0.0;
@@ -3740,8 +4518,7 @@ test "gpu rope_neox_table fuzz" {
         if (@abs(c) > max_ref) max_ref = @abs(c);
     }
     const rel = max_abs / (max_ref + 1e-6);
-    std.debug.print("rope_neox_table fuzz n_heads={} hd={} pos={} max|D|={d:.6} rel={e:.3}\n",
-        .{ n_heads, head_dim, pos, max_abs, rel });
+    std.debug.print("rope_neox_table fuzz n_heads={} hd={} pos={} max|D|={d:.6} rel={e:.3}\n", .{ n_heads, head_dim, pos, max_abs, rel });
     try std.testing.expect(rel < 1e-5);
 }
 
@@ -3755,10 +4532,13 @@ test "gpu gelu_mul fuzz" {
 
     const math_ref = @import("../ops/math.zig");
     const al = std.testing.allocator;
-    const n: usize = 2112;  // dense FFN dim in Gemma4
-    const a = try al.alloc(f32, n); defer al.free(a);
-    const b = try al.alloc(f32, n); defer al.free(b);
-    const expected = try al.alloc(f32, n); defer al.free(expected);
+    const n: usize = 2112; // dense FFN dim in Gemma4
+    const a = try al.alloc(f32, n);
+    defer al.free(a);
+    const b = try al.alloc(f32, n);
+    defer al.free(b);
+    const expected = try al.alloc(f32, n);
+    defer al.free(expected);
     var prng = std.Random.DefaultPrng.init(84);
     const r = prng.random();
     for (a, b, expected) |*ai, *bi, *ei| {
@@ -3769,11 +4549,9 @@ test "gpu gelu_mul fuzz" {
 
     var pl = try GeluMulPipeline.init(&gpu);
     defer pl.deinit();
-    var a_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var a_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer a_buf.deinit();
-    var b_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var b_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer b_buf.deinit();
     try a_buf.upload(std.mem.sliceAsBytes(a));
     try b_buf.upload(std.mem.sliceAsBytes(b));
@@ -3782,7 +4560,8 @@ test "gpu gelu_mul fuzz" {
     _ = try pl.record(cmd, &a_buf, &b_buf, @intCast(n));
     try gpu.submitBatch(cmd);
 
-    const got = try al.alloc(f32, n); defer al.free(got);
+    const got = try al.alloc(f32, n);
+    defer al.free(got);
     try a_buf.download(std.mem.sliceAsBytes(got));
     // GELU * mul can produce near-zero outputs (gelu(x) ≈ 0 for x ∈ [-2, 0]),
     // so a strict relative check is dominated by floor noise.  Use absolute
@@ -3806,7 +4585,8 @@ test "gpu elem_scale fuzz" {
 
     const al = std.testing.allocator;
     const n: usize = 2816;
-    const x = try al.alloc(f32, n); defer al.free(x);
+    const x = try al.alloc(f32, n);
+    defer al.free(x);
     const s: f32 = 1.4142136; // sqrt(2)
     var prng = std.Random.DefaultPrng.init(83);
     const r = prng.random();
@@ -3814,8 +4594,7 @@ test "gpu elem_scale fuzz" {
 
     var pl = try ElemScalePipeline.init(&gpu);
     defer pl.deinit();
-    var x_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32),
-        @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    var x_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer x_buf.deinit();
     try x_buf.upload(std.mem.sliceAsBytes(x));
 
@@ -3823,7 +4602,8 @@ test "gpu elem_scale fuzz" {
     _ = try pl.record(cmd, &x_buf, @intCast(n), s);
     try gpu.submitBatch(cmd);
 
-    const got = try al.alloc(f32, n); defer al.free(got);
+    const got = try al.alloc(f32, n);
+    defer al.free(got);
     try x_buf.download(std.mem.sliceAsBytes(got));
     for (got, x) |g, xi| try std.testing.expectApproxEqAbs(xi * s, g, 1e-6);
 }

@@ -87,8 +87,7 @@ pub const GpuProfiler = struct {
         ev.start_query = start_query;
         ev.end_query = std.math.maxInt(u32);
 
-        vk.vkCmdWriteTimestamp(cmd, vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            self.query_pool, start_query);
+        vk.vkCmdWriteTimestamp(cmd, vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, self.query_pool, start_query);
         return event_id;
     }
 
@@ -101,8 +100,7 @@ pub const GpuProfiler = struct {
         const end_query = self.query_count;
         self.query_count += 1;
         self.events[event_id].end_query = end_query;
-        vk.vkCmdWriteTimestamp(cmd, vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            self.query_pool, end_query);
+        vk.vkCmdWriteTimestamp(cmd, vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, self.query_pool, end_query);
     }
 
     fn collectBatch(self: *GpuProfiler, device: vk.VkDevice) void {
@@ -187,8 +185,7 @@ pub const GpuProfiler = struct {
         for (self.aggregates[0..self.aggregate_count]) |agg| total_ns += agg.total_ns;
 
         std.debug.print("\nGPU profile (timestamp queries):\n", .{});
-        std.debug.print("{s: <36} {s: >8} {s: >12} {s: >10} {s: >10} {s: >10} {s: >7}\n",
-            .{ "label", "count", "total ms", "avg us", "min us", "max us", "%" });
+        std.debug.print("{s: <36} {s: >8} {s: >12} {s: >10} {s: >10} {s: >10} {s: >7}\n", .{ "label", "count", "total ms", "avg us", "min us", "max us", "%" });
 
         for (self.aggregates[0..self.aggregate_count]) |agg| {
             const total_ms = @as(f64, @floatFromInt(agg.total_ns)) / 1_000_000.0;
@@ -196,11 +193,9 @@ pub const GpuProfiler = struct {
                 @as(f64, @floatFromInt(agg.count)) / 1_000.0;
             const min_us = @as(f64, @floatFromInt(agg.min_ns)) / 1_000.0;
             const max_us = @as(f64, @floatFromInt(agg.max_ns)) / 1_000.0;
-            const pct = if (total_ns == 0) 0.0 else
-                100.0 * @as(f64, @floatFromInt(agg.total_ns)) /
+            const pct = if (total_ns == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(agg.total_ns)) /
                 @as(f64, @floatFromInt(total_ns));
-            std.debug.print("{s: <36} {d: >8} {d: >12.3} {d: >10.2} {d: >10.2} {d: >10.2} {d: >6.1}\n",
-                .{ agg.label[0..agg.label_len], agg.count, total_ms, avg_us, min_us, max_us, pct });
+            std.debug.print("{s: <36} {d: >8} {d: >12.3} {d: >10.2} {d: >10.2} {d: >10.2} {d: >6.1}\n", .{ agg.label[0..agg.label_len], agg.count, total_ms, avg_us, min_us, max_us, pct });
         }
 
         if (self.dropped_events != 0) {
@@ -302,27 +297,27 @@ pub const GpuContext = struct {
         // device creation with a clear error.
         var v13 = std.mem.zeroes(vk.VkPhysicalDeviceVulkan13Features);
         v13.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-        v13.shaderIntegerDotProduct = vk.VK_TRUE;        // dotPacked4x8EXT
+        v13.shaderIntegerDotProduct = vk.VK_TRUE; // dotPacked4x8EXT
 
         var v12 = std.mem.zeroes(vk.VkPhysicalDeviceVulkan12Features);
         v12.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
         v12.pNext = &v13;
-        v12.shaderFloat16 = vk.VK_TRUE;                  // f16vec2 ds, dm
-        v12.shaderInt8 = vk.VK_TRUE;                     // int8_t arithmetic
-        v12.storageBuffer8BitAccess = vk.VK_TRUE;        // int8_t qs[32] loads
-        v12.shaderSubgroupExtendedTypes = vk.VK_TRUE;    // subgroupAdd(int32_t) etc.
+        v12.shaderFloat16 = vk.VK_TRUE; // f16vec2 ds, dm
+        v12.shaderInt8 = vk.VK_TRUE; // int8_t arithmetic
+        v12.storageBuffer8BitAccess = vk.VK_TRUE; // int8_t qs[32] loads
+        v12.shaderSubgroupExtendedTypes = vk.VK_TRUE; // subgroupAdd(int32_t) etc.
         v12.uniformAndStorageBuffer8BitAccess = vk.VK_TRUE;
 
         var v11 = std.mem.zeroes(vk.VkPhysicalDeviceVulkan11Features);
         v11.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
         v11.pNext = &v12;
-        v11.storageBuffer16BitAccess = vk.VK_TRUE;       // f16vec2 / int16 loads
+        v11.storageBuffer16BitAccess = vk.VK_TRUE; // f16vec2 / int16 loads
         v11.uniformAndStorageBuffer16BitAccess = vk.VK_TRUE;
 
         var feats2 = std.mem.zeroes(vk.VkPhysicalDeviceFeatures2);
         feats2.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         feats2.pNext = &v11;
-        feats2.features.shaderInt16 = vk.VK_TRUE;        // i16vec2 unpack in Q5_0/Q5_1
+        feats2.features.shaderInt16 = vk.VK_TRUE; // i16vec2 unpack in Q5_0/Q5_1
         feats2.features.shaderInt64 = vk.VK_TRUE;
 
         const dev_ci = vk.VkDeviceCreateInfo{
@@ -335,7 +330,7 @@ pub const GpuContext = struct {
             .ppEnabledLayerNames = null,
             .enabledExtensionCount = 0,
             .ppEnabledExtensionNames = null,
-            .pEnabledFeatures = null,                    // using Features2 in pNext instead
+            .pEnabledFeatures = null, // using Features2 in pNext instead
         };
         var device: vk.VkDevice = undefined;
         if (vk.vkCreateDevice(phys_dev, &dev_ci, null, &device) != vk.VK_SUCCESS)
@@ -480,7 +475,13 @@ pub const GpuContext = struct {
             cmd,
             vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, &barrier, 0, null, 0, null,
+            0,
+            1,
+            &barrier,
+            0,
+            null,
+            0,
+            null,
         );
     }
 
@@ -500,7 +501,38 @@ pub const GpuContext = struct {
             cmd,
             vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 1, &barrier, 0, null, 0, null,
+            0,
+            1,
+            &barrier,
+            0,
+            null,
+            0,
+            null,
+        );
+    }
+
+    // Transfer → compute pipeline barrier.
+    // Ensures vkCmdCopyBuffer writes before this point are visible to shader
+    // reads/writes after it. Used when a compute-produced buffer is copied into
+    // another compute input within the same command buffer.
+    pub fn recordTransferToShaderBarrier(cmd: vk.VkCommandBuffer) void {
+        const barrier = vk.VkMemoryBarrier{
+            .sType = vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = null,
+            .srcAccessMask = vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT | vk.VK_ACCESS_SHADER_WRITE_BIT,
+        };
+        vk.vkCmdPipelineBarrier(
+            cmd,
+            vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            1,
+            &barrier,
+            0,
+            null,
+            0,
+            null,
         );
     }
 
@@ -509,12 +541,13 @@ pub const GpuContext = struct {
     // into the per-layer VRAM cache). For one-shot copies see copyBufferRegion.
     pub fn recordCopyRegion(
         cmd: vk.VkCommandBuffer,
-        src: vk.VkBuffer, dst: vk.VkBuffer,
-        src_offset: vk.VkDeviceSize, dst_offset: vk.VkDeviceSize,
+        src: vk.VkBuffer,
+        dst: vk.VkBuffer,
+        src_offset: vk.VkDeviceSize,
+        dst_offset: vk.VkDeviceSize,
         size: vk.VkDeviceSize,
     ) void {
-        const region = vk.VkBufferCopy{
-            .srcOffset = src_offset, .dstOffset = dst_offset, .size = size };
+        const region = vk.VkBufferCopy{ .srcOffset = src_offset, .dstOffset = dst_offset, .size = size };
         vk.vkCmdCopyBuffer(cmd, src, dst, 1, &region);
     }
 
@@ -525,9 +558,13 @@ pub const GpuContext = struct {
         const submit = vk.VkSubmitInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .pNext = null,
-            .waitSemaphoreCount = 0, .pWaitSemaphores = null, .pWaitDstStageMask = null,
-            .commandBufferCount = 1, .pCommandBuffers = &cmd,
-            .signalSemaphoreCount = 0, .pSignalSemaphores = null,
+            .waitSemaphoreCount = 0,
+            .pWaitSemaphores = null,
+            .pWaitDstStageMask = null,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd,
+            .signalSemaphoreCount = 0,
+            .pSignalSemaphores = null,
         };
         if (vk.vkQueueSubmit(self.queue, 1, &submit, null) != vk.VK_SUCCESS)
             return error.VkQueueSubmitFailed;
@@ -541,8 +578,10 @@ pub const GpuContext = struct {
     // slot in a KV cache buffer).
     pub fn copyBufferRegion(
         self: *const GpuContext,
-        src: vk.VkBuffer, dst: vk.VkBuffer,
-        src_offset: vk.VkDeviceSize, dst_offset: vk.VkDeviceSize,
+        src: vk.VkBuffer,
+        dst: vk.VkBuffer,
+        src_offset: vk.VkDeviceSize,
+        dst_offset: vk.VkDeviceSize,
         size: vk.VkDeviceSize,
     ) !void {
         const alloc_ci = vk.VkCommandBufferAllocateInfo{
@@ -564,17 +603,20 @@ pub const GpuContext = struct {
             .pInheritanceInfo = null,
         };
         _ = vk.vkBeginCommandBuffer(cmd, &begin_ci);
-        const region = vk.VkBufferCopy{
-            .srcOffset = src_offset, .dstOffset = dst_offset, .size = size };
+        const region = vk.VkBufferCopy{ .srcOffset = src_offset, .dstOffset = dst_offset, .size = size };
         vk.vkCmdCopyBuffer(cmd, src, dst, 1, &region);
         _ = vk.vkEndCommandBuffer(cmd);
 
         const submit = vk.VkSubmitInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .pNext = null,
-            .waitSemaphoreCount = 0, .pWaitSemaphores = null, .pWaitDstStageMask = null,
-            .commandBufferCount = 1, .pCommandBuffers = &cmd,
-            .signalSemaphoreCount = 0, .pSignalSemaphores = null,
+            .waitSemaphoreCount = 0,
+            .pWaitSemaphores = null,
+            .pWaitDstStageMask = null,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd,
+            .signalSemaphoreCount = 0,
+            .pSignalSemaphores = null,
         };
         if (vk.vkQueueSubmit(self.queue, 1, &submit, null) != vk.VK_SUCCESS)
             return error.VkQueueSubmitFailed;
