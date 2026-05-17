@@ -586,10 +586,24 @@ This is the first correctness-checked MMVQ variant to narrowly beat the current
 Q6_K `lm_head` kernel on GPU timestamps, but the margin is only about 0.5% and
 single-target wall times remain noisy. Treat `b64/r1` as the current best
 MMVQ candidate, not as enough evidence to route production generation through
-it. The next shader-side check is llama.cpp's 4-then-2 manual unroll schedule;
-if that does not produce a larger win, the remaining parity gap is likely not
-inside this isolated Q6_K matvec but in bringing the same generated MMVQ family
-to Q3_K/Q4_K and reducing per-layer dispatch structure.
+it.
+
+Tested llama.cpp's 4-then-2 manual unroll schedule plus per-thread tail
+`num_iters` calculation. Correctness was unchanged, but focused 64-iteration
+timestamps regressed: current `lm_head` was about `1026.77 us`, while
+`lm_head.mmvq.b64.r1` moved to about `1058.04 us`. Do not repeat this as a
+Q6_K optimization unless another change makes the loop shape materially
+different. The remaining parity gap is likely not inside isolated Q6_K
+`lm_head` polish; move the generated MMVQ family to Q3_K/Q4_K and reduce
+per-layer dispatch structure.
+
+Added subgroup property reporting to `llmtoy gpu-info`; this RX 7800 XT/RADV
+run reports subgroup size `64`, compute support `true`, and arithmetic support
+`true`. A no-shared-memory b64/r1 reduction variant was tested because one
+subgroup covers `BLOCK_SIZE=64`, but it regressed: current `lm_head` about
+`1037.34 us`, safe `lm_head.mmvq.b64.r1` about `1036.36 us`, and no-shmem
+about `1059.47 us`. The experimental target was reverted; keep the safe
+subgroup-plus-shared-memory reduction.
 
 The submit-count reductions buy ~150–300 µs/token in saved overhead. On
 RX 7800 XT with our shaders the absolute per-submit cost (~150 µs) is

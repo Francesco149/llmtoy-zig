@@ -436,12 +436,20 @@ Q6_K MMVQ q8-helper rewrite:
   `lm_head.mmvq.b64.r1` about 1021 us, and `lm_head.mmvq.b64.r4` about
   1059 us. This is the first MMVQ variant to narrowly beat the current Q6_K
   path, but the win is too small to promote into generation yet.
+- The llama.cpp 4-then-2 manual iteration unroll plus per-thread tail
+  `num_iters` was tested and reverted. Correctness was unchanged, but focused
+  timestamps regressed: current `lm_head` about 1027 us, `b64.r1` about
+  1058 us. Do not repeat that unroll as a standalone Q6_K optimization.
+- `llmtoy gpu-info` now reports subgroup properties. RX 7800 XT/RADV reports
+  subgroup size 64, compute support true, and arithmetic support true.
+- A no-shared-memory b64/r1 reduction variant was tested and reverted. It was
+  valid on this device because subgroup size covers `BLOCK_SIZE=64`, but it
+  regressed: current `lm_head` about 1037 us, safe `b64.r1` about 1036 us,
+  no-shmem about 1059 us. Keep the safe subgroup-plus-shared-memory reduction.
 - Updated conclusion: for Q6_K, the obvious llama.cpp structural pieces are now
-  in place for the isolated MMVQ target. The next Q6_K-only checks are
-  llama.cpp's manual 4-then-2 iteration unroll and subgroup-size control. If
-  those do not produce a larger win, stop polishing Q6_K in isolation and port
-  the same MMVQ family to Q3_K/Q4_K, where the model spends much more decode
-  time.
+  in place for the isolated MMVQ target. Stop polishing Q6_K in isolation and
+  port the same MMVQ family to Q3_K/Q4_K, where the model spends much more
+  decode time.
 
 ---
 
@@ -562,17 +570,10 @@ Completed implementation slices:
 
 Next implementation slice:
 
-1. Add a second Q6_K MMVQ shader variant, or a specialization flag, that
-   preserves llama.cpp's 4-then-2 manual iteration unroll exactly. Compare only
-   `lm_head.mmvq.b64.r1` first.
-2. Add subgroup-size visibility/control to `gpu-info` or pipeline creation if
-   RADV exposes it. Record whether this RX 7800 XT run is using subgroup 32 or
-   64; `USE_SUBGROUP_ADD_NO_SHMEM` is only safe to test when one subgroup covers
-   the whole workgroup.
-3. If Q6_K remains a single-digit-percent win, do not spend another session on
-   Q6_K micro-tweaks. Start Q3_K/Q4_K MMVQ using the same framework, because
-   those formats dominate attention and FFN gate/up decode time.
-4. Keep current production routing on the existing kernels until a full
+1. Start Q3_K/Q4_K MMVQ using the same framework. Q3_K is likely the first
+   target because `L5.attn_q` is the largest non-lm-head GPU matvec in the
+   current microbench table and many attention / FFN gate-up matrices are Q3_K.
+2. Keep current production routing on the existing kernels until a full
    generate profile shows a material token/s improvement, not just a narrow
    isolated `lm_head` win.
 

@@ -215,6 +215,11 @@ fn cmdGpuInfo(out: *std.Io.Writer) !void {
 
     const name = ctx.deviceName();
     try out.print("GPU device: {s}\n", .{std.mem.sliceTo(&name, 0)});
+    try out.print("subgroup: size={} compute={} arithmetic={}\n", .{
+        ctx.subgroup_size,
+        ctx.subgroup_supported_stages & vk.VK_SHADER_STAGE_COMPUTE_BIT != 0,
+        ctx.hasSubgroupArithmetic(),
+    });
 
     // Smoke test: 4×4 identity * [1,2,3,4] = [1,2,3,4]
     var pipeline = gpu_matvec.MatvecPipeline.initF32(&ctx) catch |e| {

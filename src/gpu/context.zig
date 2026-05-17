@@ -217,6 +217,9 @@ pub const GpuContext = struct {
     queue_family: u32,
     cmd_pool: vk.VkCommandPool,
     profiler: ?*GpuProfiler,
+    subgroup_size: u32,
+    subgroup_supported_stages: vk.VkShaderStageFlags,
+    subgroup_supported_operations: vk.VkSubgroupFeatureFlags,
 
     pub fn init() !GpuContext {
         // We require Vulkan 1.3 for shaderIntegerDotProduct (core in 1.3) plus
@@ -273,6 +276,14 @@ pub const GpuContext = struct {
             }
         }
         if (queue_family == std.math.maxInt(u32)) return error.NoComputeQueue;
+
+        var subgroup_props = std.mem.zeroes(vk.VkPhysicalDeviceSubgroupProperties);
+        subgroup_props.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+
+        var props2 = std.mem.zeroes(vk.VkPhysicalDeviceProperties2);
+        props2.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        props2.pNext = &subgroup_props;
+        vk.vkGetPhysicalDeviceProperties2(phys_dev, &props2);
 
         // Logical device
         const priority: f32 = 1.0;
@@ -362,6 +373,9 @@ pub const GpuContext = struct {
             .queue_family = queue_family,
             .cmd_pool = cmd_pool,
             .profiler = profiler,
+            .subgroup_size = subgroup_props.subgroupSize,
+            .subgroup_supported_stages = subgroup_props.supportedStages,
+            .subgroup_supported_operations = subgroup_props.supportedOperations,
         };
     }
 
@@ -380,6 +394,10 @@ pub const GpuContext = struct {
         var props: vk.VkPhysicalDeviceProperties = undefined;
         vk.vkGetPhysicalDeviceProperties(self.phys_dev, &props);
         return props.deviceName;
+    }
+
+    pub fn hasSubgroupArithmetic(self: *const GpuContext) bool {
+        return self.subgroup_supported_operations & vk.VK_SUBGROUP_FEATURE_ARITHMETIC_BIT != 0;
     }
 
     pub fn findMemoryType(self: *const GpuContext, type_bits: u32, props: vk.VkMemoryPropertyFlags) !u32 {
