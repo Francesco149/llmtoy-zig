@@ -140,9 +140,11 @@ wait-idle, and readback overhead.
 
 Use `--skip-readback` only as a `bench-moe` diagnostic. It skips the final CPU
 read of the GPU-accumulated MoE output and therefore does not produce a valid
-bench result. Forward has an opt-in `LLMTOY_MOE_VRAM_TAIL=1` path that consumes
-the device-local MoE output on GPU, but it is not the default until final-logit
-drift is resolved.
+bench result. Default forward now consumes the device-local MoE output on GPU
+for the target model except layer 19, which stays on the CPU combine path to
+preserve the final compare argmax. Set `LLMTOY_MOE_VRAM_TAIL=0` to force the
+old readback/combine path, or use `LLMTOY_MOE_VRAM_TAIL_LIMIT` /
+`LLMTOY_MOE_VRAM_TAIL_SKIP` for diagnostics.
 
 ## Sampling Profile
 

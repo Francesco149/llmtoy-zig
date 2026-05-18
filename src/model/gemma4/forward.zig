@@ -117,6 +117,25 @@ pub fn forwardOne(
     const emb_scale = @sqrt(@as(f32, @floatFromInt(d)));
     for (x) |*v| v.* *= emb_scale;
 
+    // The VRAM MoE tail removes the per-layer MoE output readback. Layer 19 is
+    // kept on the CPU combine path for the current 30-layer target because the
+    // fully GPU-resident tail keeps layer argmaxes but can flip the final top-2
+    // logits on the standard compare prompt. Keep the env controls until that
+    // layer's numeric sensitivity is resolved.
+    const moe_vram_tail_enabled = if (std.c.getenv("LLMTOY_MOE_VRAM_TAIL")) |raw|
+        !std.mem.eql(u8, std.mem.span(raw), "0")
+    else
+        true;
+    const moe_vram_tail_limit = if (std.c.getenv("LLMTOY_MOE_VRAM_TAIL_LIMIT")) |raw|
+        std.fmt.parseUnsigned(usize, std.mem.span(raw), 10) catch cfg.n_layers
+    else
+        cfg.n_layers;
+    const default_moe_tail_skip = if (cfg.n_layers == 30) @as(usize, 19) else cfg.n_layers;
+    const moe_vram_tail_skip = if (std.c.getenv("LLMTOY_MOE_VRAM_TAIL_SKIP")) |raw|
+        std.fmt.parseUnsigned(usize, std.mem.span(raw), 10) catch cfg.n_layers
+    else
+        default_moe_tail_skip;
+
     for (0..cfg.n_layers) |l| {
         const lw = &w.layers[l];
         const is_swa = cfg.is_swa[l];
@@ -354,12 +373,11 @@ pub fn forwardOne(
 
         topK(router_out, top_idx);
 
-        // Run each selected expert. LLMTOY_MOE_VRAM_TAIL keeps the accumulated
-        // MoE vector device-resident and finishes the FFN/MoE residual tail on
-        // GPU; default forward keeps the CPU combine path until final-logit
-        // drift is resolved.
+        // Run each selected expert. The default path keeps the accumulated MoE
+        // vector device-resident and finishes the FFN/MoE residual tail on GPU
+        // for all non-skipped layers.
         @memset(moe_buf, 0.0);
-        const use_moe_vram_tail = std.c.getenv("LLMTOY_MOE_VRAM_TAIL") != null;
+        const use_moe_vram_tail = moe_vram_tail_enabled and l < moe_vram_tail_limit and l != moe_vram_tail_skip;
         var moe_residual_done_on_gpu = false;
 
         // Batched GPU path: expert batch submit, optionally followed by the

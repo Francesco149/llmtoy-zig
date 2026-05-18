@@ -921,13 +921,15 @@ systemd-run --user --scope -p MemoryMax=40G --quiet -- \
     77 us residual host/submit overhead. This makes the next production target
     explicit: keep MoE accumulation output device-resident and add it to the
     residual stream on GPU instead of downloading per layer.
-  - `LLMTOY_MOE_VRAM_TAIL=1` is the first production-shaped implementation of
-    that target: `expert_accum` writes a fresh MoE vector to device-local VRAM,
-    then the layer tail runs MoE post-norm, dense+MoE combine, final FFN norm,
-    residual add, and layer scale on GPU. It is intentionally opt-in because
-    default full compare still matches final argmax, while the VRAM-tail path
-    keeps all layer argmaxes but can swap the final top two logits on the
-    "explain MoE" prompt. Resolve that numeric drift before making it default.
+  - The production path now implements most of that target: `expert_accum`
+    writes a fresh MoE vector to device-local VRAM, then the layer tail runs
+    MoE post-norm, dense+MoE combine, final FFN norm, residual add, and layer
+    scale on GPU. On the current 30-layer target, this is enabled by default
+    for every layer except layer 19; that layer keeps the CPU combine path
+    because an all-layer VRAM tail preserves layer argmaxes but can swap the
+    final top two logits on the "explain MoE" prompt. `LLMTOY_MOE_VRAM_TAIL=0`
+    restores the old readback/combine path, and `LLMTOY_MOE_VRAM_TAIL_LIMIT` /
+    `LLMTOY_MOE_VRAM_TAIL_SKIP` are diagnostic controls for resolving layer 19.
   - Before enabling any ID path in `runExpertBatch`, add or use a model-backed
     correctness check that compares real selected-expert intermediates against
     the existing per-expert path, then run `llmtoy compare --gpu-layers`.

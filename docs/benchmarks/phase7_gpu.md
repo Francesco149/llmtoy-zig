@@ -1130,21 +1130,27 @@ This points at a concrete production target: keep expert accumulation output in
 device-local VRAM and fuse/add it into the residual stream on GPU, then avoid
 downloading per-layer MoE output to the CPU.
 
-VRAM-tail prototype:
+VRAM-tail integration:
 
 - `expert_accum.glsl` now writes a fresh accumulated MoE vector rather than
   adding into a pre-zeroed output buffer, which lets `moe_gpu_buf` live in
   device-local VRAM. Legacy/debug readback copies through `moe_stage_buf`.
-- `LLMTOY_MOE_VRAM_TAIL=1` makes forward consume that VRAM MoE vector on GPU:
-  `post_ffw_norm_2(moe)`, dense+MoE add, `post_ffw_norm`, residual add, and
-  layer scale run in a second GPU submit after the expert batch.
-- Default full compare still passes final argmax on `compare ... "explain MoE"
-  --chat`. The opt-in VRAM-tail path keeps all layer argmaxes but currently
-  swaps the final top two logits, so it remains an experiment rather than the
-  default production path.
+- Default forward consumes that VRAM MoE vector on GPU for every layer except
+  layer 19: `post_ffw_norm_2(moe)`, dense+MoE add, `post_ffw_norm`, residual
+  add, and layer scale run in a second GPU submit after the expert batch.
+- Layer 19 remains on the CPU combine path because an all-layer VRAM tail keeps
+  every layer argmax but currently swaps the final top two logits on
+  `compare ... "explain MoE" --chat`. Diagnostic controls:
+  `LLMTOY_MOE_VRAM_TAIL=0`, `LLMTOY_MOE_VRAM_TAIL_LIMIT`, and
+  `LLMTOY_MOE_VRAM_TAIL_SKIP`.
 - Layer 0 descriptor-reuse `bench-moe --skip-readback` remains at about
   `149.98 us/iter`; the legacy readback path with device-local output plus
   staging copy measured about `507.87 us/iter` for a 16-iteration check.
+- Full default compare on `compare ... "explain MoE" --chat` passes all layer
+  argmaxes and final argmax with the 29/30-layer VRAM tail. A short
+  `generate "what is 1+1?" --chat --temperature 0 --max-tokens 16 --gpu`
+  check measured prefill `20.90 tok/s` with the default tail versus
+  `17.94 tok/s` with `LLMTOY_MOE_VRAM_TAIL=0`.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
