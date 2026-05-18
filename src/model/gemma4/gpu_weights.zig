@@ -172,8 +172,8 @@ pub const GpuWeights = struct {
     // expert_all_out_buf: device-local VRAM — flat [n_experts_used × d_model] f32;
     //                     down shader writes sub-ranges, accum shader reads the whole.
     // expert_scales_buf:  HOST_COHERENT, persistently mapped — CPU writes router scales.
-    // moe_gpu_buf:        HOST_COHERENT, persistently mapped — accum shader writes result,
-    //                     CPU reads it after submit.
+    // moe_gpu_buf:        device-local VRAM — accum shader writes the MoE result.
+    // moe_stage_buf:      HOST_COHERENT staging buffer for legacy/debug CPU readback.
     expert_in_buf: ?GpuBuffer,
     expert_mid_bufs: ?[]GpuBuffer,
     // Per-expert Q8_1-quantized mid buffers — populated by a quantize dispatch
@@ -186,11 +186,12 @@ pub const GpuWeights = struct {
     expert_accum_scales_buf: ?GpuBuffer,
     expert_ids_buf: ?GpuBuffer,
     moe_gpu_buf: ?GpuBuffer,
+    moe_stage_buf: ?GpuBuffer,
     expert_in_slice: ?[]f32,
     expert_scales_slice: ?[]f32,
     expert_accum_scales_slice: ?[]f32,
     expert_ids_slice: ?[]u32,
-    moe_gpu_slice: ?[]f32,
+    moe_stage_slice: ?[]f32,
     expert_quant_input_dset: ?vk.VkDescriptorSet,
     expert_quant_mid_batched_dset: ?vk.VkDescriptorSet,
     expert_accum_dset: ?vk.VkDescriptorSet,
@@ -406,11 +407,12 @@ pub const GpuWeights = struct {
             .expert_accum_scales_buf = null,
             .expert_ids_buf = null,
             .moe_gpu_buf = null,
+            .moe_stage_buf = null,
             .expert_in_slice = null,
             .expert_scales_slice = null,
             .expert_accum_scales_slice = null,
             .expert_ids_slice = null,
-            .moe_gpu_slice = null,
+            .moe_stage_slice = null,
             .expert_quant_input_dset = null,
             .expert_quant_mid_batched_dset = null,
             .expert_accum_dset = null,
@@ -631,7 +633,8 @@ pub const GpuWeights = struct {
         // - expert_all_out_buf: device-local VRAM, flat n×d_model; down writes sub-ranges,
         //                       accum reads the whole
         // - expert_scales_buf:  HOST_COHERENT, persistently mapped (CPU writes router scales)
-        // - moe_gpu_buf:        HOST_COHERENT, persistently mapped (accum writes, CPU reads back)
+        // - moe_gpu_buf:        device-local VRAM (accum writes, GPU combine reads)
+        // - moe_stage_buf:      HOST_COHERENT staging for legacy/debug CPU readback
         const nu = g4cfg.n_experts_used;
         gw.expert_in_buf = try GpuBuffer.initHostCoherent(&gw.ctx, g4cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         gw.expert_in_slice = try gw.expert_in_buf.?.mapSlice(f32, g4cfg.d_model);
@@ -656,10 +659,11 @@ pub const GpuWeights = struct {
         gw.expert_accum_scales_slice = try gw.expert_accum_scales_buf.?.mapSlice(f32, nu);
         gw.expert_ids_buf = try GpuBuffer.initHostCoherent(&gw.ctx, nu * @sizeOf(u32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         gw.expert_ids_slice = try gw.expert_ids_buf.?.mapSlice(u32, nu);
-        gw.moe_gpu_buf = try GpuBuffer.initHostCoherent(&gw.ctx, g4cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        gw.moe_gpu_slice = try gw.moe_gpu_buf.?.mapSlice(f32, g4cfg.d_model);
+        gw.moe_gpu_buf = try GpuBuffer.initDeviceLocal(&gw.ctx, g4cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.moe_stage_buf = try GpuBuffer.initStaging(&gw.ctx, g4cfg.d_model * @sizeOf(f32));
+        gw.moe_stage_slice = try gw.moe_stage_buf.?.mapSlice(f32, g4cfg.d_model);
 
-        std.debug.print("  expert I/O bufs: in={} KiB, {} × mid={} KiB (VRAM), all_out={} KiB (VRAM), moe_out={} KiB\n", .{
+        std.debug.print("  expert I/O bufs: in={} KiB, {} × mid={} KiB (VRAM), all_out={} KiB (VRAM), moe_out={} KiB (VRAM)\n", .{
             g4cfg.d_model * @sizeOf(f32) / 1024,
             nu,
             g4cfg.d_expert * @sizeOf(f32) / 1024,
@@ -816,10 +820,11 @@ pub const GpuWeights = struct {
             var tmp = set;
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, &tmp);
         }
-        if (self.moe_gpu_buf) |*b| {
+        if (self.moe_stage_buf) |*b| {
             b.unmap();
             b.deinit();
         }
+        if (self.moe_gpu_buf) |*b| b.deinit();
         if (self.expert_ids_buf) |*b| {
             b.unmap();
             b.deinit();
@@ -1800,8 +1805,9 @@ pub const GpuWeights = struct {
     // Run all active experts for one layer in ONE GPU submission:
     //   Phase 1: n fused gate-gelu-up dispatches, write device-local mid_bufs
     //   Phase 2: n down dispatches, write sub-ranges of device-local expert_all_out_buf
-    //   Phase 3: 1 accum dispatch, reads all_out + scales, writes HOST_COHERENT moe_gpu_buf
-    // CPU writes moe_in and scales, then reads moe_gpu_buf after submit.
+    //   Phase 3: 1 accum dispatch, reads all_out + scales, writes device-local moe_gpu_buf
+    // CPU writes moe_in and scales. Legacy/debug callers can request a staging
+    // readback; the opt-in VRAM-tail forward path consumes moe_gpu_buf directly.
     // Returns error.ExpertNotOnGpu if any session is missing; caller falls back to CPU.
     pub fn runExpertBatch(
         self: *GpuWeights,
@@ -1826,11 +1832,12 @@ pub const GpuWeights = struct {
         const accum_scales_buf = &(self.expert_accum_scales_buf orelse return error.ExpertNotOnGpu);
         const ids_buf = &(self.expert_ids_buf orelse return error.ExpertNotOnGpu);
         const moe_out_buf = &(self.moe_gpu_buf orelse return error.ExpertNotOnGpu);
+        const moe_stage_buf = &(self.moe_stage_buf orelse return error.ExpertNotOnGpu);
         const in_slice = self.expert_in_slice orelse return error.ExpertNotOnGpu;
         const scales_slice = self.expert_scales_slice orelse return error.ExpertNotOnGpu;
         const accum_scales_slice = self.expert_accum_scales_slice orelse return error.ExpertNotOnGpu;
         const ids_slice = self.expert_ids_slice orelse return error.ExpertNotOnGpu;
-        const moe_slice = self.moe_gpu_slice orelse return error.ExpertNotOnGpu;
+        const moe_stage_slice = self.moe_stage_slice orelse return error.ExpertNotOnGpu;
         const acts_q8_1 = &(self.shared_acts_q8_1 orelse return error.ExpertNotOnGpu);
         const mid_q8_1_flat_buf = &(self.expert_mid_q8_1_flat_buf orelse return error.ExpertNotOnGpu);
 
@@ -1881,9 +1888,6 @@ pub const GpuWeights = struct {
             accum_scales_slice[k] = if (use_id_dn) 1.0 else scales_slice[k];
             ids_slice[k] = @intCast(eidx);
         }
-        // Zero the accumulation output — accum shader does +=.
-        @memset(moe_slice, 0);
-
         var reused_cmd = false;
         const cmd = blk: {
             if (reuse_cmd) {
@@ -2067,11 +2071,81 @@ pub const GpuWeights = struct {
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_accum.desc_pool, 1, &accum_ds);
         }
 
-        // Add GPU-accumulated expert result into moe_buf. The bench-only
-        // skip path isolates final HOST_COHERENT readback cost.
+        // Add GPU-accumulated expert result into moe_buf only for legacy/debug
+        // callers. The production forward path keeps this vector in VRAM and
+        // consumes it with runLayerMoeResidualOnGpu.
         if (!skip_readback) {
-            for (moe_buf, moe_slice) |*m, v| m.* += v;
+            try self.ctx.copyBuffer(moe_out_buf.handle, moe_stage_buf.handle, d_model * @sizeOf(f32));
+            for (moe_buf, moe_stage_slice) |*m, v| m.* += v;
         }
+    }
+
+    // Finish Gemma's dense-FFN + MoE block on GPU after runExpertBatch has
+    // produced moe_gpu_buf in VRAM. The final residual is downloaded because
+    // the current layer orchestration still uses CPU router/compare state.
+    pub fn runLayerMoeResidualOnGpu(
+        self: *const GpuWeights,
+        layer: usize,
+        eps: f32,
+        x: []f32,
+        dense_ffn: []const f32,
+        layer_output_scale: f32,
+    ) !void {
+        const lw = &self.layers[layer];
+        const post_ffw_norm_2_buf = &(lw.post_ffw_norm_2_buf orelse return error.NotOnGpu);
+        const post_ffw_norm_buf = &(lw.post_ffw_norm_buf orelse return error.NotOnGpu);
+        const x_buf = &self.shared_vec.?;
+        const dense_buf = &(self.dense_ffn_out_buf orelse return error.NotOnGpu);
+        const moe_buf = &(self.moe_gpu_buf orelse return error.NotOnGpu);
+        const moe_norm_buf = &(self.ffn_vram orelse return error.NotOnGpu);
+        const combined_norm_buf = &(self.xb_vram orelse return error.NotOnGpu);
+
+        std.debug.assert(x.len == dense_ffn.len);
+        std.debug.assert(x.len % 256 == 0);
+
+        try x_buf.upload(std.mem.sliceAsBytes(x));
+        try dense_buf.upload(std.mem.sliceAsBytes(dense_ffn));
+
+        const cmd = try self.ctx.beginBatch();
+
+        const p_moe_norm = self.ctx.profileBegin(cmd, "moe.post_norm");
+        const moe_norm_dset = try self.pl_rmsnorm.record(cmd, moe_buf, post_ffw_norm_2_buf, moe_norm_buf, @intCast(x.len), eps, false);
+        self.ctx.profileEnd(cmd, p_moe_norm);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const p_combine = self.ctx.profileBegin(cmd, "ffn_moe.combine");
+        const combine_dset = try self.pl_elem_add.record(cmd, dense_buf, moe_norm_buf, @intCast(x.len));
+        self.ctx.profileEnd(cmd, p_combine);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const p_post_ffw = self.ctx.profileBegin(cmd, "ffn_moe.post_norm");
+        const post_ffw_dset = try self.pl_rmsnorm.record(cmd, dense_buf, post_ffw_norm_buf, combined_norm_buf, @intCast(x.len), eps, false);
+        self.ctx.profileEnd(cmd, p_post_ffw);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const p_residual = self.ctx.profileBegin(cmd, "ffn_moe.residual_add");
+        const residual_dset = try self.pl_elem_add.record(cmd, x_buf, combined_norm_buf, @intCast(x.len));
+        self.ctx.profileEnd(cmd, p_residual);
+
+        var scale_dset: ?vk.VkDescriptorSet = null;
+        if (layer_output_scale != 1.0) {
+            GpuCtx.recordShaderBarrier(cmd);
+            const p_scale = self.ctx.profileBegin(cmd, "ffn_moe.layer_scale");
+            scale_dset = try self.pl_elem_scale.record(cmd, x_buf, @intCast(x.len), layer_output_scale);
+            self.ctx.profileEnd(cmd, p_scale);
+        }
+
+        try self.ctx.submitBatch(cmd);
+
+        const dev = self.ctx.device;
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &moe_norm_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_elem_add.desc_pool, 1, &combine_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &post_ffw_dset);
+        _ = vk.vkFreeDescriptorSets(dev, self.pl_elem_add.desc_pool, 1, &residual_dset);
+        if (scale_dset) |*ds|
+            _ = vk.vkFreeDescriptorSets(dev, self.pl_elem_scale.desc_pool, 1, ds);
+
+        try x_buf.download(std.mem.sliceAsBytes(x));
     }
 };
 

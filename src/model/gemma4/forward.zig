@@ -354,18 +354,27 @@ pub fn forwardOne(
 
         topK(router_out, top_idx);
 
-        // Run each selected expert; accumulate into moe_buf.
+        // Run each selected expert. LLMTOY_MOE_VRAM_TAIL keeps the accumulated
+        // MoE vector device-resident and finishes the FFN/MoE residual tail on
+        // GPU; default forward keeps the CPU combine path until final-logit
+        // drift is resolved.
         @memset(moe_buf, 0.0);
+        const use_moe_vram_tail = std.c.getenv("LLMTOY_MOE_VRAM_TAIL") != null;
+        var moe_residual_done_on_gpu = false;
 
-        // Batched GPU path: 2 submits per layer (n gate+up dispatches, then n down).
-        // Falls back to per-expert CPU path if experts aren't on GPU.
+        // Batched GPU path: expert batch submit, optionally followed by the
+        // GPU residual-tail submit. Falls back to per-expert CPU path if
+        // experts aren't on GPU.
         const expert_gpu_ok = if (gpu != null and gpu_here)
-            gpu.?.runExpertBatch(l, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, false)
+            gpu.?.runExpertBatch(l, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, use_moe_vram_tail)
         else
             error.ExpertNotOnGpu;
 
         if (expert_gpu_ok) |_| {
-            // GPU path completed; moe_buf already accumulated.
+            if (use_moe_vram_tail) {
+                try gpu.?.runLayerMoeResidualOnGpu(l, cfg.eps, x, ffn_buf, lw.layer_output_scale);
+                moe_residual_done_on_gpu = true;
+            }
         } else |_| {
             // CPU fallback: one expert at a time with thread pool.
             const gu_row_bytes = math.rowBytes(lw.gate_up_exps.type_, d);
@@ -386,18 +395,20 @@ pub fn forwardOne(
             }
         }
 
-        math.rmsnorm(moe_buf, moe_buf, lw.post_ffw_norm_2, cfg.eps);
+        if (!moe_residual_done_on_gpu) {
+            math.rmsnorm(moe_buf, moe_buf, lw.post_ffw_norm_2, cfg.eps);
 
-        // ── Combine and second residual ───────────────────────────────────────
+            // ── Combine and second residual ───────────────────────────────────
 
-        // combined = ffn_buf + moe_buf; then post_ffw_norm; then + x
-        for (ffn_buf, moe_buf) |*a, b| a.* += b;
-        math.rmsnorm(ffn_buf, ffn_buf, lw.post_ffw_norm, cfg.eps);
-        for (x, ffn_buf) |*xi, f| xi.* += f;
+            // combined = ffn_buf + moe_buf; then post_ffw_norm; then + x
+            for (ffn_buf, moe_buf) |*a, b| a.* += b;
+            math.rmsnorm(ffn_buf, ffn_buf, lw.post_ffw_norm, cfg.eps);
+            for (x, ffn_buf) |*xi, f| xi.* += f;
 
-        // Layer output scale (scalar).
-        if (lw.layer_output_scale != 1.0) {
-            for (x) |*xi| xi.* *= lw.layer_output_scale;
+            // Layer output scale (scalar).
+            if (lw.layer_output_scale != 1.0) {
+                for (x) |*xi| xi.* *= lw.layer_output_scale;
+            }
         }
 
         if (layer_taps) |taps| @memcpy(taps[l], x);

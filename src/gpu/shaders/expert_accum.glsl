@@ -1,6 +1,6 @@
 #version 450
 // Weighted accumulation of n expert outputs into a single output vector.
-// output[i] += sum over k of (scales[k] * inputs[k * d_model + i])
+// output[i] = sum over k of (scales[k] * inputs[k * d_model + i])
 //
 // Bindings: 0=inputs (n × d_model f32), 1=scales (n f32), 2=output (d_model f32, read-write)
 // Push constants: d_model, n (number of active experts, ≤16)
@@ -17,7 +17,7 @@ void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.d_model) return;
 
-    float acc = output_[i];
+    float acc = 0.0;
     for (uint k = 0u; k < pc.n; k++) {
         acc += scales[k] * inputs[k * pc.d_model + i];
     }

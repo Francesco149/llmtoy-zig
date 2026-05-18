@@ -1130,6 +1130,22 @@ This points at a concrete production target: keep expert accumulation output in
 device-local VRAM and fuse/add it into the residual stream on GPU, then avoid
 downloading per-layer MoE output to the CPU.
 
+VRAM-tail prototype:
+
+- `expert_accum.glsl` now writes a fresh accumulated MoE vector rather than
+  adding into a pre-zeroed output buffer, which lets `moe_gpu_buf` live in
+  device-local VRAM. Legacy/debug readback copies through `moe_stage_buf`.
+- `LLMTOY_MOE_VRAM_TAIL=1` makes forward consume that VRAM MoE vector on GPU:
+  `post_ffw_norm_2(moe)`, dense+MoE add, `post_ffw_norm`, residual add, and
+  layer scale run in a second GPU submit after the expert batch.
+- Default full compare still passes final argmax on `compare ... "explain MoE"
+  --chat`. The opt-in VRAM-tail path keeps all layer argmaxes but currently
+  swaps the final top two logits, so it remains an experiment rather than the
+  default production path.
+- Layer 0 descriptor-reuse `bench-moe --skip-readback` remains at about
+  `149.98 us/iter`; the legacy readback path with device-local output plus
+  staging copy measured about `507.87 us/iter` for a 16-iteration check.
+
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
 Attempted fusing gate-gelu-up + w_down into a single submit (4 submits/layer):
