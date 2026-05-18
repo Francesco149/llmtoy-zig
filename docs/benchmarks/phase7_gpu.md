@@ -1089,6 +1089,26 @@ queue submit/wait, and the final host readback still dominate the remaining
 gate/up-ID experiment is still not a promotion gate; validate layer slices while
 the Q3_K gate/up-ID kernel remains experimental.
 
+Command-buffer reuse probe:
+
+- Added `LLMTOY_EXPERT_REUSE_CMD=1` as a third experiment. It allocates one
+  command buffer per layer for the opt-in expert-ID route and resets/re-records
+  that command buffer each iteration instead of allocating/freeing a command
+  buffer in `GpuContext.submitBatchCopy`.
+- Layer 0, profiled with `LLMTOY_EXPERT_GU_ID=1 LLMTOY_EXPERT_REUSE_DSETS=1`:
+  `504.56 us/iter` wall, `88.18 us/iter` GPU phases.
+- Layer 0, same run plus `LLMTOY_EXPERT_REUSE_CMD=1`: `529.71 us/iter` wall,
+  `88.24 us/iter` GPU phases.
+- Layer 0, no-profiler 32-iteration wall check: descriptor reuse alone
+  `601.65 us/iter`; descriptor + command reuse `602.50 us/iter`.
+
+Interpretation: command-buffer allocation/free is not a measurable win for the
+current re-recorded MoE batch path. Keep the probe opt-in as a diagnostic, but
+do not prioritize a broad command-buffer reuse refactor until a profile points
+at pre-recorded graphs, fence rings, queue wait, or readback as the limiting
+factor. The next meaningful MoE work is still the Q3_K gate/up-ID kernel shape
+or removing the final per-batch wait/readback.
+
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
 Attempted fusing gate-gelu-up + w_down into a single submit (4 submits/layer):

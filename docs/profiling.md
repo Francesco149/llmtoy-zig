@@ -132,9 +132,11 @@ the current descriptor/command-recording overhead that llama.cpp avoids with its
 expert-id pipeline shape.
 
 Use `LLMTOY_EXPERT_GU_ID=1 LLMTOY_EXPERT_REUSE_DSETS=1` to test the current
-opt-in flattened expert-ID route with persistent descriptor sets. This is still
-an experiment, but it isolates descriptor churn from command submission and
-readback overhead.
+opt-in flattened expert-ID route with persistent descriptor sets. Add
+`LLMTOY_EXPERT_REUSE_CMD=1` to also reuse one command buffer per layer while
+still re-recording the commands each iteration. These are experiments for
+isolating descriptor churn from command-buffer allocation, queue submission,
+wait-idle, and readback overhead.
 
 ## Sampling Profile
 

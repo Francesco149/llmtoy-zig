@@ -905,6 +905,14 @@ systemd-run --user --scope -p MemoryMax=40G --quiet -- \
     submit/wait, and final readback remain the larger gap. Layer-slice compare
     passes for layers 0 and 10, but cumulative all-layer compare is not yet a
     promotion gate for the gate/up-ID experiment.
+  - `LLMTOY_EXPERT_REUSE_CMD=1` is a narrower command-buffer reuse probe for
+    the same expert-ID route. It caches one command buffer per layer and
+    resets/re-records it each iteration. Layer 0 did not improve: profiled
+    descriptor reuse alone measured about 505 us/iter wall, while descriptor
+    plus command reuse measured about 530 us/iter with unchanged ~88 us GPU
+    phase time; no-profiler 32-iteration checks were both about 602 us/iter.
+    Treat command-buffer allocation/free as a low-priority issue unless future
+    profiling isolates pre-recorded graphs, fence rings, queue wait, or readback.
   - Before enabling any ID path in `runExpertBatch`, add or use a model-backed
     correctness check that compares real selected-expert intermediates against
     the existing per-expert path, then run `llmtoy compare --gpu-layers`.

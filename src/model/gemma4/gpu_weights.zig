@@ -197,6 +197,7 @@ pub const GpuWeights = struct {
     expert_gate_up_id_dsets: ?[]?vk.VkDescriptorSet,
     expert_down_id_dsets: ?[]?vk.VkDescriptorSet,
     expert_down_id_dset_is_iq4: ?[]bool,
+    expert_reuse_cmds: ?[]?vk.VkCommandBuffer,
     // Per-projection output buffers for batched dispatch.
     // QKV: all three read the same input → one upload, three parallel dispatches.
     // gate+up: both read the same FFN-norm input → same pattern.
@@ -416,6 +417,7 @@ pub const GpuWeights = struct {
             .expert_gate_up_id_dsets = null,
             .expert_down_id_dsets = null,
             .expert_down_id_dset_is_iq4 = null,
+            .expert_reuse_cmds = null,
             .q_out_buf = null,
             .k_out_buf = null,
             .v_out_buf = null,
@@ -590,6 +592,10 @@ pub const GpuWeights = struct {
         @memset(gw.expert_down_id_dsets.?, null);
         gw.expert_down_id_dset_is_iq4 = try allocator.alloc(bool, g4cfg.n_layers);
         @memset(gw.expert_down_id_dset_is_iq4.?, false);
+        if (std.c.getenv("LLMTOY_EXPERT_REUSE_CMD") != null) {
+            gw.expert_reuse_cmds = try allocator.alloc(?vk.VkCommandBuffer, g4cfg.n_layers);
+            @memset(gw.expert_reuse_cmds.?, null);
+        }
         std.debug.print("  uploading {} experts × {} layers to GPU...\n", .{ g4cfg.n_experts, g4cfg.n_layers });
         for (0..g4cfg.n_layers) |l| {
             if (enable_gate_up_id and isExpertGateUpIdSupported(g4w.layers[l].gate_up_exps.type_)) {
@@ -776,6 +782,10 @@ pub const GpuWeights = struct {
         if (self.k_vram) |bs| {
             for (bs) |*b| b.deinit();
             self.allocator.free(bs);
+        }
+        if (self.expert_reuse_cmds) |cmds| {
+            for (cmds) |cmd| if (cmd) |c| self.ctx.freeReusableCommandBuffer(c);
+            self.allocator.free(cmds);
         }
         if (self.expert_down_id_dsets) |sets| {
             for (sets, 0..) |*ds, i| if (ds.*) |set| {
@@ -1836,6 +1846,7 @@ pub const GpuWeights = struct {
         const reuse_quant_mid_batched_dset = reuse_id_dsets and use_id_gu;
         const reuse_down_id_dset = reuse_id_dsets and use_id_dn;
         const reuse_accum_dset = reuse_id_dsets and (use_id_gu or use_id_dn);
+        const reuse_cmd = std.c.getenv("LLMTOY_EXPERT_REUSE_CMD") != null and use_id_gu;
 
         for (top_idx) |eidx| {
             if (!use_id_gu) {
@@ -1872,7 +1883,17 @@ pub const GpuWeights = struct {
         // Zero the accumulation output — accum shader does +=.
         @memset(moe_slice, 0);
 
-        const cmd = try self.ctx.beginBatch();
+        var reused_cmd = false;
+        const cmd = blk: {
+            if (reuse_cmd) {
+                const cmds = self.expert_reuse_cmds orelse return error.ExpertNotOnGpu;
+                if (cmds[layer] == null)
+                    cmds[layer] = try self.ctx.allocReusableCommandBuffer();
+                reused_cmd = true;
+                break :blk try self.ctx.beginReusableBatch(cmds[layer].?);
+            }
+            break :blk try self.ctx.beginBatch();
+        };
         var fused_dsets: [16]vk.VkDescriptorSet = undefined;
         var quant_dn_dsets: [16]vk.VkDescriptorSet = undefined;
         var down_dsets: [16]vk.VkDescriptorSet = undefined;
@@ -2004,7 +2025,11 @@ pub const GpuWeights = struct {
         }
         self.ctx.profileEnd(cmd, p_accum);
 
-        try self.ctx.submitBatch(cmd);
+        if (reused_cmd) {
+            try self.ctx.submitReusableBatch(cmd);
+        } else {
+            try self.ctx.submitBatch(cmd);
+        }
 
         const pl_dn_used = if (use_q8_1_dn) pl_dn_q8_1.? else pl_dn_f32.?;
         if (reuse_gate_up_id_dset and use_id_gu) {
