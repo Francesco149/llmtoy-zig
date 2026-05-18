@@ -91,14 +91,19 @@ pub fn main(init: std.process.Init) !void {
         try cmdBenchMatvec(out, args[2], opts, io, gpa);
     } else if (std.mem.eql(u8, args[1], "bench-moe")) {
         if (args.len < 3) {
-            std.debug.print("usage: llmtoy bench-moe <model.gguf> [--iters N] [--layer N]\n", .{});
+            std.debug.print("usage: llmtoy bench-moe <model.gguf> [--iters N] [--layer N] [--skip-readback]\n", .{});
             return error.MissingArg;
         }
         var opts = MoeBenchOptions{};
         var i: usize = 3;
         while (i < args.len) {
-            if (i + 1 >= args.len) break;
             const flag = args[i];
+            if (std.mem.eql(u8, flag, "--skip-readback")) {
+                opts.skip_readback = true;
+                i += 1;
+                continue;
+            }
+            if (i + 1 >= args.len) break;
             const val = args[i + 1];
             if (std.mem.eql(u8, flag, "--iters")) opts.iters = try std.fmt.parseInt(u32, val, 10);
             if (std.mem.eql(u8, flag, "--layer")) opts.layer = try std.fmt.parseInt(usize, val, 10);
@@ -210,7 +215,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\  llmtoy info <model.gguf>               print model metadata and tensor summary
         \\  llmtoy tokenize <model.gguf> <text>    BPE-encode text, print IDs and decoded tokens
         \\  llmtoy bench-matvec <model.gguf> [--iters N] [--target NAME] [--reuse-descriptor]
-        \\  llmtoy bench-moe <model.gguf> [--iters N] [--layer N]
+        \\  llmtoy bench-moe <model.gguf> [--iters N] [--layer N] [--skip-readback]
         \\  llmtoy generate <model.gguf> <prompt> [--chat] [--gpu] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N] [--stop-token TOKEN] [--gpu-layers L0:L1]
         \\  llmtoy compare  <model.gguf> <prompt> [--chat] [--threads N] [--gpu-layers L0:L1]
         \\
@@ -365,6 +370,7 @@ const MatvecBenchOptions = struct {
 const MoeBenchOptions = struct {
     iters: u32 = 64,
     layer: usize = 0,
+    skip_readback: bool = false,
 };
 
 const BenchPipelines = struct {
@@ -702,12 +708,12 @@ fn cmdBenchMoe(
     try out.print("GPU MoE batch microbench: layer={} iters={} experts_used={}/{} d_model={} d_expert={}\n", .{
         layer, opts.iters, top_n, cfg.n_experts, cfg.d_model, cfg.d_expert,
     });
-    try out.print("  gate_up_type={s} down_type={s}\n", .{
-        lw.gate_up_exps.type_.label(), lw.down_exps.type_.label(),
+    try out.print("  gate_up_type={s} down_type={s} skip_readback={}\n", .{
+        lw.gate_up_exps.type_.label(), lw.down_exps.type_.label(), opts.skip_readback,
     });
 
     @memset(moe_buf, 0.0);
-    try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf);
+    try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, opts.skip_readback);
 
     const labels = [_][]const u8{
         "moe.quantize_input",
@@ -723,7 +729,7 @@ fn cmdBenchMoe(
     const t0 = clk.now(io);
     for (0..opts.iters) |_| {
         @memset(moe_buf, 0.0);
-        try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf);
+        try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, opts.skip_readback);
     }
     const t1 = clk.now(io);
 

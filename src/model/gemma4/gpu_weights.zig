@@ -1813,6 +1813,7 @@ pub const GpuWeights = struct {
         moe_in: []const f32,
         router_out: []const f32,
         moe_buf: []f32,
+        skip_readback: bool,
     ) !void {
         const n = top_idx.len;
         const eg_sessions = self.expert_gate orelse return error.ExpertNotOnGpu;
@@ -2066,8 +2067,11 @@ pub const GpuWeights = struct {
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_accum.desc_pool, 1, &accum_ds);
         }
 
-        // Add GPU-accumulated expert result into moe_buf.
-        for (moe_buf, moe_slice) |*m, v| m.* += v;
+        // Add GPU-accumulated expert result into moe_buf. The bench-only
+        // skip path isolates final HOST_COHERENT readback cost.
+        if (!skip_readback) {
+            for (moe_buf, moe_slice) |*m, v| m.* += v;
+        }
     }
 };
 

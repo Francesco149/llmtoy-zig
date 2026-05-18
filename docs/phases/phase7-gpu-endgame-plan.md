@@ -913,6 +913,14 @@ systemd-run --user --scope -p MemoryMax=40G --quiet -- \
     phase time; no-profiler 32-iteration checks were both about 602 us/iter.
     Treat command-buffer allocation/free as a low-priority issue unless future
     profiling isolates pre-recorded graphs, fence rings, queue wait, or readback.
+  - `bench-moe --skip-readback` is a diagnostic, not a correct forward path.
+    It skips the final CPU read/add of the accumulated MoE output. With
+    descriptor reuse, layer 0 dropped from about 597 us/iter to 150 us/iter and
+    layer 10 dropped from about 525 us/iter to 162 us/iter. A timestamped layer
+    0 run with readback skipped measured about 88 us GPU phases and only about
+    77 us residual host/submit overhead. This makes the next production target
+    explicit: keep MoE accumulation output device-resident and add it to the
+    residual stream on GPU instead of downloading per layer.
   - Before enabling any ID path in `runExpertBatch`, add or use a model-backed
     correctness check that compares real selected-expert intermediates against
     the existing per-expert path, then run `llmtoy compare --gpu-layers`.

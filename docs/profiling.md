@@ -138,6 +138,11 @@ still re-recording the commands each iteration. These are experiments for
 isolating descriptor churn from command-buffer allocation, queue submission,
 wait-idle, and readback overhead.
 
+Use `--skip-readback` only as a `bench-moe` diagnostic. It skips the final CPU
+read of the GPU-accumulated MoE output and therefore does not produce a valid
+forward result. It isolates the ceiling from keeping MoE output device-resident
+and merging it into the residual stream on GPU.
+
 ## Sampling Profile
 
 ```sh

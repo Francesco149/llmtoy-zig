@@ -360,7 +360,7 @@ pub fn forwardOne(
         // Batched GPU path: 2 submits per layer (n gate+up dispatches, then n down).
         // Falls back to per-expert CPU path if experts aren't on GPU.
         const expert_gpu_ok = if (gpu != null and gpu_here)
-            gpu.?.runExpertBatch(l, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf)
+            gpu.?.runExpertBatch(l, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, false)
         else
             error.ExpertNotOnGpu;
 

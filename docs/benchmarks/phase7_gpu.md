@@ -1109,6 +1109,27 @@ at pre-recorded graphs, fence rings, queue wait, or readback as the limiting
 factor. The next meaningful MoE work is still the Q3_K gate/up-ID kernel shape
 or removing the final per-batch wait/readback.
 
+Readback isolation probe:
+
+- Added `bench-moe --skip-readback`, a diagnostic mode that skips the final CPU
+  read/add of `moe_gpu_buf`. This intentionally makes the forward result
+  invalid and is only for measuring the ceiling from keeping MoE output in
+  VRAM.
+- Layer 0, `LLMTOY_EXPERT_GU_ID=1 LLMTOY_EXPERT_REUSE_DSETS=1 bench-moe
+  --iters 32 --layer 0`: `597.12 us/iter` wall. The same command with
+  `--skip-readback`: `150.20 us/iter`.
+- Layer 0 with GPU timestamps and `--skip-readback`: `165.12 us/iter` wall,
+  `87.99 us/iter` GPU phases, leaving only `77.13 us/iter` residual
+  host/submit overhead.
+- Layer 10, descriptor reuse path: `524.73 us/iter` wall. The same command with
+  `--skip-readback`: `161.62 us/iter`.
+
+Interpretation: after descriptor reuse, the final HOST_COHERENT MoE output read
+and CPU add are the dominant remaining MoE wall-time cost in this microbench.
+This points at a concrete production target: keep expert accumulation output in
+device-local VRAM and fuse/add it into the residual stream on GPU, then avoid
+downloading per-layer MoE output to the CPU.
+
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
 Attempted fusing gate-gelu-up + w_down into a single submit (4 submits/layer):
