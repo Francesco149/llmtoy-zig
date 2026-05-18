@@ -1658,6 +1658,33 @@ pub const RmsnormPipeline = struct {
         eps: f32,
         weight_offset: bool,
     ) !vk.VkDescriptorSet {
+        return self.recordWithMode(cmd, x_buf, w_buf, y_buf, n, eps, weight_offset, false);
+    }
+
+    pub fn recordPrecise(
+        self: *const RmsnormPipeline,
+        cmd: vk.VkCommandBuffer,
+        x_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+        y_buf: *const GpuBuffer,
+        n: u32,
+        eps: f32,
+        weight_offset: bool,
+    ) !vk.VkDescriptorSet {
+        return self.recordWithMode(cmd, x_buf, w_buf, y_buf, n, eps, weight_offset, true);
+    }
+
+    fn recordWithMode(
+        self: *const RmsnormPipeline,
+        cmd: vk.VkCommandBuffer,
+        x_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+        y_buf: *const GpuBuffer,
+        n: u32,
+        eps: f32,
+        weight_offset: bool,
+        precise_sum: bool,
+    ) !vk.VkDescriptorSet {
         std.debug.assert(n % 256 == 0);
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
@@ -1689,7 +1716,8 @@ pub const RmsnormPipeline = struct {
         const pc = RmsnormPushConst{
             .n = n,
             .eps = eps,
-            .weight_offset = if (weight_offset) 1 else 0,
+            .weight_offset = (if (weight_offset) @as(u32, 1) else 0) |
+                (if (precise_sum) @as(u32, 2) else 0),
         };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(RmsnormPushConst), &pc);
         vk.vkCmdDispatch(cmd, 1, 1, 1);
@@ -4089,6 +4117,7 @@ fn runRmsnormShader(
     w: []const f32,
     eps: f32,
     weight_offset: bool,
+    precise_sum: bool,
     out: []f32,
 ) !void {
     var pl = try RmsnormPipeline.init(gpu);
@@ -4106,12 +4135,15 @@ fn runRmsnormShader(
     defer y_buf.deinit();
 
     const cmd = try gpu.beginBatch();
-    _ = try pl.record(cmd, &x_buf, &w_buf, &y_buf, @intCast(x.len), eps, weight_offset);
+    _ = if (precise_sum)
+        try pl.recordPrecise(cmd, &x_buf, &w_buf, &y_buf, @intCast(x.len), eps, weight_offset)
+    else
+        try pl.record(cmd, &x_buf, &w_buf, &y_buf, @intCast(x.len), eps, weight_offset);
     try gpu.submitBatch(cmd);
     try y_buf.download(std.mem.sliceAsBytes(out));
 }
 
-fn fuzzRmsnorm(n: usize, seed: u64, weight_offset: bool) !void {
+fn fuzzRmsnorm(n: usize, seed: u64, weight_offset: bool, precise_sum: bool) !void {
     const ctx = GpuContext.init() catch |e| {
         std.debug.print("gpu init failed: {}\n", .{e});
         return;
@@ -4143,7 +4175,7 @@ fn fuzzRmsnorm(n: usize, seed: u64, weight_offset: bool) !void {
     const bias: f32 = if (weight_offset) 1.0 else 0.0;
     for (cpu_out, x, w) |*o, xi, wi| o.* = xi * rms_inv * (bias + wi);
 
-    try runRmsnormShader(&gpu, x, w, eps, weight_offset, gpu_out);
+    try runRmsnormShader(&gpu, x, w, eps, weight_offset, precise_sum, gpu_out);
 
     var max_abs: f32 = 0.0;
     var max_ref: f32 = 0.0;
@@ -4153,18 +4185,21 @@ fn fuzzRmsnorm(n: usize, seed: u64, weight_offset: bool) !void {
         if (@abs(c) > max_ref) max_ref = @abs(c);
     }
     const rel = max_abs / (max_ref + 1e-6);
-    std.debug.print("rmsnorm fuzz n={} bias={} max|D|={d:.6} rel={e:.3}\n", .{ n, weight_offset, max_abs, rel });
+    std.debug.print("rmsnorm fuzz n={} bias={} precise={} max|D|={d:.6} rel={e:.3}\n", .{ n, weight_offset, precise_sum, max_abs, rel });
     try std.testing.expect(rel < 1e-5);
 }
 
 test "gpu rmsnorm n=512 fuzz" {
-    try fuzzRmsnorm(512, 71, false); // head_dim_global
+    try fuzzRmsnorm(512, 71, false, false); // head_dim_global
 }
 test "gpu rmsnorm n=2816 fuzz" {
-    try fuzzRmsnorm(2816, 73, false); // d_model
+    try fuzzRmsnorm(2816, 73, false, false); // d_model
 }
 test "gpu rmsnorm n=2816 fuzz with (1+w) convention" {
-    try fuzzRmsnorm(2816, 79, true); // exercise the weight_offset path
+    try fuzzRmsnorm(2816, 79, true, false); // exercise the weight_offset path
+}
+test "gpu rmsnorm n=2816 precise-sum fuzz" {
+    try fuzzRmsnorm(2816, 83, false, true);
 }
 
 // ── rmsnorm_perhead fuzz test ─────────────────────────────────────────────────

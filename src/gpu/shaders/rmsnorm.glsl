@@ -6,9 +6,10 @@
 // memory to reduce Σ x² across the row (RDNA3 wave32 → 8 subgroups per
 // workgroup, then a final 8-way subgroup reduction).
 //
-// `weight_offset` push-constant controls Gemma's weight convention:
+// Low bit of `weight_offset` controls Gemma's weight convention:
 //   0 → y = x * rms_inv * w        (this codebase's existing convention)
 //   1 → y = x * rms_inv * (1 + w)  (some Gemma variants pre-shift weights)
+// Bit 1 requests a CPU-order scalar sum for numerically sensitive tail norms.
 // The flag is parameterized so the same shader serves both layouts.
 //
 // `pc.n` MUST be a multiple of the workgroup size (256). All Gemma4 norm
@@ -38,34 +39,46 @@ void main() {
     const uint tid    = gl_LocalInvocationID.x;
     const uint stride = gl_WorkGroupSize.x;
 
-    // Phase 1 — per-thread partial sum of x².
-    float ss = 0.0;
-    for (uint i = tid; i < pc.n; i += stride) {
-        const float v = x_in[i];
-        ss += v * v;
-    }
+    if ((pc.weight_offset & 2u) != 0u) {
+        if (tid == 0u) {
+            float ss = 0.0;
+            for (uint i = 0u; i < pc.n; i++) {
+                const float v = x_in[i];
+                ss += v * v;
+            }
+            sub_sums[0] = ss;
+        }
+        barrier();
+    } else {
+        // Phase 1 — per-thread partial sum of x².
+        float ss = 0.0;
+        for (uint i = tid; i < pc.n; i += stride) {
+            const float v = x_in[i];
+            ss += v * v;
+        }
 
-    // Phase 2 — subgroup reduction (each subgroup of 32 reduces to 1 value).
-    ss = subgroupAdd(ss);
-    if (gl_SubgroupInvocationID == 0u) {
-        sub_sums[gl_SubgroupID] = ss;
-    }
-    barrier();
+        // Phase 2 — subgroup reduction (each subgroup of 32 reduces to 1 value).
+        ss = subgroupAdd(ss);
+        if (gl_SubgroupInvocationID == 0u) {
+            sub_sums[gl_SubgroupID] = ss;
+        }
+        barrier();
 
-    // Phase 3 — final reduction across subgroups by subgroup 0.
-    if (gl_SubgroupID == 0u) {
-        const float s = (gl_SubgroupInvocationID < gl_NumSubgroups)
-            ? sub_sums[gl_SubgroupInvocationID] : 0.0;
-        const float total = subgroupAdd(s);
-        if (gl_SubgroupInvocationID == 0u) sub_sums[0] = total;
+        // Phase 3 — final reduction across subgroups by subgroup 0.
+        if (gl_SubgroupID == 0u) {
+            const float s = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                ? sub_sums[gl_SubgroupInvocationID] : 0.0;
+            const float total = subgroupAdd(s);
+            if (gl_SubgroupInvocationID == 0u) sub_sums[0] = total;
+        }
+        barrier();
     }
-    barrier();
 
     const float mean_sq = sub_sums[0] / float(pc.n);
     const float rms_inv = inversesqrt(mean_sq + pc.eps);
 
     // Phase 4 — write normalized output.
-    const float bias = (pc.weight_offset != 0u) ? 1.0 : 0.0;
+    const float bias = ((pc.weight_offset & 1u) != 0u) ? 1.0 : 0.0;
     for (uint i = tid; i < pc.n; i += stride) {
         y_out[i] = x_in[i] * rms_inv * (bias + w[i]);
     }

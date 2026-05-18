@@ -1105,7 +1105,7 @@ pub const GpuWeights = struct {
         try vec_buf.upload(std.mem.sliceAsBytes(x));
 
         const cmd = try self.ctx.beginBatch();
-        const norm_dset = try self.pl_rmsnorm.record(cmd, vec_buf, attn_norm_buf, xb_buf, @intCast(x.len), eps, false);
+        const norm_dset = try self.recordLayerRmsnorm(cmd, layer, vec_buf, attn_norm_buf, xb_buf, @intCast(x.len), eps, false);
         GpuCtx.recordShaderBarrier(cmd);
 
         const quant_dset = try self.pl_quantize_q8_1.record(cmd, xb_buf, acts_buf, wq.cols);
@@ -1204,7 +1204,7 @@ pub const GpuWeights = struct {
 
         // ── 1. attn_norm(x) → xb_vram
         const p_norm = self.ctx.profileBegin(cmd, "attn_front.rmsnorm");
-        const norm_dset = try self.pl_rmsnorm.record(cmd, vec_buf, attn_norm_buf, xb_buf, @intCast(x.len), eps, false);
+        const norm_dset = try self.recordLayerRmsnorm(cmd, layer, vec_buf, attn_norm_buf, xb_buf, @intCast(x.len), eps, false);
         self.ctx.profileEnd(cmd, p_norm);
         GpuCtx.recordShaderBarrier(cmd);
 
@@ -1459,7 +1459,7 @@ pub const GpuWeights = struct {
         try vec_buf.upload(std.mem.sliceAsBytes(x));
 
         const cmd = try self.ctx.beginBatch();
-        const norm_dset = try self.pl_rmsnorm.record(cmd, vec_buf, ffn_norm_buf, xb_buf, @intCast(x.len), eps, false);
+        const norm_dset = try self.recordLayerRmsnorm(cmd, layer, vec_buf, ffn_norm_buf, xb_buf, @intCast(x.len), eps, false);
         GpuCtx.recordShaderBarrier(cmd);
 
         const quant_dset = try self.pl_quantize_q8_1.record(cmd, xb_buf, acts_buf, w_gate.cols);
@@ -1536,7 +1536,7 @@ pub const GpuWeights = struct {
         try vec_buf.upload(std.mem.sliceAsBytes(x));
 
         const cmd = try self.ctx.beginBatch();
-        const norm_dset = try self.pl_rmsnorm.record(cmd, vec_buf, ffn_norm_buf, xb_buf, @intCast(x.len), eps, false);
+        const norm_dset = try self.recordLayerRmsnorm(cmd, layer, vec_buf, ffn_norm_buf, xb_buf, @intCast(x.len), eps, false);
         GpuCtx.recordShaderBarrier(cmd);
 
         const quant_dset = try self.pl_quantize_q8_1.record(cmd, xb_buf, acts_buf, w_gate.cols);
@@ -1554,7 +1554,7 @@ pub const GpuWeights = struct {
         const down_dset = try down_pl.record(cmd, &w_down.mat_buf, gate_buf, ffn_buf, w_down.rows, w_down.cols);
         GpuCtx.recordShaderBarrier(cmd);
 
-        const norm2_dset = try self.pl_rmsnorm.record(cmd, ffn_buf, post_ffw_norm_1_buf, out_buf, @intCast(w_down.rows), eps, false);
+        const norm2_dset = try self.recordLayerRmsnorm(cmd, layer, ffn_buf, post_ffw_norm_1_buf, out_buf, @intCast(w_down.rows), eps, false);
 
         try self.ctx.submitBatch(cmd);
 
@@ -1659,7 +1659,7 @@ pub const GpuWeights = struct {
 
         // post_attention_norm in place on attn_vram.
         const p_post_attn = self.ctx.profileBegin(cmd, "post_attn.rmsnorm");
-        const post_attn_dset = try self.pl_rmsnorm.record(cmd, attn_vram, post_attn_buf, attn_vram, @intCast(wo.rows), eps, false);
+        const post_attn_dset = try self.recordLayerRmsnorm(cmd, layer, attn_vram, post_attn_buf, attn_vram, @intCast(wo.rows), eps, false);
         self.ctx.profileEnd(cmd, p_post_attn);
         GpuCtx.recordShaderBarrier(cmd);
 
@@ -1672,7 +1672,7 @@ pub const GpuWeights = struct {
 
         // ffn_norm(x_buf) → xb_vram.
         const p_ffn_norm = self.ctx.profileBegin(cmd, "dense_ffn.rmsnorm");
-        const ffn_norm_dset = try self.pl_rmsnorm.record(cmd, x_buf, ffn_norm_buf, xb_buf, @intCast(wo.rows), eps, false);
+        const ffn_norm_dset = try self.recordLayerRmsnorm(cmd, layer, x_buf, ffn_norm_buf, xb_buf, @intCast(wo.rows), eps, false);
         self.ctx.profileEnd(cmd, p_ffn_norm);
         GpuCtx.recordShaderBarrier(cmd);
 
@@ -1701,7 +1701,7 @@ pub const GpuWeights = struct {
         GpuCtx.recordShaderBarrier(cmd);
 
         const p_post_ffw = self.ctx.profileBegin(cmd, "dense_ffn.post_norm");
-        const post_ffw_dset = try self.pl_rmsnorm.record(cmd, ffn_buf, post_ffw_norm_1_buf, out_buf, @intCast(w_down.rows), eps, false);
+        const post_ffw_dset = try self.recordLayerRmsnorm(cmd, layer, ffn_buf, post_ffw_norm_1_buf, out_buf, @intCast(w_down.rows), eps, false);
         self.ctx.profileEnd(cmd, p_post_ffw);
 
         try self.ctx.submitBatch(cmd);
@@ -1787,6 +1787,26 @@ pub const GpuWeights = struct {
         const x = &(self.x_vram orelse return error.NotOnGpu);
         try self.ctx.copyBuffer(x.handle, stage.handle, out.len * @sizeOf(f32));
         try stage.download(std.mem.sliceAsBytes(out));
+    }
+
+    fn recordLayerRmsnorm(
+        self: *const GpuWeights,
+        cmd: vk.VkCommandBuffer,
+        layer: usize,
+        x_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+        y_buf: *const GpuBuffer,
+        n: u32,
+        eps: f32,
+        weight_offset: bool,
+    ) !vk.VkDescriptorSet {
+        // Layer 19 is numerically sensitive on the target Gemma4 APEX model:
+        // fast parallel reduction keeps layer argmaxes but can swap the final
+        // top-2 logits when the MoE tail stays fully GPU-resident.
+        if (layer == 19) {
+            return self.pl_rmsnorm.recordPrecise(cmd, x_buf, w_buf, y_buf, n, eps, weight_offset);
+        }
+        return self.pl_rmsnorm.record(cmd, x_buf, w_buf, y_buf, n, eps, weight_offset);
     }
 
     // Pipeline for the f32-activation path.
@@ -2109,7 +2129,7 @@ pub const GpuWeights = struct {
         const cmd = try self.ctx.beginBatch();
 
         const p_moe_norm = self.ctx.profileBegin(cmd, "moe.post_norm");
-        const moe_norm_dset = try self.pl_rmsnorm.record(cmd, moe_buf, post_ffw_norm_2_buf, moe_norm_buf, @intCast(x.len), eps, false);
+        const moe_norm_dset = try self.recordLayerRmsnorm(cmd, layer, moe_buf, post_ffw_norm_2_buf, moe_norm_buf, @intCast(x.len), eps, false);
         self.ctx.profileEnd(cmd, p_moe_norm);
         GpuCtx.recordShaderBarrier(cmd);
 
@@ -2119,7 +2139,7 @@ pub const GpuWeights = struct {
         GpuCtx.recordShaderBarrier(cmd);
 
         const p_post_ffw = self.ctx.profileBegin(cmd, "ffn_moe.post_norm");
-        const post_ffw_dset = try self.pl_rmsnorm.record(cmd, dense_buf, post_ffw_norm_buf, combined_norm_buf, @intCast(x.len), eps, false);
+        const post_ffw_dset = try self.recordLayerRmsnorm(cmd, layer, dense_buf, post_ffw_norm_buf, combined_norm_buf, @intCast(x.len), eps, false);
         self.ctx.profileEnd(cmd, p_post_ffw);
         GpuCtx.recordShaderBarrier(cmd);
 

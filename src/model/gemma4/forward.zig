@@ -117,11 +117,8 @@ pub fn forwardOne(
     const emb_scale = @sqrt(@as(f32, @floatFromInt(d)));
     for (x) |*v| v.* *= emb_scale;
 
-    // The VRAM MoE tail removes the per-layer MoE output readback. Layer 19 is
-    // kept on the CPU combine path for the current 30-layer target because the
-    // fully GPU-resident tail keeps layer argmaxes but can flip the final top-2
-    // logits on the standard compare prompt. Keep the env controls until that
-    // layer's numeric sensitivity is resolved.
+    // The VRAM MoE tail removes the per-layer MoE output readback. Diagnostic
+    // env controls remain useful for bisecting future numerical sensitivity.
     const moe_vram_tail_enabled = if (std.c.getenv("LLMTOY_MOE_VRAM_TAIL")) |raw|
         !std.mem.eql(u8, std.mem.span(raw), "0")
     else
@@ -130,7 +127,7 @@ pub fn forwardOne(
         std.fmt.parseUnsigned(usize, std.mem.span(raw), 10) catch cfg.n_layers
     else
         cfg.n_layers;
-    const default_moe_tail_skip = if (cfg.n_layers == 30) @as(usize, 19) else cfg.n_layers;
+    const default_moe_tail_skip = cfg.n_layers;
     const moe_vram_tail_skip = if (std.c.getenv("LLMTOY_MOE_VRAM_TAIL_SKIP")) |raw|
         std.fmt.parseUnsigned(usize, std.mem.span(raw), 10) catch cfg.n_layers
     else
