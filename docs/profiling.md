@@ -131,12 +131,13 @@ The GPU phase timing is useful for shader comparisons; the wall timing exposes
 the current descriptor/command-recording overhead that llama.cpp avoids with its
 expert-id pipeline shape.
 
-Use `LLMTOY_EXPERT_GU_ID=1 LLMTOY_EXPERT_REUSE_DSETS=1` to test the current
-opt-in flattened expert-ID route with persistent descriptor sets. Add
-`LLMTOY_EXPERT_REUSE_CMD=1` to also reuse one command buffer per layer while
-still re-recording the commands each iteration. These are experiments for
-isolating descriptor churn from command-buffer allocation, queue submission,
-wait-idle, and readback overhead.
+Flat expert gate/up ID is enabled by default for supported layers. Set
+`LLMTOY_EXPERT_GU_ID=0` to force the older per-expert gate/up route. Use
+`LLMTOY_EXPERT_REUSE_DSETS=1` to test persistent descriptor sets, and add
+`LLMTOY_EXPERT_REUSE_CMD=1` to reuse one command buffer per fully persistent
+ID-GU + ID-down layer while still re-recording commands each iteration. These
+are experiments for isolating descriptor churn from command-buffer allocation,
+queue submission, wait-idle, and readback overhead.
 
 Use `--skip-readback` only as a `bench-moe` diagnostic. It skips the final CPU
 read of the GPU-accumulated MoE output and therefore does not produce a valid

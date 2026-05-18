@@ -1109,6 +1109,50 @@ at pre-recorded graphs, fence rings, queue wait, or readback as the limiting
 factor. The next meaningful MoE work is still the Q3_K gate/up-ID kernel shape
 or removing the final per-batch wait/readback.
 
+Gate/up-ID mixed-down correctness fix:
+
+- The flat gate/up-ID route was failing on layers whose down projection could
+  not use the flat expert-down ID shader, notably Q5_0 expert-down layers. The
+  gate/up-ID shader itself checked out against real layer weights; the bug was
+  routing. ID gate/up wrote mids into the flat mid buffer, while the non-ID down
+  branch still read the per-expert Q8_1 mid buffers.
+- The fix now routes ID gate/up mids to the flat Q8_1 buffer only when the
+  selected down path also consumes flat mids. Mixed ID-GU/non-ID-down layers
+  quantize each selected flat f32 mid range into the existing per-expert Q8_1
+  mid buffer before dispatching the normal per-expert down shaders.
+- Descriptor cleanup and command-buffer reuse were tightened for the same mixed
+  path. `LLMTOY_EXPERT_REUSE_CMD=1` now applies only to fully persistent
+  ID-GU + ID-down layers; mixed layers use the normal one-shot command buffer
+  because their temporary descriptor sets cannot be freed while a reusable
+  command buffer still references them.
+- Correctness:
+  - `LLMTOY_EXPERT_GU_ID=1 compare ... "explain MoE" --chat --gpu-layers 1:1`
+    returns layer 1 to the baseline `max|D|=0.09959`, all layer argmaxes match,
+    and final argmax matches.
+  - `LLMTOY_EXPERT_GU_ID=1 compare ... "explain MoE" --chat` passes all layer
+    argmaxes and final argmax.
+  - `LLMTOY_EXPERT_GU_ID=1 LLMTOY_EXPERT_REUSE_DSETS=1
+    LLMTOY_EXPERT_REUSE_CMD=1 compare ... "explain MoE" --chat` also passes all
+    layer argmaxes and final argmax.
+- Added focused tests for expert-ID Q3_K gate/up on nontrivial expert IDs and
+  for batched Q8_1 quantization round-trip behavior.
+- With the corrected route, flat gate/up-ID is now the default for supported
+  layers. Set `LLMTOY_EXPERT_GU_ID=0` to force the older per-expert gate/up
+  path for diagnostics.
+- Quiet-host layer 0 `bench-moe --iters 64 --layer 0 --skip-readback`:
+  - older per-expert gate/up forced via `LLMTOY_EXPERT_GU_ID=0`: about
+    `178.67 us/iter` wall, `88.08 us/iter` GPU phases.
+  - flat gate/up-ID: about `160.89 us/iter` wall, `88.76 us/iter` GPU phases.
+  - flat gate/up-ID plus descriptor/command reuse envs: about `160.78 us/iter`
+    wall, `88.26 us/iter` GPU phases. In this skip-readback microbench the
+    default flattening provides the measurable win; descriptor/command reuse is
+    mostly noise.
+- Short default generation sanity check on the standard MoE prompt
+  (`--max-tokens 8`, `LLMTOY_GPU_PROFILE=1`): prefill `20.46 tok/s`,
+  generation `20.31 tok/s`. The largest GPU buckets remain dense FFN down,
+  `lm_head`, MoE gate/up, and attention softmax; this change mainly reduces
+  MoE host/dispatch shape rather than changing total GPU math time.
+
 Readback isolation probe:
 
 - Added `bench-moe --skip-readback`, a diagnostic mode that skips the final CPU

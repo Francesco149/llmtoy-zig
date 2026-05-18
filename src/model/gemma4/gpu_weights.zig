@@ -583,7 +583,8 @@ pub const GpuWeights = struct {
         @memset(gw.expert_up.?, null);
         gw.expert_down = try allocator.alloc(?MatvecSession, n_total);
         @memset(gw.expert_down.?, null);
-        const enable_gate_up_id = std.c.getenv("LLMTOY_EXPERT_GU_ID") != null;
+        const expert_gu_env = std.c.getenv("LLMTOY_EXPERT_GU_ID");
+        const enable_gate_up_id = expert_gu_env == null or !std.mem.eql(u8, std.mem.span(expert_gu_env.?), "0");
         gw.expert_gate_up_flat = try allocator.alloc(?MatvecSession, g4cfg.n_layers);
         @memset(gw.expert_gate_up_flat.?, null);
         gw.expert_down_flat = try allocator.alloc(?MatvecSession, g4cfg.n_layers);
@@ -1874,7 +1875,7 @@ pub const GpuWeights = struct {
         const reuse_quant_mid_batched_dset = reuse_id_dsets and use_id_gu;
         const reuse_down_id_dset = reuse_id_dsets and use_id_dn;
         const reuse_accum_dset = reuse_id_dsets and (use_id_gu or use_id_dn);
-        const reuse_cmd = std.c.getenv("LLMTOY_EXPERT_REUSE_CMD") != null and use_id_gu;
+        const reuse_cmd = std.c.getenv("LLMTOY_EXPERT_REUSE_CMD") != null and use_id_gu and use_id_dn;
 
         for (top_idx) |eidx| {
             if (!use_id_gu) {
@@ -1976,7 +1977,7 @@ pub const GpuWeights = struct {
             else
                 ed_sessions[layer * self.n_experts + top_idx[0]].?.cols;
             const mid_q8_1_bytes = mv_mod.q8_1OutBytes(d_expert);
-            if (use_id_gu) {
+            if (use_id_gu and use_id_dn) {
                 const p_quant_dn = self.ctx.profileBegin(cmd, "moe.quantize_mid");
                 if (reuse_quant_mid_batched_dset) {
                     if (self.expert_quant_mid_batched_dset == null)
@@ -1986,6 +1987,12 @@ pub const GpuWeights = struct {
                     quant_mid_id_dset = try self.pl_quantize_q8_1_batched.record(cmd, all_out_buf, mid_q8_1_flat_buf, d_expert, @intCast(n));
                 }
                 self.ctx.profileEnd(cmd, p_quant_dn);
+            } else if (use_id_gu) {
+                for (0..n) |k| {
+                    const p_quant_dn = self.ctx.profileBegin(cmd, "moe.quantize_mid");
+                    quant_dn_dsets[k] = try self.pl_quantize_q8_1.recordRangeToOffset(cmd, all_out_buf, k * d_expert * @sizeOf(f32), d_expert * @sizeOf(f32), &mid_q8_1_bufs.?[k], 0, mid_q8_1_bytes, d_expert);
+                    self.ctx.profileEnd(cmd, p_quant_dn);
+                }
             } else {
                 for (0..n) |k| {
                     const p_quant_dn = self.ctx.profileBegin(cmd, "moe.quantize_mid");
@@ -2075,7 +2082,7 @@ pub const GpuWeights = struct {
                 _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_dn_used.desc_pool, 1, ds);
         }
         if (use_q8_1_dn) {
-            if (reuse_quant_mid_batched_dset and use_id_gu) {
+            if (reuse_quant_mid_batched_dset and use_id_gu and use_id_dn) {
                 // Persistent descriptor set is owned by GpuWeights.
             } else if (quant_mid_id_dset) |*ds| {
                 _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1_batched.desc_pool, 1, ds);

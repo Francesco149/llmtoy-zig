@@ -889,28 +889,24 @@ systemd-run --user --scope -p MemoryMax=40G --quiet -- \
     `mul_mat_vecq.comp`, or until a production-like integration proves that
     lower host overhead outweighs the slightly slower GPU phase without adding
     a duplicate flat gate/up upload.
-  - `LLMTOY_EXPERT_GU_ID=1` enables an opt-in production-like route: flat
-    gate/up upload per layer, no per-expert gate/up duplicate for those layers,
-    one gate/up-ID dispatch, then flat-mid Q8_1 quantization for down-ID. It is
-    correct for `compare --gpu-layers 0:0`. After adding batched flat-mid
-    Q8_1 quantization, layer 0 `bench-moe` improved to about 561 us/iter wall
-    and 94 us/iter GPU phases, but it stays experimental because gate/up-ID is
-    still slower than the current per-expert gate/up GPU phase.
-  - `LLMTOY_EXPERT_REUSE_DSETS=1` is a follow-up experiment for the opt-in
+  - Flat gate/up-ID is now the default for supported Q3_K expert gate/up
+    layers. Set `LLMTOY_EXPERT_GU_ID=0` to force the older per-expert gate/up
+    route. The mixed path for layers with non-ID down projections now quantizes
+    flat f32 mids back into per-expert Q8_1 mid buffers before dispatching the
+    normal down shaders; this fixed the previous layer-1/Q5_0 correctness
+    failure. Full `compare ... "explain MoE" --chat` passes with default
+    gate/up-ID and with the descriptor/command reuse experiments enabled.
+  - `LLMTOY_EXPERT_REUSE_DSETS=1` is a follow-up experiment for the flattened
     expert-ID route. It reuses stable descriptor sets for the flattened
     four-dispatch MoE sequence. Layer 0 improved again to about 502 us/iter
     wall with the same ~88 us GPU phase time; layer 10 measured about
     549 us/iter wall with ~99 us GPU phases. This confirms descriptor churn
     matters once the route is flattened, but command-buffer allocation,
-    submit/wait, and final readback remain the larger gap. Layer-slice compare
-    passes for layers 0 and 10, but cumulative all-layer compare is not yet a
-    promotion gate for the gate/up-ID experiment.
+    submit/wait, and final readback remain the larger gap.
   - `LLMTOY_EXPERT_REUSE_CMD=1` is a narrower command-buffer reuse probe for
-    the same expert-ID route. It caches one command buffer per layer and
-    resets/re-records it each iteration. Layer 0 did not improve: profiled
-    descriptor reuse alone measured about 505 us/iter wall, while descriptor
-    plus command reuse measured about 530 us/iter with unchanged ~88 us GPU
-    phase time; no-profiler 32-iteration checks were both about 602 us/iter.
+    fully persistent expert-ID layers. It is intentionally disabled for mixed
+    ID-GU/non-ID-down layers because those still use temporary descriptor sets,
+    and reusable command buffers keep descriptor references alive until reset.
     Treat command-buffer allocation/free as a low-priority issue unless future
     profiling isolates pre-recorded graphs, fence rings, queue wait, or readback.
   - `bench-moe --skip-readback` is a diagnostic, not a correct forward path.

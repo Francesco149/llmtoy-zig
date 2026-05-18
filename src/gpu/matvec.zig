@@ -3182,6 +3182,172 @@ test "gpu expert-id gate-up Q3_K x Q8_1 correctness" {
     }
 }
 
+test "gpu expert-id gate-up Q3_K x Q8_1 fuzz" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    const al = std.testing.allocator;
+    const n_experts: usize = 128;
+    const active: usize = 8;
+    const rows: usize = 4;
+    const cols: usize = 2816;
+    const row_bytes = math_mod.rowBytes(.q3_k, cols);
+    const one_mat_bytes = rows * row_bytes;
+    const flat_bytes = n_experts * 2 * one_mat_bytes;
+
+    var prng = std.Random.DefaultPrng.init(0xE1D5_0002);
+    const r = prng.random();
+
+    const mat = try al.alloc(u8, flat_bytes);
+    defer al.free(mat);
+    for (mat) |*b| b.* = r.int(u8);
+    const small_d_le: [2]u8 = .{ 0xCD, 0x21 };
+    for (0..n_experts * 2 * rows) |i| {
+        const off = i * row_bytes;
+        mat[off + 108] = small_d_le[0];
+        mat[off + 109] = small_d_le[1];
+    }
+
+    const vec = try al.alloc(f32, cols);
+    defer al.free(vec);
+    for (vec) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+
+    const q8_1_basic = try al.alloc(u8, (cols / 32) * dq.Q8_1_BLOCK_BYTES);
+    defer al.free(q8_1_basic);
+    dq.quantizeQ8_1(vec, q8_1_basic);
+
+    const vec_q8_rounded = try al.alloc(f32, cols);
+    defer al.free(vec_q8_rounded);
+    dq.dequantQ8_1(q8_1_basic, vec_q8_rounded);
+
+    const q8_1_x4 = try al.alloc(u8, q8_1_basic.len);
+    defer al.free(q8_1_x4);
+    dq.packQ8_1_x4(q8_1_basic, q8_1_x4);
+
+    const ids = [_]u32{ 122, 53, 51, 119, 79, 0, 102, 73 };
+    const cpu_out = try al.alloc(f32, active * rows);
+    defer al.free(cpu_out);
+    const gate_tmp = try al.alloc(f32, rows);
+    defer al.free(gate_tmp);
+    const up_tmp = try al.alloc(f32, rows);
+    defer al.free(up_tmp);
+    const row_buf = try al.alloc(f32, cols);
+    defer al.free(row_buf);
+    for (ids, 0..) |expert_id, slot| {
+        const e: usize = @intCast(expert_id);
+        const expert_base = e * 2 * one_mat_bytes;
+        const gate_mat = mat[expert_base..][0..one_mat_bytes];
+        const up_mat = mat[expert_base + one_mat_bytes ..][0..one_mat_bytes];
+        math_mod.quantMatvec(gate_tmp, gate_mat, .q3_k, vec_q8_rounded, rows, cols, row_buf);
+        math_mod.quantMatvec(up_tmp, up_mat, .q3_k, vec_q8_rounded, rows, cols, row_buf);
+        for (0..rows) |row| {
+            cpu_out[slot * rows + row] = math_mod.gelu(gate_tmp[row]) * up_tmp[row];
+        }
+    }
+
+    var pipeline = try ExpertGateUpIdPipeline.initQ3KQ8_1(&gpu);
+    defer pipeline.deinit();
+
+    var weights_buf = try GpuBuffer.initHostCoherent(&gpu, flat_bytes, @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer weights_buf.deinit();
+    try weights_buf.upload(mat);
+
+    var acts_buf = try GpuBuffer.initHostCoherent(&gpu, q8_1_x4.len, @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer acts_buf.deinit();
+    try acts_buf.upload(q8_1_x4);
+
+    var ids_buf = try GpuBuffer.initHostCoherent(&gpu, ids.len * @sizeOf(u32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer ids_buf.deinit();
+    try ids_buf.upload(std.mem.sliceAsBytes(&ids));
+
+    var out_buf = try GpuBuffer.initHostCoherent(&gpu, active * rows * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer out_buf.deinit();
+
+    const cmd = try gpu.beginBatch();
+    var ds = try pipeline.record(cmd, &weights_buf, &acts_buf, &ids_buf, &out_buf, @intCast(rows), @intCast(cols), @intCast(active));
+    try gpu.submitBatch(cmd);
+    _ = vk.vkFreeDescriptorSets(gpu.device, pipeline.desc_pool, 1, &ds);
+
+    const gpu_out = try al.alloc(f32, active * rows);
+    defer al.free(gpu_out);
+    try out_buf.download(std.mem.sliceAsBytes(gpu_out));
+
+    var max_abs: f32 = 0.0;
+    var max_ref: f32 = 0.0;
+    for (cpu_out, gpu_out) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs) max_abs = d;
+        if (@abs(c) > max_ref) max_ref = @abs(c);
+    }
+    const rel = max_abs / (max_ref + 1e-6);
+    std.debug.print("expert-id Q3_K×Q8_1 GU fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs, rel });
+    try std.testing.expect(rel < 1e-4);
+}
+
+test "gpu quantize Q8_1 batched round-trip" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    const al = std.testing.allocator;
+    const ncols: usize = 704;
+    const active: usize = 8;
+    const in_len = active * ncols;
+    const out_slot_bytes = q8_1OutBytes(@intCast(ncols));
+    const out_len = active * out_slot_bytes;
+
+    var prng = std.Random.DefaultPrng.init(0xE1D5_0003);
+    const r = prng.random();
+    const input = try al.alloc(f32, in_len);
+    defer al.free(input);
+    for (input) |*v| v.* = (r.float(f32) - 0.5) * 12.0;
+
+    var pl_batched = try QuantizeQ8_1BatchedPipeline.init(&gpu);
+    defer pl_batched.deinit();
+
+    var in_buf = try GpuBuffer.initHostCoherent(&gpu, input.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer in_buf.deinit();
+    try in_buf.upload(std.mem.sliceAsBytes(input));
+
+    var batched_out = try GpuBuffer.initHostCoherent(&gpu, out_len, @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer batched_out.deinit();
+
+    {
+        const cmd = try gpu.beginBatch();
+        var batched_set = try pl_batched.record(cmd, &in_buf, &batched_out, @intCast(ncols), @intCast(active));
+        try gpu.submitBatch(cmd);
+        _ = vk.vkFreeDescriptorSets(gpu.device, pl_batched.desc_pool, 1, &batched_set);
+    }
+
+    const batched_bytes = try al.alloc(u8, out_len);
+    defer al.free(batched_bytes);
+    try batched_out.download(batched_bytes);
+
+    const basic = try al.alloc(u8, out_slot_bytes);
+    defer al.free(basic);
+    const deq = try al.alloc(f32, ncols);
+    defer al.free(deq);
+    for (0..active) |slot| {
+        dq.unpackQ8_1_x4(batched_bytes[slot * out_slot_bytes ..][0..out_slot_bytes], basic);
+        dq.dequantQ8_1(basic[0 .. (ncols / 32) * dq.Q8_1_BLOCK_BYTES], deq);
+        var max_abs: f32 = 0.0;
+        var amax: f32 = 0.0;
+        for (input[slot * ncols ..][0..ncols], deq) |c, g| {
+            const d = @abs(c - g);
+            if (d > max_abs) max_abs = d;
+            if (@abs(c) > amax) amax = @abs(c);
+        }
+        try std.testing.expect(max_abs <= amax / 120.0 + 1e-5);
+    }
+}
+
 test "gpu expert accum correctness" {
     // n=2 experts, d_model=4.
     // inputs = [[1,2,3,4],[5,6,7,8]], scales = [2.0, 3.0].
