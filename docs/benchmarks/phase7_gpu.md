@@ -4,6 +4,43 @@ Model: Gemma 4 26B A4B (APEX-I-Mini, GGUF)
 Hardware: Ryzen 5900x, 64 GB RAM, AMD RX 7800 XT (16 GB VRAM)
 Prompt: "What is 2+2?" (chat template, --seed 42)
 
+## Phase 7m profile snapshot - sorted timestamp table
+
+Command:
+
+```sh
+LLMTOY_GPU_PROFILE=1 systemd-run --user --scope -p MemoryMax=40G --quiet -- \
+  nix develop --command ./zig-out/bin/llmtoy generate \
+  /opt/ai-lab/models/mudler/gemma-4-26B-A4B-it-APEX-GGUF/gemma-4-26B-A4B-APEX-I-Mini.gguf \
+  "Briefly explain the full forward pass of a MoE model" \
+  --chat --temperature 0 --max-tokens 8 --gpu
+```
+
+Result after the all-layer MoE VRAM tail path:
+
+- setup: 4.7 s after warm filesystem cache
+- prefill: 25 tokens in 1.23 s, 20.3 tok/s
+- generation: 8 tokens in 0.39 s, 20.4 tok/s
+
+Top timestamped GPU totals across 33 forwarded tokens:
+
+| Label | Count | Total ms | Avg us | Share |
+|-------|------:|---------:|-------:|------:|
+| `matvec_q8_1.single.262144x2816` | 33 | 55.84 | 1692.24 | 10.6% |
+| `moe.fused_gate_up` | 990 | 54.27 | 54.82 | 10.3% |
+| `attention.qk_softmax` | 990 | 42.52 | 42.95 | 8.1% |
+| `moe.down` | 5379 | 33.23 | 6.18 | 6.3% |
+| `attn_front.rmsnorm` | 990 | 25.97 | 26.24 | 4.9% |
+| `dense_ffn.rmsnorm` | 990 | 25.69 | 25.95 | 4.9% |
+| `ffn_moe.post_norm` | 990 | 25.69 | 25.95 | 4.9% |
+| `attn_front.wq` | 990 | 23.37 | 23.61 | 4.4% |
+
+The formerly generic dense FFN down label is now split by layer and shape.
+Layer 0 (`2816x2112`) averages about 85 us; layers 1-29 with the same shape
+average about 103 us. There is no single outlier layer to chase, so the next
+production targets should remain `lm_head`, flattened MoE gate/up, attention
+QK, or a broader Q5_0 dense-down kernel improvement.
+
 ## GPU upload
 
 - Weights uploaded: attention + dense FFN only (MoE experts stay on CPU)

@@ -1696,7 +1696,7 @@ pub const GpuWeights = struct {
         self.ctx.profileEnd(cmd, p_gelu);
         GpuCtx.recordShaderBarrier(cmd);
 
-        const p_down = self.ctx.profileBegin(cmd, "dense_ffn.down");
+        const p_down = self.ctx.profileBeginFmt(cmd, "dense_ffn.down.L{d:0>2}.{d}x{d}", .{ layer, w_down.rows, w_down.cols });
         const down_dset = try down_pl.record(cmd, &w_down.mat_buf, gate_buf, ffn_buf, w_down.rows, w_down.cols);
         self.ctx.profileEnd(cmd, p_down);
         GpuCtx.recordShaderBarrier(cmd);

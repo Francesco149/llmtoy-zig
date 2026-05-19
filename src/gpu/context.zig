@@ -184,10 +184,19 @@ pub const GpuProfiler = struct {
         var total_ns: u64 = 0;
         for (self.aggregates[0..self.aggregate_count]) |agg| total_ns += agg.total_ns;
 
+        var order: [max_profile_labels]u32 = undefined;
+        for (order[0..self.aggregate_count], 0..) |*idx, i| idx.* = @intCast(i);
+        std.mem.sort(u32, order[0..self.aggregate_count], self, struct {
+            fn lessThan(prof: *const GpuProfiler, lhs: u32, rhs: u32) bool {
+                return prof.aggregates[lhs].total_ns > prof.aggregates[rhs].total_ns;
+            }
+        }.lessThan);
+
         std.debug.print("\nGPU profile (timestamp queries):\n", .{});
         std.debug.print("{s: <36} {s: >8} {s: >12} {s: >10} {s: >10} {s: >10} {s: >7}\n", .{ "label", "count", "total ms", "avg us", "min us", "max us", "%" });
 
-        for (self.aggregates[0..self.aggregate_count]) |agg| {
+        for (order[0..self.aggregate_count]) |agg_idx| {
+            const agg = self.aggregates[agg_idx];
             const total_ms = @as(f64, @floatFromInt(agg.total_ns)) / 1_000_000.0;
             const avg_us = @as(f64, @floatFromInt(agg.total_ns)) /
                 @as(f64, @floatFromInt(agg.count)) / 1_000.0;
@@ -494,6 +503,20 @@ pub const GpuContext = struct {
 
     pub fn profileBegin(self: *const GpuContext, cmd: vk.VkCommandBuffer, label: []const u8) u32 {
         if (self.profiler) |p| return p.begin(cmd, label);
+        return std.math.maxInt(u32);
+    }
+
+    pub fn profileBeginFmt(
+        self: *const GpuContext,
+        cmd: vk.VkCommandBuffer,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) u32 {
+        if (self.profiler) |p| {
+            var buf: [profile_label_len]u8 = undefined;
+            const label = std.fmt.bufPrint(&buf, fmt, args) catch "profile.label_truncated";
+            return p.begin(cmd, label);
+        }
         return std.math.maxInt(u32);
     }
 
