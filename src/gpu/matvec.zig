@@ -2570,6 +2570,91 @@ pub const AttnAvPipeline = struct {
     }
 };
 
+pub const AttnFusedSmallPipeline = struct {
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !AttnFusedSmallPipeline {
+        comptime std.debug.assert(shaders.attn_fused_small.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.attn_fused_small, 4, @sizeOf(AttnQkSoftmaxPushConst), 32);
+        return .{
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn record(
+        self: *const AttnFusedSmallPipeline,
+        cmd: vk.VkCommandBuffer,
+        q_buf: *const GpuBuffer,
+        k_buf: *const GpuBuffer,
+        v_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+        n_heads: u32,
+        seq: u32,
+        win_len: u32,
+        head_dim: u32,
+        n_kv_heads: u32,
+        n_q_per_kv: u32,
+        cap: u32,
+        scale: f32,
+    ) !vk.VkDescriptorSet {
+        const dev = self.device;
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [4]vk.VkDescriptorBufferInfo{
+            .{ .buffer = q_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = k_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = v_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = out_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [4]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+            mkWrite(dset, 2, &buf_infos[2]),
+            mkWrite(dset, 3, &buf_infos[3]),
+        };
+        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
+        const pc = AttnQkSoftmaxPushConst{
+            .seq = seq,
+            .win_len = win_len,
+            .head_dim = head_dim,
+            .n_kv_heads = n_kv_heads,
+            .n_q_per_kv = n_q_per_kv,
+            .cap = cap,
+            .scale = scale,
+        };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(AttnQkSoftmaxPushConst), &pc);
+        vk.vkCmdDispatch(cmd, n_heads, 1, 1);
+        return dset;
+    }
+
+    pub fn deinit(self: *AttnFusedSmallPipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
 // ── convenience functions ─────────────────────────────────────────────────────
 
 // One-shot fp32 matvec: upload matrix to VRAM, run, download result.
@@ -4533,6 +4618,8 @@ fn fuzzAttn(
     defer pl_qk.deinit();
     var pl_av = try AttnAvPipeline.init(&gpu);
     defer pl_av.deinit();
+    var pl_fused = try AttnFusedSmallPipeline.init(&gpu);
+    defer pl_fused.deinit();
 
     const al = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(seed);
@@ -4557,6 +4644,8 @@ fn fuzzAttn(
     defer al.free(out_cpu);
     const out_gpu = try al.alloc(f32, out_len);
     defer al.free(out_gpu);
+    const out_fused = try al.alloc(f32, out_len);
+    defer al.free(out_fused);
 
     for (q) |*x| x.* = (r.float(f32) - 0.5) * 2.0;
     for (k) |*x| x.* = (r.float(f32) - 0.5) * 2.0;
@@ -4581,6 +4670,8 @@ fn fuzzAttn(
     defer sc_buf.deinit();
     var o_buf = try GpuBuffer.initHostCoherent(&gpu, out_len * @sizeOf(f32), usage);
     defer o_buf.deinit();
+    var fused_o_buf = try GpuBuffer.initHostCoherent(&gpu, out_len * @sizeOf(f32), usage);
+    defer fused_o_buf.deinit();
 
     try q_buf.upload(std.mem.sliceAsBytes(q));
     try k_buf.upload(std.mem.sliceAsBytes(k));
@@ -4594,6 +4685,11 @@ fn fuzzAttn(
 
     try sc_buf.download(std.mem.sliceAsBytes(sc_gpu));
     try o_buf.download(std.mem.sliceAsBytes(out_gpu));
+
+    const fused_cmd = try gpu.beginBatch();
+    _ = try pl_fused.record(fused_cmd, &q_buf, &k_buf, &v_buf, &fused_o_buf, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
+    try gpu.submitBatch(fused_cmd);
+    try fused_o_buf.download(std.mem.sliceAsBytes(out_fused));
 
     var sc_max: f32 = 0;
     var sc_ref: f32 = 0;
@@ -4609,11 +4705,20 @@ fn fuzzAttn(
         if (d > ov_max) ov_max = d;
         if (@abs(c) > ov_ref) ov_ref = @abs(c);
     }
+    var fused_max: f32 = 0;
+    var fused_ref: f32 = 0;
+    for (out_cpu, out_fused) |c, g| {
+        const d = @abs(c - g);
+        if (d > fused_max) fused_max = d;
+        if (@abs(c) > fused_ref) fused_ref = @abs(c);
+    }
     const sc_rel = sc_max / (sc_ref + 1e-6);
     const ov_rel = ov_max / (ov_ref + 1e-6);
-    std.debug.print("attn fuzz nh={} nkv={} hd={} win={} scores rel={e:.3} out rel={e:.3}\n", .{ n_heads, n_kv_heads, head_dim, win_len, sc_rel, ov_rel });
+    const fused_rel = fused_max / (fused_ref + 1e-6);
+    std.debug.print("attn fuzz nh={} nkv={} hd={} win={} scores rel={e:.3} out rel={e:.3} fused rel={e:.3}\n", .{ n_heads, n_kv_heads, head_dim, win_len, sc_rel, ov_rel, fused_rel });
     try std.testing.expect(sc_rel < 1e-4);
     try std.testing.expect(ov_rel < 1e-4);
+    try std.testing.expect(fused_rel < 1e-4);
 }
 
 test "gpu attn fuzz SWA shape n_heads=16 n_kv=4 hd=256 win=1" {

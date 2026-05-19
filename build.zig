@@ -85,6 +85,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(attn_qk_spv, "attn_qk_softmax.spv");
     const attn_av_spv = compileShader(b, "src/gpu/shaders/attn_av.glsl");
     _ = wf.addCopyFile(attn_av_spv, "attn_av.spv");
+    const attn_fused_small_spv = compileShader(b, "src/gpu/shaders/attn_fused_small.glsl");
+    _ = wf.addCopyFile(attn_fused_small_spv, "attn_fused_small.spv");
     // align(4): VkShaderModuleCreateInfo.pCode requires 4-byte aligned SPIR-V data.
     // Declaring the embedded file with align(4) makes &matvec_f32 satisfy that
     // requirement without a runtime allocation or copy.
@@ -126,6 +128,7 @@ pub fn build(b: *std.Build) void {
         \\pub const rope_neox_theta     align(4) = @embedFile("rope_neox_theta.spv").*;
         \\pub const attn_qk_softmax     align(4) = @embedFile("attn_qk_softmax.spv").*;
         \\pub const attn_av             align(4) = @embedFile("attn_av.spv").*;
+        \\pub const attn_fused_small    align(4) = @embedFile("attn_fused_small.spv").*;
     );
     const shaders_mod = b.createModule(.{ .root_source_file = shaders_src });
 

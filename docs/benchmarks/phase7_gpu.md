@@ -41,6 +41,32 @@ average about 103 us. There is no single outlier layer to chase, so the next
 production targets should remain `lm_head`, flattened MoE gate/up, attention
 QK, or a broader Q5_0 dense-down kernel improvement.
 
+## Phase 7 attention fused-small probe
+
+Added a production-routed fused attention shader for `win_len <= 1024`, with
+`LLMTOY_ATTENTION_FUSED_SMALL=0` as a fallback switch. It combines the previous
+`attention.qk_softmax` and `attention.av` dispatches by keeping softmax scores
+in shared memory and writing the final attention output directly.
+
+Focused profile on the same 33-token short run:
+
+| Path | Count | Total ms | Avg us |
+|------|------:|---------:|-------:|
+| two-pass `attention.qk_softmax` + `attention.av` | 990 + 990 | 42.44 + 10.07 = 52.51 | 53.04 combined |
+| fused `attention.fused_small` | 990 | 51.14 | 51.66 |
+
+This is only a small attention-kernel win, and too small to move short
+end-to-end tok/s through noise, but it is structurally closer to the
+llama.cpp `FLASH_ATTN_EXT` direction and removes the intermediate global
+scores buffer for decode/SWA-sized windows.
+
+Verification:
+
+- `nix develop --command zig build test`
+- `llmtoy compare ... "explain MoE" --chat`: all layer argmaxes and final
+  argmax match
+- deterministic GPU generate `what is 1+1?`: produced `The answer is **2**.`
+
 ## GPU upload
 
 - Weights uploaded: attention + dense FFN only (MoE experts stay on CPU)

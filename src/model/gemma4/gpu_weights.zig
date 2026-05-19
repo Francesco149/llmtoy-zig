@@ -34,6 +34,7 @@ const RopeNeoxTablePipeline = mv_mod.RopeNeoxTablePipeline;
 const RopeNeoxThetaPipeline = mv_mod.RopeNeoxThetaPipeline;
 const AttnQkSoftmaxPipeline = mv_mod.AttnQkSoftmaxPipeline;
 const AttnAvPipeline = mv_mod.AttnAvPipeline;
+const AttnFusedSmallPipeline = mv_mod.AttnFusedSmallPipeline;
 const wt_ = @import("weights.zig");
 const Gemma4Weights = wt_.Gemma4Weights;
 const Gemma4LayerWeights = wt_.Gemma4LayerWeights;
@@ -115,6 +116,7 @@ pub const GpuWeights = struct {
     pl_rope_theta: RopeNeoxThetaPipeline,
     pl_attn_qk: AttnQkSoftmaxPipeline,
     pl_attn_av: AttnAvPipeline,
+    pl_attn_fused_small: AttnFusedSmallPipeline,
     layers: []GpuLayerWeights,
     lm_head: ?MatvecSession,
     // Shared host-coherent I/O buffers sized to the largest matrix across all
@@ -320,6 +322,8 @@ pub const GpuWeights = struct {
         errdefer pl_attn_qk.deinit();
         var pl_attn_av = try AttnAvPipeline.init(&ctx);
         errdefer pl_attn_av.deinit();
+        var pl_attn_fused_small = try AttnFusedSmallPipeline.init(&ctx);
+        errdefer pl_attn_fused_small.deinit();
         std.debug.print("  init: pl_rmsnorm + elem + rope ok\n", .{});
 
         const layers = try allocator.alloc(GpuLayerWeights, g4cfg.n_layers);
@@ -375,6 +379,7 @@ pub const GpuWeights = struct {
             .pl_rope_theta = pl_rope_theta,
             .pl_attn_qk = pl_attn_qk,
             .pl_attn_av = pl_attn_av,
+            .pl_attn_fused_small = pl_attn_fused_small,
             .layers = layers,
             .lm_head = null,
             .shared_vec = null,
@@ -903,6 +908,7 @@ pub const GpuWeights = struct {
         self.pl_q5_0.deinit();
         self.pl_q5_1.deinit();
         self.pl_attn_av.deinit();
+        self.pl_attn_fused_small.deinit();
         self.pl_attn_qk.deinit();
         self.pl_rope_theta.deinit();
         self.pl_rope_table.deinit();
@@ -1341,20 +1347,35 @@ pub const GpuWeights = struct {
 
         const seq = pos + 1;
         const n_q_per_kv = n_heads / n_kv_heads;
+        const fused_small_enabled = if (std.c.getenv("LLMTOY_ATTENTION_FUSED_SMALL")) |raw|
+            !std.mem.eql(u8, std.mem.span(raw), "0")
+        else
+            true;
+        const use_fused_small = fused_small_enabled and win_len <= 1024;
 
         const cmd = try self.ctx.beginBatch();
-        const p_qk = self.ctx.profileBegin(cmd, "attention.qk_softmax");
-        const qk_dset = try self.pl_attn_qk.record(cmd, q_buf, k_cache, scores_buf, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
-        self.ctx.profileEnd(cmd, p_qk);
-        GpuCtx.recordShaderBarrier(cmd);
-        const p_av = self.ctx.profileBegin(cmd, "attention.av");
-        const av_dset = try self.pl_attn_av.record(cmd, scores_buf, v_cache, attn_buf, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap);
-        self.ctx.profileEnd(cmd, p_av);
+        var qk_dset: ?vk.VkDescriptorSet = null;
+        var av_dset: ?vk.VkDescriptorSet = null;
+        var fused_dset: ?vk.VkDescriptorSet = null;
+        if (use_fused_small) {
+            const p_fused = self.ctx.profileBegin(cmd, "attention.fused_small");
+            fused_dset = try self.pl_attn_fused_small.record(cmd, q_buf, k_cache, v_cache, attn_buf, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
+            self.ctx.profileEnd(cmd, p_fused);
+        } else {
+            const p_qk = self.ctx.profileBegin(cmd, "attention.qk_softmax");
+            qk_dset = try self.pl_attn_qk.record(cmd, q_buf, k_cache, scores_buf, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
+            self.ctx.profileEnd(cmd, p_qk);
+            GpuCtx.recordShaderBarrier(cmd);
+            const p_av = self.ctx.profileBegin(cmd, "attention.av");
+            av_dset = try self.pl_attn_av.record(cmd, scores_buf, v_cache, attn_buf, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap);
+            self.ctx.profileEnd(cmd, p_av);
+        }
         try self.ctx.submitBatch(cmd);
 
         const dev = self.ctx.device;
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_attn_qk.desc_pool, 1, &qk_dset);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_attn_av.desc_pool, 1, &av_dset);
+        if (fused_dset) |*ds| _ = vk.vkFreeDescriptorSets(dev, self.pl_attn_fused_small.desc_pool, 1, ds);
+        if (qk_dset) |*ds| _ = vk.vkFreeDescriptorSets(dev, self.pl_attn_qk.desc_pool, 1, ds);
+        if (av_dset) |*ds| _ = vk.vkFreeDescriptorSets(dev, self.pl_attn_av.desc_pool, 1, ds);
 
         if (attn_out) |o| {
             try attn_buf.download(std.mem.sliceAsBytes(o));
