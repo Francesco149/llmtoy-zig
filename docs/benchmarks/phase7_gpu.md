@@ -105,6 +105,47 @@ RMSNorm dispatches) beats orchestration cleanup (fewer barriers, fewer
 submits) by an order of magnitude at this point. Submit-fusion has at most
 ~1.3 ms/token (7%) left to give back.
 
+## Phase 7r-attempt — Async submit (reverted)
+
+After the gap measurement showed only 7.3% in-batch idle but ~33 ms/token of
+host-side overhead (50 ms wall - ~17 ms GPU), I tried replacing
+`vkQueueWaitIdle` in `submitBatchCopy` with `vkWaitForFences` deferred to the
+next submit (one-deep async). This would overlap CPU recording of batch N+1
+with GPU execution of batch N.
+
+The change required two pieces of infrastructure:
+1. `pending_fence` + `pending_cmd` on `GpuContext`, plus a `flushPendingSubmit`
+   method that callers automatically hit on buffer access / next submit.
+2. A way for `GpuBuffer.upload/download/mapSlice` to call `flushPendingSubmit`
+   so host-coherent reads/writes don't race with in-flight GPU work.
+
+Two bugs killed this:
+
+1. **Dangling context pointer**: `GpuWeights.init` constructs the GpuContext
+   as a local `var ctx` and then copies it into the returned struct. The
+   buffer's stored `*GpuContext` pointed at the dead stack slot, not the
+   in-struct copy. Fix needs either heap-allocating GpuContext or threading a
+   stable pointer through later. The `generate` command happened to "work"
+   because the dead stack frame wasn't overwritten before its buffers were
+   used, but `compare` (which runs CPU forward first) corrupted it.
+
+2. **Descriptor-set frees race with in-flight GPU work**: every `runLayer*`
+   function in `gpu_weights.zig` calls `vkFreeDescriptorSets` *immediately*
+   after `submitBatch` returns. With sync submit that's safe (GPU is done);
+   with deferred-wait submit the GPU may still be reading the descriptor sets,
+   which is undefined behavior. Compare deadlocked on this. Real fix requires
+   per-batch deferred-free lists so descriptor sets are freed only after the
+   batch's fence signals.
+
+Both fixes are real refactors (heap-allocate GpuContext or pass it stably;
+deferred-free queues in every runLayer\*). Reverted to keep the tree clean.
+The gap-measurement profiler addition (commit `5adac7e`) stays — it's still
+the right signal to drive future decisions.
+
+**Lesson for next attempt**: async submit needs (a) stable pointer for
+GpuContext, and (b) descriptor pools or per-submit free lists. Don't start the
+async refactor without those two prerequisites.
+
 ## GPU upload
 
 - Weights uploaded: attention + dense FFN only (MoE experts stay on CPU)
