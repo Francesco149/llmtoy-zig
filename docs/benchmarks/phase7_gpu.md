@@ -67,6 +67,44 @@ Verification:
   argmax match
 - deterministic GPU generate `what is 1+1?`: produced `The answer is **2**.`
 
+## Phase 7m — Inter-dispatch gap measurement
+
+Extended `GpuProfiler.collectBatch` to compute the GPU-side idle gap between
+every consecutive event pair within a batch (gap = next.start_ts -
+cur.end_ts). Also accumulates total batch span (first start → last end). The
+print summary now shows total dispatch ms, total gap ms (= GPU idle between
+profiled spans), and the gap percentage of batch span.
+
+This was added to disambiguate "shader compute is the bottleneck" from
+"orchestration/dispatch overhead is the bottleneck" without rewriting any
+kernels first.
+
+Result on the standard 33-token `Briefly explain the full forward pass of a
+MoE model` run with `LLMTOY_GPU_PROFILE=1 --gpu`:
+
+```
+GPU batches=4983  dispatch=525.799 ms  gap=41.624 ms (37521 gaps, avg 1.11 us, 7.3% of batch span)  span=567.423 ms
+```
+
+- 4983 batches across 33 forwarded tokens = 151 batches/token.
+- Per token: ~15.9 ms dispatched GPU compute, only ~1.26 ms inter-dispatch idle.
+- Average gap between profiled dispatches is **1.11 us** and aggregate idle is
+  only **7.3%** of batch span.
+
+Interpretation: the GPU is busy 92.7% of the time inside batches. The
+microbench vs production divergence for `dense_ffn.down` (~13 us isolated
+vs ~103 us in production) is real shader compute under cache contention from
+neighboring work, not dispatch/orchestration latency or pipeline-drain
+artifacts in the profiler. The 16-26 us floor seen on RMSNorm dispatches is
+also real (single-workgroup serial reductions have a hard latency floor on
+RDNA3), not idle time waiting between dispatches.
+
+Implication for the optimization queue: kernel quality (faster individual
+shaders such as FLASH_ATTN_EXT-style attention, MMVQ-shape Q5_0/Q5_1, smaller
+RMSNorm dispatches) beats orchestration cleanup (fewer barriers, fewer
+submits) by an order of magnitude at this point. Submit-fusion has at most
+~1.3 ms/token (7%) left to give back.
+
 ## GPU upload
 
 - Weights uploaded: attention + dense FFN only (MoE experts stay on CPU)

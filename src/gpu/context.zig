@@ -38,6 +38,15 @@ pub const GpuProfiler = struct {
     aggregates: [max_profile_labels]ProfileAggregate = undefined,
     aggregate_count: u32 = 0,
     dropped_events: u64 = 0,
+    // Cumulative across all collected batches. Gap = (next.start_ts -
+    // cur.end_ts) when positive, summed only within a batch (batch boundaries
+    // reset the timestamp pool). Tells us how much GPU time is spent idle
+    // between profiled dispatches — distinguishes shader-compute hotspots from
+    // dispatch/barrier-bound chains.
+    gap_total_ns: u64 = 0,
+    gap_count: u64 = 0,
+    span_total_ns: u64 = 0, // sum of (last_end - first_start) across batches
+    batch_count: u64 = 0,
 
     pub fn init(device: vk.VkDevice, timestamp_period: f32) !GpuProfiler {
         const ci = vk.VkQueryPoolCreateInfo{
@@ -120,6 +129,9 @@ pub const GpuProfiler = struct {
             return;
         }
 
+        var prev_end_ts: ?u64 = null;
+        var first_start_ts: ?u64 = null;
+        var last_end_ts: ?u64 = null;
         for (self.events[0..self.event_count]) |ev| {
             if (ev.end_query == std.math.maxInt(u32)) continue;
             const start = self.timestamps[ev.start_query];
@@ -129,6 +141,30 @@ pub const GpuProfiler = struct {
                 @as(f64, @floatCast(self.timestamp_period));
             const ns: u64 = @intFromFloat(ns_f);
             self.addAggregate(ev.label[0..ev.label_len], ns);
+
+            if (prev_end_ts) |pe| {
+                if (start > pe) {
+                    const gap_raw = start - pe;
+                    const gap_ns_f = @as(f64, @floatFromInt(gap_raw)) *
+                        @as(f64, @floatCast(self.timestamp_period));
+                    self.gap_total_ns += @intFromFloat(gap_ns_f);
+                    self.gap_count += 1;
+                }
+            }
+            prev_end_ts = end_ts;
+            if (first_start_ts == null) first_start_ts = start;
+            last_end_ts = end_ts;
+        }
+        if (first_start_ts) |fs| {
+            if (last_end_ts) |le| {
+                if (le > fs) {
+                    const span_raw = le - fs;
+                    const span_ns_f = @as(f64, @floatFromInt(span_raw)) *
+                        @as(f64, @floatCast(self.timestamp_period));
+                    self.span_total_ns += @intFromFloat(span_ns_f);
+                    self.batch_count += 1;
+                }
+            }
         }
     }
 
@@ -209,6 +245,22 @@ pub const GpuProfiler = struct {
 
         if (self.dropped_events != 0) {
             std.debug.print("GPU profile dropped events: {}\n", .{self.dropped_events});
+        }
+
+        if (self.batch_count != 0) {
+            const dispatch_ms = @as(f64, @floatFromInt(total_ns)) / 1_000_000.0;
+            const gap_ms = @as(f64, @floatFromInt(self.gap_total_ns)) / 1_000_000.0;
+            const span_ms = @as(f64, @floatFromInt(self.span_total_ns)) / 1_000_000.0;
+            const idle_pct = if (self.span_total_ns == 0) 0.0 else 100.0 *
+                @as(f64, @floatFromInt(self.gap_total_ns)) /
+                @as(f64, @floatFromInt(self.span_total_ns));
+            const avg_gap_us = if (self.gap_count == 0) 0.0 else
+                @as(f64, @floatFromInt(self.gap_total_ns)) /
+                @as(f64, @floatFromInt(self.gap_count)) / 1_000.0;
+            std.debug.print(
+                "\nGPU batches={d}  dispatch={d:.3} ms  gap={d:.3} ms ({d} gaps, avg {d:.2} us, {d:.1}% of batch span)  span={d:.3} ms\n",
+                .{ self.batch_count, dispatch_ms, gap_ms, self.gap_count, avg_gap_us, idle_pct, span_ms },
+            );
         }
     }
 };
