@@ -2138,6 +2138,8 @@ pub const GpuWeights = struct {
         x: []f32,
         dense_ffn: []const f32,
         layer_output_scale: f32,
+        x_buf_current: bool,
+        dense_buf_current: bool,
     ) !void {
         const lw = &self.layers[layer];
         const post_ffw_norm_2_buf = &(lw.post_ffw_norm_2_buf orelse return error.NotOnGpu);
@@ -2151,8 +2153,12 @@ pub const GpuWeights = struct {
         std.debug.assert(x.len == dense_ffn.len);
         std.debug.assert(x.len % 256 == 0);
 
-        try x_buf.upload(std.mem.sliceAsBytes(x));
-        try dense_buf.upload(std.mem.sliceAsBytes(dense_ffn));
+        if (!x_buf_current) {
+            try x_buf.upload(std.mem.sliceAsBytes(x));
+        }
+        if (!dense_buf_current) {
+            try dense_buf.upload(std.mem.sliceAsBytes(dense_ffn));
+        }
 
         const cmd = try self.ctx.beginBatch();
 

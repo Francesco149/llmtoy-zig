@@ -1338,6 +1338,23 @@ VRAM-tail integration:
   check measured prefill `21.06 tok/s` with the all-layer tail and layer-19
   precise RMSNorm, versus `17.94 tok/s` with `LLMTOY_MOE_VRAM_TAIL=0`.
 
+VRAM-tail upload cleanup:
+
+- The full post-attention+dense FFN path already leaves the post-attention
+  residual in `shared_vec` and the dense FFN output in `dense_ffn_out_buf`.
+  `runLayerMoeResidualOnGpu` now reuses those buffers instead of uploading the
+  same two 2816-float vectors again before the MoE residual tail. The fallback
+  path still uploads when a previous GPU path did not leave those buffers
+  current.
+- Correctness: `compare ... "explain MoE" --chat` passes all layer argmaxes
+  and final argmax.
+- Short unprofiled sanity run on the same prompt:
+  `generate ... "what is 1+1?" --chat --temperature 0 --max-tokens 16 --gpu`
+  measured prefill `21.88 tok/s`, generation `21.76 tok/s`.
+- The matching `LLMTOY_GPU_PROFILE=1` run measured prefill `20.74 tok/s`,
+  generation `20.81 tok/s`, with `5436` GPU batches, `544.445 ms` dispatch,
+  `44.934 ms` in-batch gap, and `589.379 ms` profiled batch span.
+
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
 Attempted fusing gate-gelu-up + w_down into a single submit (4 submits/layer):

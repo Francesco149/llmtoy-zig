@@ -330,13 +330,20 @@ pub fn forwardOne(
         const can_batch_ffn = !can_q8_1_ffn and gpu != null and glw != null and
             glw.?.w_gate != null and glw.?.w_up != null;
 
+        var x_current_in_gpu_shared_vec = false;
+        var dense_current_in_gpu_out_buf = false;
+
         if (can_full_fused) {
             const g = gpu.?;
             try g.runLayerAttnResidualDenseFfnQ8_1(l, cfg.eps, wo_q8_pl.?, gate_q8_pl.?, up_q8_pl.?, g.pipelineFor(lw.w_down.type_), x, attn_concat[0..nq_l], ffn_buf, use_gpu_attn);
             // x updated with post-attn residual; ffn_buf has post_ffw_norm_1.
+            x_current_in_gpu_shared_vec = true;
+            dense_current_in_gpu_out_buf = true;
         } else if (can_fused_dense) {
             const g = gpu.?;
             try g.runLayerDenseFfnQ8_1(l, cfg.eps, gate_q8_pl.?, up_q8_pl.?, g.pipelineFor(lw.w_down.type_), x, ffn_buf);
+            x_current_in_gpu_shared_vec = true;
+            dense_current_in_gpu_out_buf = true;
         } else {
             if (can_q8_1_ffn) {
                 try gpu.?.runLayerFfnGateUpQ8_1(l, cfg.eps, gate_q8_pl.?, up_q8_pl.?, x, gate_buf, up_buf);
@@ -387,7 +394,7 @@ pub fn forwardOne(
 
         if (expert_gpu_ok) |_| {
             if (use_moe_vram_tail) {
-                try gpu.?.runLayerMoeResidualOnGpu(l, cfg.eps, x, ffn_buf, lw.layer_output_scale);
+                try gpu.?.runLayerMoeResidualOnGpu(l, cfg.eps, x, ffn_buf, lw.layer_output_scale, x_current_in_gpu_shared_vec, dense_current_in_gpu_out_buf);
                 moe_residual_done_on_gpu = true;
             }
         } else |_| {
