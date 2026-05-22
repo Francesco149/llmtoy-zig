@@ -723,7 +723,11 @@ High-value cleanup once matvec is faster:
 
 ## Phase 7r - Descriptor, Command, and Pipeline Overhead
 
-Status: TODO after matvec throughput improves.
+Status: STARTED after VRAM-tail work exposed host overhead. `GpuContext` now
+owns one Vulkan pipeline cache handle and all compute pipeline builders route
+through it. Disk serialization is still TODO; the current step only removes
+the previous `null` cache handle from pipeline creation and establishes the
+shared plumbing.
 
 The current wrappers allocate/update/free descriptor sets for nearly every
 dispatch and allocate/free command buffers for every submit. That overhead is

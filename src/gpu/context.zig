@@ -271,6 +271,7 @@ pub const GpuContext = struct {
     queue: vk.VkQueue,
     queue_family: u32,
     cmd_pool: vk.VkCommandPool,
+    pipeline_cache: vk.VkPipelineCache,
     profiler: ?*GpuProfiler,
     subgroup_size: u32,
     subgroup_supported_stages: vk.VkShaderStageFlags,
@@ -418,6 +419,19 @@ pub const GpuContext = struct {
         var cmd_pool: vk.VkCommandPool = null;
         if (vk.vkCreateCommandPool(device, &pool_ci, null, &cmd_pool) != vk.VK_SUCCESS)
             return error.VkCommandPoolCreateFailed;
+        errdefer vk.vkDestroyCommandPool(device, cmd_pool, null);
+
+        const cache_ci = vk.VkPipelineCacheCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+            .initialDataSize = 0,
+            .pInitialData = null,
+        };
+        var pipeline_cache: vk.VkPipelineCache = null;
+        if (vk.vkCreatePipelineCache(device, &cache_ci, null, &pipeline_cache) != vk.VK_SUCCESS)
+            return error.VkPipelineCacheCreateFailed;
+        errdefer vk.vkDestroyPipelineCache(device, pipeline_cache, null);
 
         var profiler: ?*GpuProfiler = null;
         if (std.c.getenv("LLMTOY_GPU_PROFILE") != null) {
@@ -432,6 +446,7 @@ pub const GpuContext = struct {
             .queue = queue,
             .queue_family = queue_family,
             .cmd_pool = cmd_pool,
+            .pipeline_cache = pipeline_cache,
             .profiler = profiler,
             .subgroup_size = subgroup_props.subgroupSize,
             .subgroup_supported_stages = subgroup_props.supportedStages,
@@ -445,9 +460,19 @@ pub const GpuContext = struct {
             p.deinit(self.device);
             std.heap.page_allocator.destroy(p);
         }
+        vk.vkDestroyPipelineCache(self.device, self.pipeline_cache, null);
         vk.vkDestroyCommandPool(self.device, self.cmd_pool, null);
         vk.vkDestroyDevice(self.device, null);
         vk.vkDestroyInstance(self.instance, null);
+    }
+
+    pub fn createComputePipeline(
+        self: *const GpuContext,
+        pipeline_ci: *const vk.VkComputePipelineCreateInfo,
+        pipeline: *vk.VkPipeline,
+    ) !void {
+        if (vk.vkCreateComputePipelines(self.device, self.pipeline_cache, 1, pipeline_ci, null, pipeline) != vk.VK_SUCCESS)
+            return error.VkComputePipelineFailed;
     }
 
     pub fn deviceName(self: *const GpuContext) [vk.VK_MAX_PHYSICAL_DEVICE_NAME_SIZE]u8 {

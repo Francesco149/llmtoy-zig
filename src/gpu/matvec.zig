@@ -241,8 +241,7 @@ pub const MatvecPipeline = struct {
             .basePipelineIndex = -1,
         };
         var pipeline: vk.VkPipeline = null;
-        if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
-            return error.VkComputePipelineFailed;
+        try ctx.createComputePipeline(&pipeline_ci, &pipeline);
         errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
         // 64 sets: enough for one-shot run() (1 set) and batched record() (up to 16
@@ -713,8 +712,7 @@ pub const FusedGateUpPipeline = struct {
             .basePipelineIndex = -1,
         };
         var pipeline: vk.VkPipeline = null;
-        if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
-            return error.VkComputePipelineFailed;
+        try ctx.createComputePipeline(&pipeline_ci, &pipeline);
         errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
         // 16 sets: one per active expert per layer (n_experts_used = 8 typical)
@@ -881,8 +879,7 @@ pub const AccumPipeline = struct {
             .basePipelineIndex = -1,
         };
         var pipeline: vk.VkPipeline = null;
-        if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
-            return error.VkComputePipelineFailed;
+        try ctx.createComputePipeline(&pipeline_ci, &pipeline);
         errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
         const pool_size = vk.VkDescriptorPoolSize{
@@ -1072,8 +1069,7 @@ pub const QuantizeQ8_1Pipeline = struct {
             .basePipelineIndex = -1,
         };
         var pipeline: vk.VkPipeline = null;
-        if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
-            return error.VkComputePipelineFailed;
+        try ctx.createComputePipeline(&pipeline_ci, &pipeline);
         errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
         const pool_size = vk.VkDescriptorPoolSize{
@@ -1619,8 +1615,7 @@ pub const RmsnormPipeline = struct {
             .basePipelineIndex = -1,
         };
         var pipeline: vk.VkPipeline = null;
-        if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
-            return error.VkComputePipelineFailed;
+        try ctx.createComputePipeline(&pipeline_ci, &pipeline);
         errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
         const pool_size = vk.VkDescriptorPoolSize{
@@ -1828,8 +1823,7 @@ pub const RmsnormPerHeadPipeline = struct {
             .basePipelineIndex = -1,
         };
         var pipeline: vk.VkPipeline = null;
-        if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
-            return error.VkComputePipelineFailed;
+        try ctx.createComputePipeline(&pipeline_ci, &pipeline);
         errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
         const pool_size = vk.VkDescriptorPoolSize{
@@ -2007,8 +2001,7 @@ fn buildSimplePipeline(
         .basePipelineIndex = -1,
     };
     var pipeline: vk.VkPipeline = null;
-    if (vk.vkCreateComputePipelines(dev, null, 1, &pipeline_ci, null, &pipeline) != vk.VK_SUCCESS)
-        return error.VkComputePipelineFailed;
+    try ctx.createComputePipeline(&pipeline_ci, &pipeline);
     errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
     const pool_size = vk.VkDescriptorPoolSize{
