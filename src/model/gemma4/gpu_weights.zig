@@ -201,6 +201,7 @@ pub const GpuWeights = struct {
     expert_down_id_dsets: ?[]?vk.VkDescriptorSet,
     expert_down_id_dset_is_iq4: ?[]bool,
     expert_reuse_cmds: ?[]?vk.VkCommandBuffer,
+    pending_moe_batch: ?GpuCtx.PendingBatch,
     // Per-projection output buffers for batched dispatch.
     // QKV: all three read the same input → one upload, three parallel dispatches.
     // gate+up: both read the same FFN-norm input → same pattern.
@@ -425,6 +426,7 @@ pub const GpuWeights = struct {
             .expert_down_id_dsets = null,
             .expert_down_id_dset_is_iq4 = null,
             .expert_reuse_cmds = null,
+            .pending_moe_batch = null,
             .q_out_buf = null,
             .k_out_buf = null,
             .v_out_buf = null,
@@ -782,6 +784,7 @@ pub const GpuWeights = struct {
     }
 
     pub fn deinit(self: *GpuWeights) void {
+        self.finishPendingMoeBatch() catch {};
         if (self.scores_vram) |*b| b.deinit();
         if (self.kv_stage) |*b| b.deinit();
         if (self.kv_cap) |c| self.allocator.free(c);
@@ -931,6 +934,13 @@ pub const GpuWeights = struct {
         self.pl_q8_0.deinit();
         self.pl_f32.deinit();
         self.ctx.deinit();
+    }
+
+    fn finishPendingMoeBatch(self: *GpuWeights) !void {
+        if (self.pending_moe_batch) |pending| {
+            self.pending_moe_batch = null;
+            try self.ctx.waitPendingBatch(pending);
+        }
     }
 
     // Dispatch wq, wk, (optionally wv) in a single command buffer.
@@ -1863,6 +1873,8 @@ pub const GpuWeights = struct {
         moe_buf: []f32,
         skip_readback: bool,
     ) !void {
+        try self.finishPendingMoeBatch();
+
         const n = top_idx.len;
         const eg_sessions = self.expert_gate orelse return error.ExpertNotOnGpu;
         const eu_sessions = self.expert_up orelse return error.ExpertNotOnGpu;
@@ -1897,6 +1909,21 @@ pub const GpuWeights = struct {
         const reuse_down_id_dset = reuse_id_dsets and use_id_dn;
         const reuse_accum_dset = reuse_id_dsets and (use_id_gu or use_id_dn);
         const reuse_cmd = std.c.getenv("LLMTOY_EXPERT_REUSE_CMD") != null and use_id_gu and use_id_dn;
+        const async_moe_env = if (std.c.getenv("LLMTOY_EXPERT_ASYNC")) |raw|
+            !std.mem.eql(u8, std.mem.span(raw), "0")
+        else
+            true;
+        const async_moe = async_moe_env and
+            skip_readback and
+            self.ctx.profiler == null and
+            !reuse_cmd and
+            use_id_gu and
+            use_id_dn and
+            reuse_quant_input_dset and
+            reuse_gate_up_id_dset and
+            reuse_quant_mid_batched_dset and
+            reuse_down_id_dset and
+            reuse_accum_dset;
 
         for (top_idx) |eidx| {
             if (!use_id_gu) {
@@ -2078,7 +2105,9 @@ pub const GpuWeights = struct {
         }
         self.ctx.profileEnd(cmd, p_accum);
 
-        if (reused_cmd) {
+        if (async_moe) {
+            self.pending_moe_batch = try self.ctx.submitBatchAsync(cmd);
+        } else if (reused_cmd) {
             try self.ctx.submitReusableBatch(cmd);
         } else {
             try self.ctx.submitBatch(cmd);

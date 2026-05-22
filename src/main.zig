@@ -91,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
         try cmdBenchMatvec(out, args[2], opts, io, gpa);
     } else if (std.mem.eql(u8, args[1], "bench-moe")) {
         if (args.len < 3) {
-            std.debug.print("usage: llmtoy bench-moe <model.gguf> [--iters N] [--layer N] [--skip-readback]\n", .{});
+            std.debug.print("usage: llmtoy bench-moe <model.gguf> [--iters N] [--layer N] [--skip-readback] [--tail]\n", .{});
             return error.MissingArg;
         }
         var opts = MoeBenchOptions{};
@@ -99,6 +99,12 @@ pub fn main(init: std.process.Init) !void {
         while (i < args.len) {
             const flag = args[i];
             if (std.mem.eql(u8, flag, "--skip-readback")) {
+                opts.skip_readback = true;
+                i += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, flag, "--tail")) {
+                opts.tail = true;
                 opts.skip_readback = true;
                 i += 1;
                 continue;
@@ -215,7 +221,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\  llmtoy info <model.gguf>               print model metadata and tensor summary
         \\  llmtoy tokenize <model.gguf> <text>    BPE-encode text, print IDs and decoded tokens
         \\  llmtoy bench-matvec <model.gguf> [--iters N] [--target NAME] [--reuse-descriptor]
-        \\  llmtoy bench-moe <model.gguf> [--iters N] [--layer N] [--skip-readback]
+        \\  llmtoy bench-moe <model.gguf> [--iters N] [--layer N] [--skip-readback] [--tail]
         \\  llmtoy generate <model.gguf> <prompt> [--chat] [--gpu] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N] [--stop-token TOKEN] [--gpu-layers L0:L1]
         \\  llmtoy compare  <model.gguf> <prompt> [--chat] [--threads N] [--gpu-layers L0:L1]
         \\
@@ -371,6 +377,7 @@ const MoeBenchOptions = struct {
     iters: u32 = 64,
     layer: usize = 0,
     skip_readback: bool = false,
+    tail: bool = false,
 };
 
 const BenchPipelines = struct {
@@ -692,12 +699,22 @@ fn cmdBenchMoe(
     defer gpa.free(router_out);
     const moe_buf = try gpa.alloc(f32, cfg.d_model);
     defer gpa.free(moe_buf);
+    const x = try gpa.alloc(f32, cfg.d_model);
+    defer gpa.free(x);
+    const dense_ffn = try gpa.alloc(f32, cfg.d_model);
+    defer gpa.free(dense_ffn);
     const top_idx = try gpa.alloc(usize, top_n);
     defer gpa.free(top_idx);
 
     for (moe_in, 0..) |*v, i| {
         const centered: i32 = @as(i32, @intCast(i % 31)) - 15;
         v.* = @as(f32, @floatFromInt(centered)) / 16.0;
+    }
+    for (x, dense_ffn, 0..) |*xv, *dv, i| {
+        const x_centered: i32 = @as(i32, @intCast(i % 43)) - 21;
+        const d_centered: i32 = @as(i32, @intCast(i % 37)) - 18;
+        xv.* = @as(f32, @floatFromInt(x_centered)) / 32.0;
+        dv.* = @as(f32, @floatFromInt(d_centered)) / 32.0;
     }
     @memset(router_out, 0.0);
     for (top_idx, 0..) |*e, i| {
@@ -708,12 +725,20 @@ fn cmdBenchMoe(
     try out.print("GPU MoE batch microbench: layer={} iters={} experts_used={}/{} d_model={} d_expert={}\n", .{
         layer, opts.iters, top_n, cfg.n_experts, cfg.d_model, cfg.d_expert,
     });
-    try out.print("  gate_up_type={s} down_type={s} skip_readback={}\n", .{
-        lw.gate_up_exps.type_.label(), lw.down_exps.type_.label(), opts.skip_readback,
+    try out.print("  gate_up_type={s} down_type={s} skip_readback={} tail={}\n", .{
+        lw.gate_up_exps.type_.label(), lw.down_exps.type_.label(), opts.skip_readback, opts.tail,
     });
+
+    if (opts.tail) {
+        try gpu_weights.shared_vec.?.upload(std.mem.sliceAsBytes(x));
+        try gpu_weights.dense_ffn_out_buf.?.upload(std.mem.sliceAsBytes(dense_ffn));
+    }
 
     @memset(moe_buf, 0.0);
     try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, opts.skip_readback);
+    if (opts.tail) {
+        try gpu_weights.runLayerMoeResidualOnGpu(layer, cfg.eps, x, dense_ffn, lw.layer_output_scale, true, true);
+    }
 
     const labels = [_][]const u8{
         "moe.quantize_input",
@@ -721,6 +746,11 @@ fn cmdBenchMoe(
         "moe.quantize_mid",
         "moe.down",
         "moe.accum",
+        "moe.post_norm",
+        "ffn_moe.combine",
+        "ffn_moe.post_norm",
+        "ffn_moe.residual_add",
+        "ffn_moe.layer_scale",
     };
     var before: [labels.len]gpu_ctx.ProfileStats = undefined;
     for (labels, 0..) |label, i| before[i] = gpu_weights.ctx.profileStats(label);
@@ -730,6 +760,9 @@ fn cmdBenchMoe(
     for (0..opts.iters) |_| {
         @memset(moe_buf, 0.0);
         try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, opts.skip_readback);
+        if (opts.tail) {
+            try gpu_weights.runLayerMoeResidualOnGpu(layer, cfg.eps, x, dense_ffn, lw.layer_output_scale, true, true);
+        }
     }
     const t1 = clk.now(io);
 

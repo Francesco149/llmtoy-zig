@@ -254,8 +254,7 @@ pub const GpuProfiler = struct {
             const idle_pct = if (self.span_total_ns == 0) 0.0 else 100.0 *
                 @as(f64, @floatFromInt(self.gap_total_ns)) /
                 @as(f64, @floatFromInt(self.span_total_ns));
-            const avg_gap_us = if (self.gap_count == 0) 0.0 else
-                @as(f64, @floatFromInt(self.gap_total_ns)) /
+            const avg_gap_us = if (self.gap_count == 0) 0.0 else @as(f64, @floatFromInt(self.gap_total_ns)) /
                 @as(f64, @floatFromInt(self.gap_count)) / 1_000.0;
             std.debug.print(
                 "\nGPU batches={d}  dispatch={d:.3} ms  gap={d:.3} ms ({d} gaps, avg {d:.2} us, {d:.1}% of batch span)  span={d:.3} ms\n",
@@ -276,6 +275,11 @@ pub const GpuContext = struct {
     subgroup_size: u32,
     subgroup_supported_stages: vk.VkShaderStageFlags,
     subgroup_supported_operations: vk.VkSubgroupFeatureFlags,
+
+    pub const PendingBatch = struct {
+        cmd: vk.VkCommandBuffer,
+        fence: vk.VkFence,
+    };
 
     pub fn init() !GpuContext {
         // We require Vulkan 1.3 for shaderIntegerDotProduct (core in 1.3) plus
@@ -476,6 +480,48 @@ pub const GpuContext = struct {
 
     pub fn submitBatch(self: *const GpuContext, cmd: vk.VkCommandBuffer) !void {
         return self.submitBatchCopy(cmd);
+    }
+
+    pub fn submitBatchAsync(self: *const GpuContext, cmd: vk.VkCommandBuffer) !PendingBatch {
+        // The profiler owns one query pool and resets it at beginBatch(), so keep
+        // async submits out of profiled runs until the profiler can snapshot
+        // per-submit event ranges.
+        std.debug.assert(self.profiler == null);
+        _ = vk.vkEndCommandBuffer(cmd);
+        errdefer vk.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, &cmd);
+
+        const fence_ci = vk.VkFenceCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+        };
+        var fence: vk.VkFence = null;
+        if (vk.vkCreateFence(self.device, &fence_ci, null, &fence) != vk.VK_SUCCESS)
+            return error.VkFenceCreateFailed;
+        errdefer vk.vkDestroyFence(self.device, fence, null);
+
+        const submit = vk.VkSubmitInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext = null,
+            .waitSemaphoreCount = 0,
+            .pWaitSemaphores = null,
+            .pWaitDstStageMask = null,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd,
+            .signalSemaphoreCount = 0,
+            .pSignalSemaphores = null,
+        };
+        if (vk.vkQueueSubmit(self.queue, 1, &submit, fence) != vk.VK_SUCCESS)
+            return error.VkQueueSubmitFailed;
+        return .{ .cmd = cmd, .fence = fence };
+    }
+
+    pub fn waitPendingBatch(self: *const GpuContext, pending: PendingBatch) !void {
+        const rc = vk.vkWaitForFences(self.device, 1, &pending.fence, vk.VK_TRUE, std.math.maxInt(u64));
+        defer vk.vkDestroyFence(self.device, pending.fence, null);
+        defer vk.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, &pending.cmd);
+        if (rc != vk.VK_SUCCESS)
+            return error.VkFenceWaitFailed;
     }
 
     pub fn allocReusableCommandBuffer(self: *const GpuContext) !vk.VkCommandBuffer {
