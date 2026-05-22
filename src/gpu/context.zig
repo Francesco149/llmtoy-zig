@@ -4,6 +4,7 @@ const vk = @import("vk.zig").vk;
 const max_profile_events = 4096;
 const max_profile_labels = 256;
 const profile_label_len = 72;
+const max_pipeline_cache_bytes = 64 * 1024 * 1024;
 
 const ProfileEvent = struct {
     label: [profile_label_len]u8 = [_]u8{0} ** profile_label_len,
@@ -272,6 +273,7 @@ pub const GpuContext = struct {
     queue_family: u32,
     cmd_pool: vk.VkCommandPool,
     pipeline_cache: vk.VkPipelineCache,
+    pipeline_cache_path: ?[:0]u8,
     profiler: ?*GpuProfiler,
     subgroup_size: u32,
     subgroup_supported_stages: vk.VkShaderStageFlags,
@@ -421,12 +423,21 @@ pub const GpuContext = struct {
             return error.VkCommandPoolCreateFailed;
         errdefer vk.vkDestroyCommandPool(device, cmd_pool, null);
 
+        const pipeline_cache_path = pipelineCachePath(std.heap.page_allocator) catch null;
+        errdefer if (pipeline_cache_path) |path| std.heap.page_allocator.free(path);
+
+        var initial_cache_data: ?[]u8 = null;
+        if (pipeline_cache_path) |path| {
+            initial_cache_data = loadPipelineCacheData(std.heap.page_allocator, path, props) catch null;
+        }
+        defer if (initial_cache_data) |data| std.heap.page_allocator.free(data);
+
         const cache_ci = vk.VkPipelineCacheCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
             .pNext = null,
             .flags = 0,
-            .initialDataSize = 0,
-            .pInitialData = null,
+            .initialDataSize = if (initial_cache_data) |data| data.len else 0,
+            .pInitialData = if (initial_cache_data) |data| data.ptr else null,
         };
         var pipeline_cache: vk.VkPipelineCache = null;
         if (vk.vkCreatePipelineCache(device, &cache_ci, null, &pipeline_cache) != vk.VK_SUCCESS)
@@ -447,6 +458,7 @@ pub const GpuContext = struct {
             .queue_family = queue_family,
             .cmd_pool = cmd_pool,
             .pipeline_cache = pipeline_cache,
+            .pipeline_cache_path = pipeline_cache_path,
             .profiler = profiler,
             .subgroup_size = subgroup_props.subgroupSize,
             .subgroup_supported_stages = subgroup_props.supportedStages,
@@ -460,10 +472,34 @@ pub const GpuContext = struct {
             p.deinit(self.device);
             std.heap.page_allocator.destroy(p);
         }
+        self.savePipelineCache() catch {};
+        if (self.pipeline_cache_path) |path| std.heap.page_allocator.free(path);
         vk.vkDestroyPipelineCache(self.device, self.pipeline_cache, null);
         vk.vkDestroyCommandPool(self.device, self.cmd_pool, null);
         vk.vkDestroyDevice(self.device, null);
         vk.vkDestroyInstance(self.instance, null);
+    }
+
+    fn savePipelineCache(self: *const GpuContext) !void {
+        const path = self.pipeline_cache_path orelse return;
+
+        var size: usize = 0;
+        if (vk.vkGetPipelineCacheData(self.device, self.pipeline_cache, &size, null) != vk.VK_SUCCESS)
+            return error.VkPipelineCacheDataFailed;
+        if (size == 0 or size > max_pipeline_cache_bytes) return;
+
+        const data = try std.heap.page_allocator.alloc(u8, size);
+        defer std.heap.page_allocator.free(data);
+
+        if (vk.vkGetPipelineCacheData(self.device, self.pipeline_cache, &size, data.ptr) != vk.VK_SUCCESS)
+            return error.VkPipelineCacheDataFailed;
+
+        if (std.fs.path.dirname(path)) |dir| ensureDirPath(dir);
+        const file = std.c.fopen(path, "wb") orelse return error.PipelineCacheOpenFailed;
+        defer _ = std.c.fclose(file);
+
+        if (std.c.fwrite(data.ptr, 1, size, file) != size)
+            return error.PipelineCacheWriteFailed;
     }
 
     pub fn createComputePipeline(
@@ -861,3 +897,73 @@ pub const GpuContext = struct {
         _ = vk.vkQueueWaitIdle(self.queue);
     }
 };
+
+fn pipelineCachePath(allocator: std.mem.Allocator) !?[:0]u8 {
+    if (std.c.getenv("LLMTOY_PIPELINE_CACHE")) |raw| {
+        const path = std.mem.span(raw);
+        if (path.len == 0 or std.mem.eql(u8, path, "0")) return null;
+        return try allocator.dupeZ(u8, path);
+    }
+
+    const base = if (std.c.getenv("XDG_CACHE_HOME")) |raw|
+        std.mem.span(raw)
+    else if (std.c.getenv("HOME")) |raw|
+        try std.fs.path.join(allocator, &.{ std.mem.span(raw), ".cache" })
+    else
+        return null;
+    defer if (std.c.getenv("XDG_CACHE_HOME") == null) allocator.free(base);
+
+    return try std.fs.path.joinZ(allocator, &.{ base, "llmtoy", "vulkan-pipeline-cache.bin" });
+}
+
+fn loadPipelineCacheData(
+    allocator: std.mem.Allocator,
+    path: [:0]const u8,
+    props: vk.VkPhysicalDeviceProperties,
+) ![]u8 {
+    const file = std.c.fopen(path, "rb") orelse return error.PipelineCacheOpenFailed;
+    defer _ = std.c.fclose(file);
+
+    var data = try allocator.alloc(u8, max_pipeline_cache_bytes);
+    errdefer allocator.free(data);
+
+    const n = std.c.fread(data.ptr, 1, data.len, file);
+    if (n == data.len) return error.PipelineCacheTooLarge;
+    data = try allocator.realloc(data, n);
+    if (!pipelineCacheHeaderMatches(data, props)) return error.PipelineCacheHeaderMismatch;
+    return data;
+}
+
+fn pipelineCacheHeaderMatches(data: []const u8, props: vk.VkPhysicalDeviceProperties) bool {
+    const header_size = 16 + vk.VK_UUID_SIZE;
+    if (data.len < header_size) return false;
+
+    const header_len = std.mem.readInt(u32, data[0..4], .little);
+    const header_version = std.mem.readInt(u32, data[4..8], .little);
+    const vendor_id = std.mem.readInt(u32, data[8..12], .little);
+    const device_id = std.mem.readInt(u32, data[12..16], .little);
+
+    return header_len >= header_size and
+        header_version == vk.VK_PIPELINE_CACHE_HEADER_VERSION_ONE and
+        vendor_id == props.vendorID and
+        device_id == props.deviceID and
+        std.mem.eql(u8, data[16..header_size], props.pipelineCacheUUID[0..vk.VK_UUID_SIZE]);
+}
+
+fn ensureDirPath(path: []const u8) void {
+    if (path.len == 0) return;
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (path.len >= buf.len) return;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+
+    var i: usize = if (path[0] == '/') 1 else 0;
+    while (i < path.len) : (i += 1) {
+        if (buf[i] != '/') continue;
+        buf[i] = 0;
+        _ = std.c.mkdir(@ptrCast(&buf), 0o700);
+        buf[i] = '/';
+    }
+    _ = std.c.mkdir(@ptrCast(&buf), 0o700);
+}

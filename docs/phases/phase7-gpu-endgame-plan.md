@@ -724,10 +724,10 @@ High-value cleanup once matvec is faster:
 ## Phase 7r - Descriptor, Command, and Pipeline Overhead
 
 Status: STARTED after VRAM-tail work exposed host overhead. `GpuContext` now
-owns one Vulkan pipeline cache handle and all compute pipeline builders route
-through it. Disk serialization is still TODO; the current step only removes
-the previous `null` cache handle from pipeline creation and establishes the
-shared plumbing.
+owns one Vulkan pipeline cache handle, all compute pipeline builders route
+through it, and cache data is serialized under `$XDG_CACHE_HOME/llmtoy` (or
+`$HOME/.cache/llmtoy`) by default. `LLMTOY_PIPELINE_CACHE=/path/file` overrides
+the location and `LLMTOY_PIPELINE_CACHE=0` disables disk persistence.
 
 The current wrappers allocate/update/free descriptor sets for nearly every
 dispatch and allocate/free command buffers for every submit. That overhead is
@@ -742,7 +742,7 @@ Roadmap:
 - Reuse command buffers where the sequence is fixed and only push constants
   change.
 - Replace immediate `vkQueueWaitIdle` with fences.
-- Add pipeline cache serialization.
+- Measure warm-start pipeline creation after cache serialization.
 
 Acceptance criteria:
 
