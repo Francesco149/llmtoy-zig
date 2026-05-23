@@ -933,6 +933,7 @@ fn cmdBenchMoe(
         .dense_ffn = dense_ffn,
         .layer_output_scale = lw.layer_output_scale,
         .x_buf_current = true,
+        .x_vram_current = false,
         .dense_buf_current = true,
     } else null;
     try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, opts.skip_readback, tail_params);

@@ -338,6 +338,7 @@ pub fn forwardOne(
             glw.?.w_gate != null and glw.?.w_up != null;
 
         var x_current_in_gpu_shared_vec = false;
+        var x_current_in_gpu_vram = false;
         var dense_current_in_gpu_out_buf = false;
 
         if (can_full_fused) {
@@ -345,6 +346,7 @@ pub fn forwardOne(
             try g.runLayerAttnResidualDenseFfnQ8_1(l, cfg.eps, wo_q8_pl.?, gate_q8_pl.?, up_q8_pl.?, g.pipelineFor(lw.w_down.type_), x, attn_concat[0..nq_l], ffn_buf, use_gpu_attn);
             // x updated with post-attn residual; ffn_buf has post_ffw_norm_1.
             x_current_in_gpu_shared_vec = false;
+            x_current_in_gpu_vram = true;
             dense_current_in_gpu_out_buf = true;
         } else if (can_fused_dense) {
             const g = gpu.?;
@@ -401,6 +403,7 @@ pub fn forwardOne(
                 .dense_ffn = ffn_buf,
                 .layer_output_scale = lw.layer_output_scale,
                 .x_buf_current = x_current_in_gpu_shared_vec,
+                .x_vram_current = x_current_in_gpu_vram,
                 .dense_buf_current = dense_current_in_gpu_out_buf,
             } else null)
         else

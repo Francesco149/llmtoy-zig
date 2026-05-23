@@ -92,6 +92,7 @@ pub const MoeTailParams = struct {
     dense_ffn: []const f32,
     layer_output_scale: f32,
     x_buf_current: bool,
+    x_vram_current: bool,
     dense_buf_current: bool,
 };
 
@@ -221,8 +222,10 @@ pub const GpuWeights = struct {
     moe_tail_add_rmsnorm_dsets: ?[]?vk.VkDescriptorSet,
     moe_tail_combine_dset: ?vk.VkDescriptorSet,
     moe_tail_residual_dset: ?vk.VkDescriptorSet,
+    moe_tail_residual_x_vram_dset: ?vk.VkDescriptorSet,
     moe_tail_scale_dset: ?vk.VkDescriptorSet,
     moe_tail_residual_scale_dset: ?vk.VkDescriptorSet,
+    moe_tail_residual_scale_x_vram_dset: ?vk.VkDescriptorSet,
     // Per-projection output buffers for batched dispatch.
     // QKV: all three read the same input → one upload, three parallel dispatches.
     // gate+up: both read the same FFN-norm input → same pattern.
@@ -459,8 +462,10 @@ pub const GpuWeights = struct {
             .moe_tail_add_rmsnorm_dsets = null,
             .moe_tail_combine_dset = null,
             .moe_tail_residual_dset = null,
+            .moe_tail_residual_x_vram_dset = null,
             .moe_tail_scale_dset = null,
             .moe_tail_residual_scale_dset = null,
+            .moe_tail_residual_scale_x_vram_dset = null,
             .q_out_buf = null,
             .k_out_buf = null,
             .v_out_buf = null,
@@ -2098,7 +2103,7 @@ pub const GpuWeights = struct {
         // Write inputs and per-expert scales to HOST_COHERENT buffers.
         @memcpy(in_slice, moe_in);
         if (tail) |tp| {
-            if (!tp.x_buf_current) {
+            if (!tp.x_buf_current and !tp.x_vram_current) {
                 try self.shared_vec.?.upload(std.mem.sliceAsBytes(tp.x));
             }
             if (!tp.dense_buf_current) {
@@ -2261,7 +2266,13 @@ pub const GpuWeights = struct {
 
         if (tail) |tp| {
             GpuCtx.recordShaderBarrier(cmd);
-            try self.recordMoeResidualTail(cmd, layer, tp.eps, tp.x.len, tp.layer_output_scale);
+            try self.recordMoeResidualTail(cmd, layer, tp.eps, tp.x.len, tp.layer_output_scale, tp.x_vram_current);
+            if (tp.x_vram_current) {
+                const stage = &(self.stage_buf orelse return error.ExpertNotOnGpu);
+                const x_vram = &(self.x_vram orelse return error.ExpertNotOnGpu);
+                GpuCtx.recordShaderToTransferBarrier(cmd);
+                GpuCtx.recordCopy(cmd, x_vram.handle, stage.handle, tp.x.len * @sizeOf(f32));
+            }
         }
 
         const pl_dn_used = if (use_q8_1_dn) pl_dn_q8_1.? else pl_dn_f32.?;
@@ -2330,7 +2341,12 @@ pub const GpuWeights = struct {
             }
         }
         if (tail) |tp| {
-            try self.shared_vec.?.download(std.mem.sliceAsBytes(tp.x));
+            if (tp.x_vram_current) {
+                const stage = &(self.stage_buf orelse return error.ExpertNotOnGpu);
+                try stage.download(std.mem.sliceAsBytes(tp.x));
+            } else {
+                try self.shared_vec.?.download(std.mem.sliceAsBytes(tp.x));
+            }
         }
 
         // Add GPU-accumulated expert result into moe_buf only for legacy/debug
@@ -2590,7 +2606,7 @@ pub const GpuWeights = struct {
         }
 
         const cmd = try self.ctx.beginBatch();
-        try self.recordMoeResidualTail(cmd, layer, eps, x.len, layer_output_scale);
+        try self.recordMoeResidualTail(cmd, layer, eps, x.len, layer_output_scale, false);
         try self.ctx.submitBatch(cmd);
 
         try x_buf.download(std.mem.sliceAsBytes(x));
@@ -2603,11 +2619,15 @@ pub const GpuWeights = struct {
         eps: f32,
         len: usize,
         layer_output_scale: f32,
+        use_x_vram: bool,
     ) !void {
         const lw = &self.layers[layer];
         const post_ffw_norm_2_buf = &(lw.post_ffw_norm_2_buf orelse return error.NotOnGpu);
         const post_ffw_norm_buf = &(lw.post_ffw_norm_buf orelse return error.NotOnGpu);
-        const x_buf = &self.shared_vec.?;
+        const x_buf = if (use_x_vram)
+            &(self.x_vram orelse return error.NotOnGpu)
+        else
+            &self.shared_vec.?;
         const dense_buf = &(self.dense_ffn_out_buf orelse return error.NotOnGpu);
         const moe_buf = &(self.moe_gpu_buf orelse return error.NotOnGpu);
         const moe_norm_buf = &(self.ffn_vram orelse return error.NotOnGpu);
@@ -2628,15 +2648,29 @@ pub const GpuWeights = struct {
 
         if (layer_output_scale != 1.0) {
             const p_residual = self.ctx.profileBegin(cmd, "ffn_moe.residual_add_scale");
-            if (self.moe_tail_residual_scale_dset == null)
-                self.moe_tail_residual_scale_dset = try self.pl_elem_add_scale.allocSet(x_buf, combined_norm_buf);
-            self.pl_elem_add_scale.recordWithSet(cmd, self.moe_tail_residual_scale_dset.?, n, layer_output_scale);
+            const dset = if (use_x_vram) blk: {
+                if (self.moe_tail_residual_scale_x_vram_dset == null)
+                    self.moe_tail_residual_scale_x_vram_dset = try self.pl_elem_add_scale.allocSet(x_buf, combined_norm_buf);
+                break :blk self.moe_tail_residual_scale_x_vram_dset.?;
+            } else blk: {
+                if (self.moe_tail_residual_scale_dset == null)
+                    self.moe_tail_residual_scale_dset = try self.pl_elem_add_scale.allocSet(x_buf, combined_norm_buf);
+                break :blk self.moe_tail_residual_scale_dset.?;
+            };
+            self.pl_elem_add_scale.recordWithSet(cmd, dset, n, layer_output_scale);
             self.ctx.profileEnd(cmd, p_residual);
         } else {
             const p_residual = self.ctx.profileBegin(cmd, "ffn_moe.residual_add");
-            if (self.moe_tail_residual_dset == null)
-                self.moe_tail_residual_dset = try self.pl_elem_add.allocSet(x_buf, combined_norm_buf);
-            self.pl_elem_add.recordWithSet(cmd, self.moe_tail_residual_dset.?, n);
+            const dset = if (use_x_vram) blk: {
+                if (self.moe_tail_residual_x_vram_dset == null)
+                    self.moe_tail_residual_x_vram_dset = try self.pl_elem_add.allocSet(x_buf, combined_norm_buf);
+                break :blk self.moe_tail_residual_x_vram_dset.?;
+            } else blk: {
+                if (self.moe_tail_residual_dset == null)
+                    self.moe_tail_residual_dset = try self.pl_elem_add.allocSet(x_buf, combined_norm_buf);
+                break :blk self.moe_tail_residual_dset.?;
+            };
+            self.pl_elem_add.recordWithSet(cmd, dset, n);
             self.ctx.profileEnd(cmd, p_residual);
         }
     }
