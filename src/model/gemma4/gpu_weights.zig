@@ -2297,13 +2297,7 @@ pub const GpuWeights = struct {
                 self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
             self.pending_moe_batch = try self.ctx.submitBatchAsyncWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
             async_submit_succeeded = true;
-        } else if (reused_cmd) {
-            try self.ctx.submitReusableBatch(cmd);
         } else {
-            try self.ctx.submitBatch(cmd);
-        }
-
-        if (!async_moe) {
             try self.collectRunExpertBatchDescriptorFrees(
                 &descriptor_frees,
                 &descriptor_free_count,
@@ -2328,7 +2322,12 @@ pub const GpuWeights = struct {
                 reuse_accum_dset,
                 accum_dset,
             );
-            self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
+            if (reused_cmd) {
+                try self.ctx.submitReusableBatch(cmd);
+                self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
+            } else {
+                try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
+            }
         }
         if (tail) |tp| {
             try self.shared_vec.?.download(std.mem.sliceAsBytes(tp.x));
