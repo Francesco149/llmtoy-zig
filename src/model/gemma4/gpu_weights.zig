@@ -1376,19 +1376,29 @@ pub const GpuWeights = struct {
         GpuCtx.recordCopyRegion(cmd, v_buf.handle, v_cache.handle, 0, slot_offset, slot_bytes);
         self.ctx.profileEnd(cmd, p_v_copy);
 
-        try self.ctx.submitBatch(cmd);
+        var descriptor_frees: [gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree = undefined;
+        var descriptor_free_count: usize = 0;
+        try self.collectRunLayerAttnFrontDescriptorFrees(
+            &descriptor_frees,
+            &descriptor_free_count,
+            wq_pl,
+            wk_pl,
+            wv_pl,
+            norm_dset,
+            quant_dset,
+            q_mv_dset,
+            k_mv_dset,
+            v_mv_dset,
+            qn_dset,
+            kn_dset,
+            vn_dset,
+            rope_pool,
+            qr_dset,
+            kr_dset,
+        );
 
-        const dev = self.ctx.device;
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &norm_dset);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_quantize_q8_1.desc_pool, 1, &quant_dset);
-        _ = vk.vkFreeDescriptorSets(dev, wq_pl.desc_pool, 1, &q_mv_dset);
-        _ = vk.vkFreeDescriptorSets(dev, wk_pl.desc_pool, 1, &k_mv_dset);
-        if (v_mv_dset) |*ds| _ = vk.vkFreeDescriptorSets(dev, wv_pl.?.desc_pool, 1, ds);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm_perhead.desc_pool, 1, &qn_dset);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm_perhead.desc_pool, 1, &kn_dset);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm_perhead.desc_pool, 1, &vn_dset);
-        _ = vk.vkFreeDescriptorSets(dev, rope_pool, 1, &qr_dset);
-        _ = vk.vkFreeDescriptorSets(dev, rope_pool, 1, &kr_dset);
+        try self.ctx.submitBatch(cmd);
+        self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
 
         try q_buf.download(std.mem.sliceAsBytes(q_out));
         try k_buf.download(std.mem.sliceAsBytes(k_out));
@@ -2331,6 +2341,38 @@ pub const GpuWeights = struct {
             if (accum_dset) |set|
                 try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_accum.desc_pool, set);
         }
+    }
+
+    fn collectRunLayerAttnFrontDescriptorFrees(
+        self: *const GpuWeights,
+        descriptor_frees: *[gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree,
+        descriptor_free_count: *usize,
+        wq_pl: *const MatvecPipeline,
+        wk_pl: *const MatvecPipeline,
+        wv_pl: ?*const MatvecPipeline,
+        norm_dset: vk.VkDescriptorSet,
+        quant_dset: vk.VkDescriptorSet,
+        q_mv_dset: vk.VkDescriptorSet,
+        k_mv_dset: vk.VkDescriptorSet,
+        v_mv_dset: ?vk.VkDescriptorSet,
+        qn_dset: vk.VkDescriptorSet,
+        kn_dset: vk.VkDescriptorSet,
+        vn_dset: vk.VkDescriptorSet,
+        rope_pool: vk.VkDescriptorPool,
+        qr_dset: vk.VkDescriptorSet,
+        kr_dset: vk.VkDescriptorSet,
+    ) !void {
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm.desc_pool, norm_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_quantize_q8_1.desc_pool, quant_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, wq_pl.desc_pool, q_mv_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, wk_pl.desc_pool, k_mv_dset);
+        if (v_mv_dset) |set|
+            try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, wv_pl.?.desc_pool, set);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm_perhead.desc_pool, qn_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm_perhead.desc_pool, kn_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm_perhead.desc_pool, vn_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, rope_pool, qr_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, rope_pool, kr_dset);
     }
 
     fn appendDeferredDescriptorFree(
