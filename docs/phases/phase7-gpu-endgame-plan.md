@@ -848,10 +848,10 @@ Next-session plan:
 1. Fix the async/graph prerequisites from the reverted attempt: give
    `GpuContext` a stable address and add deferred descriptor-set free lists so
    descriptor sets are released only after the owning fence signals. Current
-   status: `runExpertBatch` now attaches transient descriptor sets to the
-   pending async fence and passes `compare` without descriptor reuse enabled.
-   General async command buffers still need the same conversion in attention,
-   dense FFN, post-attention, and one-shot helper paths before they can be
+   status: `runExpertBatch` and the no-readback GPU attention path attach
+   transient descriptor sets to a generic pending async fence and pass
+   `compare` without descriptor reuse enabled. Dense FFN, post-attention, and
+   one-shot helper paths still need the same conversion before they can be
    allowed in flight.
 2. Build a steady decode command-buffer path that records a larger per-token or
    per-layer graph and blocks at real host boundaries, not after every local

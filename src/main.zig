@@ -1725,8 +1725,9 @@ fn envFlagEnabled(name: [:0]const u8, default: bool) bool {
 }
 
 fn printGemma4GpuRuntimeOptions() void {
-    std.debug.print("  Gemma4 GPU options: attn_cpu_kv_shadow={}\n", .{
+    std.debug.print("  Gemma4 GPU options: attn_cpu_kv_shadow={} attention_async={}\n", .{
         envFlagEnabled("LLMTOY_ATTN_CPU_KV_SHADOW", true),
+        envFlagEnabled("LLMTOY_ATTENTION_ASYNC", true),
     });
 }
 

@@ -1521,6 +1521,17 @@ MoE dispatch follow-up:
   `50.644 ms` / `51.16 us`, `dense_ffn.rmsnorm` `16.776 ms` / `16.95 us`, and
   `ffn_moe.residual_add_scale` `0.849 ms` / `0.86 us`. Treat this as a data
   movement cleanup, not a new throughput milestone.
+- Removed the host wait after GPU attention when the attention output remains
+  on GPU for the full fused dense path. The command buffer is now submitted
+  asynchronously only when there is no attention readback, the GPU profiler is
+  off, and the generic pending batch slot is free; transient descriptor sets
+  are freed after the pending fence completes. `LLMTOY_ATTENTION_ASYNC=0`
+  restores the synchronous path for A/B checks.
+- Short unprofiled A/B generation (`GPU=1 TOKENS=8 scripts/profile_gemma4.sh
+  stat`, quiet-system preflight) measured `20.85 tok/s` generation with
+  `LLMTOY_ATTENTION_ASYNC=0` and `21.38 tok/s` with the default async path.
+  Treat this as a small submit/wait overlap win; the profiler cannot measure
+  it directly because async attention is disabled while `LLMTOY_GPU_PROFILE=1`.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

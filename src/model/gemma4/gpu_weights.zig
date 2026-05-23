@@ -1451,7 +1451,7 @@ pub const GpuWeights = struct {
     // For verification / non-full-fused wo paths, the caller can also receive
     // a CPU copy of attn_concat via `attn_out`. Pass null to skip the download.
     pub fn runLayerAttention(
-        self: *const GpuWeights,
+        self: *GpuWeights,
         layer: usize,
         n_heads: u32,
         n_kv_heads: u32,
@@ -1475,6 +1475,10 @@ pub const GpuWeights = struct {
         else
             true;
         const use_fused_small = fused_small_enabled and win_len <= 1024;
+        const async_attention_enabled = if (std.c.getenv("LLMTOY_ATTENTION_ASYNC")) |raw|
+            !std.mem.eql(u8, std.mem.span(raw), "0")
+        else
+            true;
 
         const cmd = try self.ctx.beginBatch();
         var qk_dset: ?vk.VkDescriptorSet = null;
@@ -1503,10 +1507,18 @@ pub const GpuWeights = struct {
             av_dset,
         );
 
-        try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
-
-        if (attn_out) |o| {
-            try attn_buf.download(std.mem.sliceAsBytes(o));
+        const async_attention = async_attention_enabled and attn_out == null and self.ctx.profiler == null and self.pending_gpu_batch == null;
+        if (async_attention) {
+            var async_submit_succeeded = false;
+            errdefer if (!async_submit_succeeded)
+                self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
+            self.pending_gpu_batch = try self.ctx.submitBatchAsyncWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
+            async_submit_succeeded = true;
+        } else {
+            try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
+            if (attn_out) |o| {
+                try attn_buf.download(std.mem.sliceAsBytes(o));
+            }
         }
     }
 
