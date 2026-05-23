@@ -1279,8 +1279,8 @@ pub const GpuWeights = struct {
         kv_slot: u32,
         x: []const f32,
         q_out: ?[]f32,
-        k_out: []f32,
-        v_out: []f32,
+        k_out: ?[]f32,
+        v_out: ?[]f32,
     ) !void {
         const lw = &self.layers[layer];
         const wq = lw.wq orelse return error.NotOnGpu;
@@ -1420,8 +1420,8 @@ pub const GpuWeights = struct {
         self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
 
         if (q_out) |q| try q_buf.download(std.mem.sliceAsBytes(q));
-        try k_buf.download(std.mem.sliceAsBytes(k_out));
-        try v_buf.download(std.mem.sliceAsBytes(v_out));
+        if (k_out) |k| try k_buf.download(std.mem.sliceAsBytes(k));
+        if (v_out) |v| try v_buf.download(std.mem.sliceAsBytes(v));
     }
 
     // 7l.2/3 — GPU attention compute. Replaces the per-head CPU sdpAttn loop.

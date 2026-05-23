@@ -132,6 +132,10 @@ pub fn forwardOne(
         std.fmt.parseUnsigned(usize, std.mem.span(raw), 10) catch cfg.n_layers
     else
         default_moe_tail_skip;
+    const attn_cpu_kv_shadow = if (std.c.getenv("LLMTOY_ATTN_CPU_KV_SHADOW")) |raw|
+        !std.mem.eql(u8, std.mem.span(raw), "0")
+    else
+        true;
 
     for (0..cfg.n_layers) |l| {
         const lw = &w.layers[l];
@@ -204,7 +208,9 @@ pub fn forwardOne(
                 g.q8_1PipelineFor(lw.wv.?.type_)
             else
                 null;
-            try g.runLayerAttnQ8_1KvVram(l, cfg.eps, wq_q8_pl, wk_q8_pl, wv_q8_pl, @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd), @intCast(pos), is_swa, cfg.rope_theta_swa, @intCast(kv_slot_l), x, null, k_cur, v_cur);
+            const k_readback: ?[]f32 = if (attn_cpu_kv_shadow) k_cur else null;
+            const v_readback: ?[]f32 = if (attn_cpu_kv_shadow) v_cur else null;
+            try g.runLayerAttnQ8_1KvVram(l, cfg.eps, wq_q8_pl, wk_q8_pl, wv_q8_pl, @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd), @intCast(pos), is_swa, cfg.rope_theta_swa, @intCast(kv_slot_l), x, null, k_readback, v_readback);
             gpu_did_norms_and_rope = true;
         } else if (can_q8_1_qkv) {
             const g = gpu.?;
@@ -256,12 +262,13 @@ pub fn forwardOne(
             }
         }
 
-        // Write K, V into CPU KV cache. (GPU 7l.1 path also wrote into
-        // k_vram[l]/v_vram[l]; the CPU sdpAttn still reads from kv.k[l]/kv.v[l]
-        // until 7l.2/3 puts the attention compute itself on the GPU.)
+        // Write K, V into CPU KV cache. The GPU KV-VRAM path can opt out of
+        // maintaining this fallback shadow once GPU attention owns the cache.
         const kv_nkv = nkv_l;
-        @memcpy(kv.k[l][kv_slot_l * kv_nkv ..][0..kv_nkv], k_cur);
-        @memcpy(kv.v[l][kv_slot_l * kv_nkv ..][0..kv_nkv], v_cur);
+        if (!gpu_did_norms_and_rope or attn_cpu_kv_shadow) {
+            @memcpy(kv.k[l][kv_slot_l * kv_nkv ..][0..kv_nkv], k_cur);
+            @memcpy(kv.v[l][kv_slot_l * kv_nkv ..][0..kv_nkv], v_cur);
+        }
 
         // Determine attended positions.
         const seq = pos + 1;
