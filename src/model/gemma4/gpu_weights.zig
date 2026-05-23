@@ -1671,16 +1671,25 @@ pub const GpuWeights = struct {
 
         const norm2_dset = try self.recordLayerRmsnorm(cmd, layer, ffn_buf, post_ffw_norm_1_buf, out_buf, @intCast(w_down.rows), eps, false);
 
-        try self.ctx.submitBatch(cmd);
+        var descriptor_frees: [gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree = undefined;
+        var descriptor_free_count: usize = 0;
+        try self.collectRunLayerDenseFfnDescriptorFrees(
+            &descriptor_frees,
+            &descriptor_free_count,
+            gate_pl,
+            up_pl,
+            down_pl,
+            norm_dset,
+            quant_dset,
+            gate_dset,
+            up_dset,
+            gelu_dset,
+            down_dset,
+            norm2_dset,
+        );
 
-        const dev = self.ctx.device;
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &norm_dset);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_quantize_q8_1.desc_pool, 1, &quant_dset);
-        _ = vk.vkFreeDescriptorSets(dev, gate_pl.desc_pool, 1, &gate_dset);
-        _ = vk.vkFreeDescriptorSets(dev, up_pl.desc_pool, 1, &up_dset);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_gelu_mul.desc_pool, 1, &gelu_dset);
-        _ = vk.vkFreeDescriptorSets(dev, down_pl.desc_pool, 1, &down_dset);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &norm2_dset);
+        try self.ctx.submitBatch(cmd);
+        self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
 
         try out_buf.download(std.mem.sliceAsBytes(ffn_out));
     }
@@ -2416,6 +2425,30 @@ pub const GpuWeights = struct {
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_gelu_mul.desc_pool, gelu_dset);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, down_pl.desc_pool, down_dset);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm.desc_pool, post_ffw_dset);
+    }
+
+    fn collectRunLayerDenseFfnDescriptorFrees(
+        self: *const GpuWeights,
+        descriptor_frees: *[gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree,
+        descriptor_free_count: *usize,
+        gate_pl: *const MatvecPipeline,
+        up_pl: *const MatvecPipeline,
+        down_pl: *const MatvecPipeline,
+        norm_dset: vk.VkDescriptorSet,
+        quant_dset: vk.VkDescriptorSet,
+        gate_dset: vk.VkDescriptorSet,
+        up_dset: vk.VkDescriptorSet,
+        gelu_dset: vk.VkDescriptorSet,
+        down_dset: vk.VkDescriptorSet,
+        norm2_dset: vk.VkDescriptorSet,
+    ) !void {
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm.desc_pool, norm_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_quantize_q8_1.desc_pool, quant_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, gate_pl.desc_pool, gate_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, up_pl.desc_pool, up_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_gelu_mul.desc_pool, gelu_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, down_pl.desc_pool, down_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm.desc_pool, norm2_dset);
     }
 
     fn appendDeferredDescriptorFree(
