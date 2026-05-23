@@ -1770,6 +1770,8 @@ pub const GpuWeights = struct {
     //  11. rmsnorm(ffn_vram, post_ffw_norm_1)  → dense_ffn_out_buf
     // After submit, x_vram is copied through stage_buf back into x, and
     // dense_ffn_out_buf holds the dense FFN output (post_ffw_norm_1 applied).
+    // Pass null for ffn_out when the following MoE tail will consume that
+    // buffer on GPU and CPU fallback can explicitly download it later.
     //
     // Saves one submit (the standalone wo submit) compared to the
     // runLayerDenseFfnQ8_1 entry point, and removes one CPU rmsnorm
@@ -1793,7 +1795,7 @@ pub const GpuWeights = struct {
         down_pl: *const MatvecPipeline, // f32-acts pipeline for w_down
         x: []f32, // in: unnormalized residual; out: x + post_attn_norm(wo(attn_concat))
         attn_concat: []const f32, // CPU sdpAttn output, length = nq
-        ffn_out: []f32, // post_ffw_norm_1 result (d_model)
+        ffn_out: ?[]f32, // post_ffw_norm_1 result (d_model)
         skip_attn_upload: bool, // 7l.2/3: GPU attention already wrote attn_in_buf
     ) !void {
         const lw = &self.layers[layer];
@@ -1812,7 +1814,7 @@ pub const GpuWeights = struct {
         std.debug.assert(w_gate.rows == w_up.rows);
         std.debug.assert(w_down.cols == w_gate.rows); // d_ffn
         std.debug.assert(w_down.rows == x.len);
-        std.debug.assert(w_down.rows == ffn_out.len);
+        if (ffn_out) |out| std.debug.assert(w_down.rows == out.len);
 
         const x_buf = &(self.x_vram orelse return error.NotOnGpu);
         const stage_buf = &(self.stage_buf orelse return error.NotOnGpu);
@@ -1917,8 +1919,15 @@ pub const GpuWeights = struct {
 
         try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
 
-        try out_buf.download(std.mem.sliceAsBytes(ffn_out));
+        if (ffn_out) |out| {
+            try out_buf.download(std.mem.sliceAsBytes(out));
+        }
         try stage_buf.download(std.mem.sliceAsBytes(x));
+    }
+
+    pub fn downloadDenseFfnOut(self: *const GpuWeights, out: []f32) !void {
+        const out_buf = &(self.dense_ffn_out_buf orelse return error.NotOnGpu);
+        try out_buf.download(std.mem.sliceAsBytes(out));
     }
 
     // Dispatch w_gate and w_up in one command buffer (both read the same FFN-norm xb).

@@ -322,6 +322,8 @@ pub fn forwardOne(
             for (x, attn_buf) |*xi, a| xi.* += a;
         }
 
+        const use_moe_vram_tail = moe_vram_tail_enabled and l < moe_vram_tail_limit and l != moe_vram_tail_skip;
+
         // ── Dense FFN path ────────────────────────────────────────────────────
         //
         // FFN dispatch paths, in priority order:
@@ -343,8 +345,9 @@ pub fn forwardOne(
 
         if (can_full_fused) {
             const g = gpu.?;
-            try g.runLayerAttnResidualDenseFfnQ8_1(l, cfg.eps, wo_q8_pl.?, gate_q8_pl.?, up_q8_pl.?, g.pipelineFor(lw.w_down.type_), x, attn_concat[0..nq_l], ffn_buf, use_gpu_attn);
-            // x updated with post-attn residual; ffn_buf has post_ffw_norm_1.
+            const dense_readback: ?[]f32 = if (use_moe_vram_tail) null else ffn_buf;
+            try g.runLayerAttnResidualDenseFfnQ8_1(l, cfg.eps, wo_q8_pl.?, gate_q8_pl.?, up_q8_pl.?, g.pipelineFor(lw.w_down.type_), x, attn_concat[0..nq_l], dense_readback, use_gpu_attn);
+            // x updated with post-attn residual; dense_ffn_out_buf has post_ffw_norm_1.
             x_current_in_gpu_shared_vec = false;
             x_current_in_gpu_vram = true;
             dense_current_in_gpu_out_buf = true;
@@ -390,7 +393,6 @@ pub fn forwardOne(
         // vector device-resident and finishes the FFN/MoE residual tail on GPU
         // for all non-skipped layers.
         @memset(moe_buf, 0.0);
-        const use_moe_vram_tail = moe_vram_tail_enabled and l < moe_vram_tail_limit and l != moe_vram_tail_skip;
         var moe_residual_done_on_gpu = false;
 
         // Batched GPU path: expert batch submit, optionally followed by the
@@ -414,6 +416,9 @@ pub fn forwardOne(
                 moe_residual_done_on_gpu = true;
             }
         } else |_| {
+            if (dense_current_in_gpu_out_buf) {
+                try gpu.?.downloadDenseFfnOut(ffn_buf);
+            }
             // CPU fallback: one expert at a time with thread pool.
             const gu_row_bytes = math.rowBytes(lw.gate_up_exps.type_, d);
             const gu_per_expert = 2 * cfg.d_expert * gu_row_bytes;
