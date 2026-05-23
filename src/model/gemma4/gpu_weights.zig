@@ -1741,17 +1741,16 @@ pub const GpuWeights = struct {
     //   1. quantize(attn_concat)              → shared_acts_q8_1   (acts for wo)
     //   2. wo matvec (Q8_1)                    → attn_vram           (rows=d_model)
     //   3. rmsnorm(attn_vram, post_attn_norm) → attn_vram (in place)
-    //   4. elem_add(x_buf, attn_vram)          → x_buf (post-attn residual)
-    //   5. rmsnorm(x_buf, ffn_norm)            → xb_vram
+    //   4. elem_add(x_vram, attn_vram)         → x_vram (post-attn residual)
+    //   5. rmsnorm(x_vram, ffn_norm)           → xb_vram
     //   6. quantize(xb_vram)                   → shared_acts_q8_1   (acts for FFN)
     //   7. gate matvec  (Q8_1)                 → gate_vram
     //   8. up   matvec  (Q8_1)                 → up_vram
     //   9. gelu_mul: gate_vram = gelu(g)*u    (in place)
     //  10. w_down matvec (f32-acts pl_q3_k)    → ffn_vram
     //  11. rmsnorm(ffn_vram, post_ffw_norm_1)  → dense_ffn_out_buf
-    // After submit, host-coherent x_buf holds the post-attention residual
-    // (x + attn_buf after norm) and dense_ffn_out_buf holds the dense FFN
-    // output (post_ffw_norm_1 applied).  Caller downloads both.
+    // After submit, x_vram is copied through stage_buf back into x, and
+    // dense_ffn_out_buf holds the dense FFN output (post_ffw_norm_1 applied).
     //
     // Saves one submit (the standalone wo submit) compared to the
     // runLayerDenseFfnQ8_1 entry point, and removes one CPU rmsnorm
@@ -1796,7 +1795,8 @@ pub const GpuWeights = struct {
         std.debug.assert(w_down.rows == x.len);
         std.debug.assert(w_down.rows == ffn_out.len);
 
-        const x_buf = &self.shared_vec.?; // host-coherent x
+        const x_buf = &(self.x_vram orelse return error.NotOnGpu);
+        const stage_buf = &(self.stage_buf orelse return error.NotOnGpu);
         const attn_in_buf = &(self.attn_in_buf orelse return error.NotOnGpu);
         const attn_vram = &(self.attn_vram orelse return error.NotOnGpu);
         const xb_buf = &(self.xb_vram orelse return error.NotOnGpu);
@@ -1806,12 +1806,14 @@ pub const GpuWeights = struct {
         const ffn_buf = &(self.ffn_vram orelse return error.NotOnGpu);
         const out_buf = &(self.dense_ffn_out_buf orelse return error.NotOnGpu);
 
-        try x_buf.upload(std.mem.sliceAsBytes(x));
+        try stage_buf.upload(std.mem.sliceAsBytes(x));
         if (!skip_attn_upload) {
             try attn_in_buf.upload(std.mem.sliceAsBytes(attn_concat));
         }
 
         const cmd = try self.ctx.beginBatch();
+        GpuCtx.recordCopy(cmd, stage_buf.handle, x_buf.handle, x.len * @sizeOf(f32));
+        GpuCtx.recordTransferToShaderBarrier(cmd);
 
         // wo: quantize attn_concat, then Q8_1 matvec into attn_vram.
         const p_wo_quant = self.ctx.profileBegin(cmd, "post_attn.wo_quantize");
@@ -1829,8 +1831,8 @@ pub const GpuWeights = struct {
         self.ctx.profileEnd(cmd, p_post_attn);
         GpuCtx.recordShaderBarrier(cmd);
 
-        // Residual: x_buf += attn_vram.  x_buf is HOST_COHERENT shared_vec
-        // pre-loaded by the caller; after this dispatch it carries the new x.
+        // Residual: x_vram += attn_vram; copied back to CPU after this fused
+        // dense block so CPU-side router work still sees the updated residual.
         const p_add = self.ctx.profileBegin(cmd, "post_attn.residual_add");
         const add_dset = try self.pl_elem_add.record(cmd, x_buf, attn_vram, @intCast(wo.rows));
         self.ctx.profileEnd(cmd, p_add);
@@ -1869,6 +1871,8 @@ pub const GpuWeights = struct {
         const p_post_ffw = self.ctx.profileBegin(cmd, "dense_ffn.post_norm");
         const post_ffw_dset = try self.recordLayerRmsnorm(cmd, layer, ffn_buf, post_ffw_norm_1_buf, out_buf, @intCast(w_down.rows), eps, false);
         self.ctx.profileEnd(cmd, p_post_ffw);
+        GpuCtx.recordShaderToTransferBarrier(cmd);
+        GpuCtx.recordCopy(cmd, x_buf.handle, stage_buf.handle, x.len * @sizeOf(f32));
 
         var descriptor_frees: [gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree = undefined;
         var descriptor_free_count: usize = 0;
@@ -1896,7 +1900,7 @@ pub const GpuWeights = struct {
         self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
 
         try out_buf.download(std.mem.sliceAsBytes(ffn_out));
-        try x_buf.download(std.mem.sliceAsBytes(x));
+        try stage_buf.download(std.mem.sliceAsBytes(x));
     }
 
     // Dispatch w_gate and w_up in one command buffer (both read the same FFN-norm xb).

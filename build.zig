@@ -72,8 +72,12 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(expert_down_id_iq4_nl_q8_1_spv, "expert_down_id_iq4_nl_q8_1.spv");
     const rmsnorm_spv = compileShader(b, "src/gpu/shaders/rmsnorm.glsl");
     _ = wf.addCopyFile(rmsnorm_spv, "rmsnorm.spv");
+    const rmsnorm_128_spv = compileShader(b, "src/gpu/shaders/rmsnorm_128.glsl");
+    _ = wf.addCopyFile(rmsnorm_128_spv, "rmsnorm_128.spv");
     const add_rmsnorm_spv = compileShader(b, "src/gpu/shaders/add_rmsnorm.glsl");
     _ = wf.addCopyFile(add_rmsnorm_spv, "add_rmsnorm.spv");
+    const add_rmsnorm_128_spv = compileShader(b, "src/gpu/shaders/add_rmsnorm_128.glsl");
+    _ = wf.addCopyFile(add_rmsnorm_128_spv, "add_rmsnorm_128.spv");
     const rmsnorm_perhead_spv = compileShader(b, "src/gpu/shaders/rmsnorm_perhead.glsl");
     _ = wf.addCopyFile(rmsnorm_perhead_spv, "rmsnorm_perhead.spv");
     const elem_add_spv = compileShader(b, "src/gpu/shaders/elem_add.glsl");
@@ -129,7 +133,9 @@ pub fn build(b: *std.Build) void {
         \\pub const expert_down_id_q5_1_q8_1 align(4) = @embedFile("expert_down_id_q5_1_q8_1.spv").*;
         \\pub const expert_down_id_iq4_nl_q8_1 align(4) = @embedFile("expert_down_id_iq4_nl_q8_1.spv").*;
         \\pub const rmsnorm             align(4) = @embedFile("rmsnorm.spv").*;
+        \\pub const rmsnorm_128         align(4) = @embedFile("rmsnorm_128.spv").*;
         \\pub const add_rmsnorm         align(4) = @embedFile("add_rmsnorm.spv").*;
+        \\pub const add_rmsnorm_128     align(4) = @embedFile("add_rmsnorm_128.spv").*;
         \\pub const rmsnorm_perhead     align(4) = @embedFile("rmsnorm_perhead.spv").*;
         \\pub const elem_add            align(4) = @embedFile("elem_add.spv").*;
         \\pub const elem_scale          align(4) = @embedFile("elem_scale.spv").*;

@@ -344,7 +344,7 @@ pub fn forwardOne(
             const g = gpu.?;
             try g.runLayerAttnResidualDenseFfnQ8_1(l, cfg.eps, wo_q8_pl.?, gate_q8_pl.?, up_q8_pl.?, g.pipelineFor(lw.w_down.type_), x, attn_concat[0..nq_l], ffn_buf, use_gpu_attn);
             // x updated with post-attn residual; ffn_buf has post_ffw_norm_1.
-            x_current_in_gpu_shared_vec = true;
+            x_current_in_gpu_shared_vec = false;
             dense_current_in_gpu_out_buf = true;
         } else if (can_fused_dense) {
             const g = gpu.?;

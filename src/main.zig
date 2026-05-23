@@ -116,6 +116,18 @@ pub fn main(init: std.process.Init) !void {
             i += 2;
         }
         try cmdBenchMoe(out, args[2], opts, io, gpa);
+    } else if (std.mem.eql(u8, args[1], "bench-rmsnorm")) {
+        var opts = RmsnormBenchOptions{};
+        var i: usize = 2;
+        while (i < args.len) {
+            const flag = args[i];
+            if (i + 1 >= args.len) break;
+            const val = args[i + 1];
+            if (std.mem.eql(u8, flag, "--iters")) opts.iters = try std.fmt.parseInt(u32, val, 10);
+            if (std.mem.eql(u8, flag, "--n")) opts.n = try std.fmt.parseInt(u32, val, 10);
+            i += 2;
+        }
+        try cmdBenchRmsnorm(out, opts, io, gpa);
     } else if (std.mem.eql(u8, args[1], "generate")) {
         if (args.len < 4) {
             std.debug.print(
@@ -222,6 +234,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\  llmtoy tokenize <model.gguf> <text>    BPE-encode text, print IDs and decoded tokens
         \\  llmtoy bench-matvec <model.gguf> [--iters N] [--target NAME] [--reuse-descriptor]
         \\  llmtoy bench-moe <model.gguf> [--iters N] [--layer N] [--skip-readback] [--tail]
+        \\  llmtoy bench-rmsnorm [--iters N] [--n N]
         \\  llmtoy generate <model.gguf> <prompt> [--chat] [--gpu] [--max-tokens N] [--temperature T] [--top-p P] [--top-k K] [--seed S] [--threads N] [--stop-token TOKEN] [--gpu-layers L0:L1]
         \\  llmtoy compare  <model.gguf> <prompt> [--chat] [--threads N] [--gpu-layers L0:L1]
         \\
@@ -231,6 +244,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
         \\  compare:      run one CPU and one GPU forward pass, print per-layer residual divergence
         \\  bench-matvec: benchmark current Q8_1 matvec kernels on representative real tensors
         \\  bench-moe:    benchmark the current top-k expert batch path on real Gemma4 tensors
+        \\  bench-rmsnorm: benchmark single-row RMSNorm and add+RMSNorm kernel shapes
         \\
     );
 }
@@ -378,6 +392,11 @@ const MoeBenchOptions = struct {
     layer: usize = 0,
     skip_readback: bool = false,
     tail: bool = false,
+};
+
+const RmsnormBenchOptions = struct {
+    iters: u32 = 256,
+    n: u32 = 2816,
 };
 
 const BenchPipelines = struct {
@@ -624,6 +643,149 @@ const BenchPipelines = struct {
         };
     }
 };
+
+fn cmdBenchRmsnorm(out: *std.Io.Writer, opts: RmsnormBenchOptions, io: std.Io, gpa: std.mem.Allocator) !void {
+    if (opts.n % 256 != 0) return error.InvalidRmsnormShape;
+
+    var ctx = try gpu_ctx.GpuContext.init();
+    defer ctx.deinit();
+
+    var rms_256 = try gpu_matvec.RmsnormPipeline.init(&ctx);
+    defer rms_256.deinit();
+    var rms_128 = try gpu_matvec.RmsnormPipeline.initR128(&ctx);
+    defer rms_128.deinit();
+    var add_256 = try gpu_matvec.AddRmsnormPipeline.init(&ctx);
+    defer add_256.deinit();
+    var add_128 = try gpu_matvec.AddRmsnormPipeline.initR128(&ctx);
+    defer add_128.deinit();
+
+    const n: usize = opts.n;
+    const x = try gpa.alloc(f32, n);
+    defer gpa.free(x);
+    const b = try gpa.alloc(f32, n);
+    defer gpa.free(b);
+    const w = try gpa.alloc(f32, n);
+    defer gpa.free(w);
+    for (x, 0..) |*v, i| {
+        const centered: i32 = @as(i32, @intCast(i % 41)) - 20;
+        v.* = @as(f32, @floatFromInt(centered)) / 13.0;
+    }
+    for (b, 0..) |*v, i| {
+        const centered: i32 = @as(i32, @intCast(i % 37)) - 18;
+        v.* = @as(f32, @floatFromInt(centered)) / 17.0;
+    }
+    for (w, 0..) |*v, i| {
+        const centered: i32 = @as(i32, @intCast(i % 29)) - 14;
+        v.* = 1.0 + @as(f32, @floatFromInt(centered)) / 64.0;
+    }
+
+    var x_buf = try uploadDeviceLocalBytes(&ctx, std.mem.sliceAsBytes(x), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer x_buf.deinit();
+    var b_buf = try uploadDeviceLocalBytes(&ctx, std.mem.sliceAsBytes(b), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer b_buf.deinit();
+    var w_buf = try uploadDeviceLocalBytes(&ctx, std.mem.sliceAsBytes(w), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer w_buf.deinit();
+    var y_buf = try gpu_buffer.GpuBuffer.initDeviceLocal(&ctx, n * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer y_buf.deinit();
+
+    var rms_256_set = try rms_256.allocSet(&x_buf, &w_buf, &y_buf);
+    defer _ = vk.vkFreeDescriptorSets(ctx.device, rms_256.desc_pool, 1, &rms_256_set);
+    var rms_128_set = try rms_128.allocSet(&x_buf, &w_buf, &y_buf);
+    defer _ = vk.vkFreeDescriptorSets(ctx.device, rms_128.desc_pool, 1, &rms_128_set);
+    var add_256_set = try add_256.allocSet(&x_buf, &b_buf, &w_buf, &y_buf);
+    defer _ = vk.vkFreeDescriptorSets(ctx.device, add_256.desc_pool, 1, &add_256_set);
+    var add_128_set = try add_128.allocSet(&x_buf, &b_buf, &w_buf, &y_buf);
+    defer _ = vk.vkFreeDescriptorSets(ctx.device, add_128.desc_pool, 1, &add_128_set);
+
+    try out.print("GPU RMSNorm microbench: iters={} n={}\n", .{ opts.iters, opts.n });
+    try out.print("{s:20} {s:>10} {s:>10} {s:>10}\n", .{ "name", "wall_us", "gpu_us", "host_us" });
+    try benchRmsnormPipeline(out, &ctx, &rms_256, rms_256_set, opts.n, opts.iters, "rmsnorm.256", io);
+    try benchRmsnormPipeline(out, &ctx, &rms_128, rms_128_set, opts.n, opts.iters, "rmsnorm.128", io);
+    try benchAddRmsnormPipeline(out, &ctx, &add_256, add_256_set, opts.n, opts.iters, "add_rmsnorm.256", io);
+    try benchAddRmsnormPipeline(out, &ctx, &add_128, add_128_set, opts.n, opts.iters, "add_rmsnorm.128", io);
+}
+
+fn benchRmsnormPipeline(
+    out: *std.Io.Writer,
+    ctx: *const gpu_ctx.GpuContext,
+    pipeline: *const gpu_matvec.RmsnormPipeline,
+    dset: vk.VkDescriptorSet,
+    n: u32,
+    iters: u32,
+    label: []const u8,
+    io: std.Io,
+) !void {
+    {
+        const cmd = try ctx.beginBatch();
+        const p = ctx.profileBegin(cmd, label);
+        pipeline.recordWithSet(cmd, dset, n, 1e-6, false);
+        ctx.profileEnd(cmd, p);
+        try ctx.submitBatch(cmd);
+    }
+    const before = ctx.profileStats(label);
+    const clk = std.Io.Clock.real;
+    const t0 = clk.now(io);
+    for (0..iters) |_| {
+        const cmd = try ctx.beginBatch();
+        const p = ctx.profileBegin(cmd, label);
+        pipeline.recordWithSet(cmd, dset, n, 1e-6, false);
+        ctx.profileEnd(cmd, p);
+        try ctx.submitBatch(cmd);
+    }
+    const t1 = clk.now(io);
+    const after = ctx.profileStats(label);
+    try printGpuBenchLine(out, label, t0.durationTo(t1).nanoseconds, before, after, iters);
+}
+
+fn benchAddRmsnormPipeline(
+    out: *std.Io.Writer,
+    ctx: *const gpu_ctx.GpuContext,
+    pipeline: *const gpu_matvec.AddRmsnormPipeline,
+    dset: vk.VkDescriptorSet,
+    n: u32,
+    iters: u32,
+    label: []const u8,
+    io: std.Io,
+) !void {
+    {
+        const cmd = try ctx.beginBatch();
+        const p = ctx.profileBegin(cmd, label);
+        pipeline.recordWithSet(cmd, dset, n, 1e-6, false, false);
+        ctx.profileEnd(cmd, p);
+        try ctx.submitBatch(cmd);
+    }
+    const before = ctx.profileStats(label);
+    const clk = std.Io.Clock.real;
+    const t0 = clk.now(io);
+    for (0..iters) |_| {
+        const cmd = try ctx.beginBatch();
+        const p = ctx.profileBegin(cmd, label);
+        pipeline.recordWithSet(cmd, dset, n, 1e-6, false, false);
+        ctx.profileEnd(cmd, p);
+        try ctx.submitBatch(cmd);
+    }
+    const t1 = clk.now(io);
+    const after = ctx.profileStats(label);
+    try printGpuBenchLine(out, label, t0.durationTo(t1).nanoseconds, before, after, iters);
+}
+
+fn printGpuBenchLine(
+    out: *std.Io.Writer,
+    label: []const u8,
+    wall_ns: i128,
+    before: gpu_ctx.ProfileStats,
+    after: gpu_ctx.ProfileStats,
+    iters: u32,
+) !void {
+    const wall_us = @as(f64, @floatFromInt(wall_ns)) / @as(f64, @floatFromInt(iters)) / 1000.0;
+    const count_delta = after.count - before.count;
+    const gpu_ns = after.total_ns - before.total_ns;
+    const gpu_us = if (count_delta == 0)
+        0.0
+    else
+        @as(f64, @floatFromInt(gpu_ns)) / @as(f64, @floatFromInt(count_delta)) / 1000.0;
+    try out.print("{s:20} {d:10.2} {d:10.2} {d:10.2}\n", .{ label, wall_us, gpu_us, @max(0.0, wall_us - gpu_us) });
+}
 
 fn cmdBenchMatvec(
     out: *std.Io.Writer,

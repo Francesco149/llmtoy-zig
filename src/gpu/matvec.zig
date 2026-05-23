@@ -1562,9 +1562,19 @@ pub const RmsnormPipeline = struct {
     dset_layout: vk.VkDescriptorSetLayout,
     desc_pool: vk.VkDescriptorPool,
     device: vk.VkDevice,
+    workgroup_size: u32,
 
     pub fn init(ctx: *const GpuContext) !RmsnormPipeline {
         comptime std.debug.assert(shaders.rmsnorm.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.rmsnorm, 256);
+    }
+
+    pub fn initR128(ctx: *const GpuContext) !RmsnormPipeline {
+        comptime std.debug.assert(shaders.rmsnorm_128.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.rmsnorm_128, 128);
+    }
+
+    fn initFromSpv(ctx: *const GpuContext, spv: []align(4) const u8, workgroup_size: u32) !RmsnormPipeline {
         const dev = ctx.device;
 
         const bindings = [3]vk.VkDescriptorSetLayoutBinding{
@@ -1601,7 +1611,6 @@ pub const RmsnormPipeline = struct {
             return error.VkPipelineLayoutFailed;
         errdefer vk.vkDestroyPipelineLayout(dev, layout, null);
 
-        const spv = &shaders.rmsnorm;
         const shader_ci = vk.VkShaderModuleCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
             .pNext = null,
@@ -1658,6 +1667,7 @@ pub const RmsnormPipeline = struct {
             .dset_layout = dset_layout,
             .desc_pool = desc_pool,
             .device = dev,
+            .workgroup_size = workgroup_size,
         };
     }
 
@@ -1698,7 +1708,7 @@ pub const RmsnormPipeline = struct {
         weight_offset: bool,
         precise_sum: bool,
     ) !vk.VkDescriptorSet {
-        std.debug.assert(n % 256 == 0);
+        std.debug.assert(n % self.workgroup_size == 0);
         const dset = try self.allocSet(x_buf, w_buf, y_buf);
         self.recordWithSetMode(cmd, dset, n, eps, weight_offset, precise_sum);
         return dset;
@@ -1766,7 +1776,7 @@ pub const RmsnormPipeline = struct {
         weight_offset: bool,
         precise_sum: bool,
     ) void {
-        std.debug.assert(n % 256 == 0);
+        std.debug.assert(n % self.workgroup_size == 0);
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
 
@@ -1800,16 +1810,27 @@ pub const AddRmsnormPipeline = struct {
     dset_layout: vk.VkDescriptorSetLayout,
     desc_pool: vk.VkDescriptorPool,
     device: vk.VkDevice,
+    workgroup_size: u32,
 
     pub fn init(ctx: *const GpuContext) !AddRmsnormPipeline {
         comptime std.debug.assert(shaders.add_rmsnorm.len % 4 == 0);
-        const built = try buildSimplePipeline(ctx, &shaders.add_rmsnorm, 4, @sizeOf(RmsnormPushConst), 64);
+        return initFromSpv(ctx, &shaders.add_rmsnorm, 256);
+    }
+
+    pub fn initR128(ctx: *const GpuContext) !AddRmsnormPipeline {
+        comptime std.debug.assert(shaders.add_rmsnorm_128.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.add_rmsnorm_128, 128);
+    }
+
+    fn initFromSpv(ctx: *const GpuContext, spv: []align(4) const u8, workgroup_size: u32) !AddRmsnormPipeline {
+        const built = try buildSimplePipeline(ctx, spv, 4, @sizeOf(RmsnormPushConst), 64);
         return .{
             .pipeline = built.pipeline,
             .layout = built.layout,
             .dset_layout = built.dset_layout,
             .desc_pool = built.desc_pool,
             .device = ctx.device,
+            .workgroup_size = workgroup_size,
         };
     }
 
@@ -1856,7 +1877,7 @@ pub const AddRmsnormPipeline = struct {
         weight_offset: bool,
         precise_sum: bool,
     ) void {
-        std.debug.assert(n % 256 == 0);
+        std.debug.assert(n % self.workgroup_size == 0);
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = RmsnormPushConst{
@@ -4692,9 +4713,13 @@ fn runRmsnormShader(
     eps: f32,
     weight_offset: bool,
     precise_sum: bool,
+    use_r128: bool,
     out: []f32,
 ) !void {
-    var pl = try RmsnormPipeline.init(gpu);
+    var pl = if (use_r128)
+        try RmsnormPipeline.initR128(gpu)
+    else
+        try RmsnormPipeline.init(gpu);
     defer pl.deinit();
 
     var x_buf = try GpuBuffer.initHostCoherent(gpu, x.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
@@ -4737,6 +4762,8 @@ fn fuzzRmsnorm(n: usize, seed: u64, weight_offset: bool, precise_sum: bool) !voi
     defer al.free(cpu_out);
     const gpu_out = try al.alloc(f32, n);
     defer al.free(gpu_out);
+    const gpu_out_r128 = try al.alloc(f32, n);
+    defer al.free(gpu_out_r128);
 
     for (x) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
     for (w) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
@@ -4749,18 +4776,26 @@ fn fuzzRmsnorm(n: usize, seed: u64, weight_offset: bool, precise_sum: bool) !voi
     const bias: f32 = if (weight_offset) 1.0 else 0.0;
     for (cpu_out, x, w) |*o, xi, wi| o.* = xi * rms_inv * (bias + wi);
 
-    try runRmsnormShader(&gpu, x, w, eps, weight_offset, precise_sum, gpu_out);
+    try runRmsnormShader(&gpu, x, w, eps, weight_offset, precise_sum, false, gpu_out);
+    try runRmsnormShader(&gpu, x, w, eps, weight_offset, precise_sum, true, gpu_out_r128);
 
     var max_abs: f32 = 0.0;
     var max_ref: f32 = 0.0;
+    var max_abs_r128: f32 = 0.0;
     for (cpu_out, gpu_out) |c, g| {
         const d = @abs(c - g);
         if (d > max_abs) max_abs = d;
         if (@abs(c) > max_ref) max_ref = @abs(c);
     }
+    for (cpu_out, gpu_out_r128) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs_r128) max_abs_r128 = d;
+    }
     const rel = max_abs / (max_ref + 1e-6);
-    std.debug.print("rmsnorm fuzz n={} bias={} precise={} max|D|={d:.6} rel={e:.3}\n", .{ n, weight_offset, precise_sum, max_abs, rel });
+    const rel_r128 = max_abs_r128 / (max_ref + 1e-6);
+    std.debug.print("rmsnorm fuzz n={} bias={} precise={} max|D|={d:.6} rel={e:.3} r128_rel={e:.3}\n", .{ n, weight_offset, precise_sum, max_abs, rel, rel_r128 });
     try std.testing.expect(rel < 1e-5);
+    try std.testing.expect(rel_r128 < 1e-5);
 }
 
 test "gpu rmsnorm n=512 fuzz" {
@@ -4786,9 +4821,13 @@ fn runAddRmsnormShader(
     eps: f32,
     weight_offset: bool,
     precise_sum: bool,
+    use_r128: bool,
     out: []f32,
 ) !void {
-    var pl = try AddRmsnormPipeline.init(gpu);
+    var pl = if (use_r128)
+        try AddRmsnormPipeline.initR128(gpu)
+    else
+        try AddRmsnormPipeline.init(gpu);
     defer pl.deinit();
 
     var a_buf = try GpuBuffer.initHostCoherent(gpu, a.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
@@ -4835,6 +4874,8 @@ fn fuzzAddRmsnorm(n: usize, seed: u64, weight_offset: bool, precise_sum: bool) !
     defer al.free(cpu_out);
     const gpu_out = try al.alloc(f32, n);
     defer al.free(gpu_out);
+    const gpu_out_r128 = try al.alloc(f32, n);
+    defer al.free(gpu_out_r128);
 
     for (a) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
     for (b) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
@@ -4850,18 +4891,26 @@ fn fuzzAddRmsnorm(n: usize, seed: u64, weight_offset: bool, precise_sum: bool) !
     const bias: f32 = if (weight_offset) 1.0 else 0.0;
     for (cpu_out, a, b, w) |*o, av, bv, wi| o.* = (av + bv) * rms_inv * (bias + wi);
 
-    try runAddRmsnormShader(&gpu, a, b, w, eps, weight_offset, precise_sum, gpu_out);
+    try runAddRmsnormShader(&gpu, a, b, w, eps, weight_offset, precise_sum, false, gpu_out);
+    try runAddRmsnormShader(&gpu, a, b, w, eps, weight_offset, precise_sum, true, gpu_out_r128);
 
     var max_abs: f32 = 0.0;
     var max_ref: f32 = 0.0;
+    var max_abs_r128: f32 = 0.0;
     for (cpu_out, gpu_out) |c, g| {
         const d = @abs(c - g);
         if (d > max_abs) max_abs = d;
         if (@abs(c) > max_ref) max_ref = @abs(c);
     }
+    for (cpu_out, gpu_out_r128) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs_r128) max_abs_r128 = d;
+    }
     const rel = max_abs / (max_ref + 1e-6);
-    std.debug.print("add_rmsnorm fuzz n={} bias={} precise={} max|D|={d:.6} rel={e:.3}\n", .{ n, weight_offset, precise_sum, max_abs, rel });
+    const rel_r128 = max_abs_r128 / (max_ref + 1e-6);
+    std.debug.print("add_rmsnorm fuzz n={} bias={} precise={} max|D|={d:.6} rel={e:.3} r128_rel={e:.3}\n", .{ n, weight_offset, precise_sum, max_abs, rel, rel_r128 });
     try std.testing.expect(rel < 1e-5);
+    try std.testing.expect(rel_r128 < 1e-5);
 }
 
 test "gpu add_rmsnorm n=2816 fuzz" {

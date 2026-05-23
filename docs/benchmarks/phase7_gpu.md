@@ -1483,6 +1483,29 @@ MoE dispatch follow-up:
   `54.68 us`. Overall GPU dispatch time moved only slightly
   (`492.717 ms` -> `490.638 ms`) and generation stayed about `20 tok/s`, so this
   is a narrow shader-shape win rather than an end-to-end milestone.
+- Added `bench-rmsnorm` and swept a 128-thread single-row RMSNorm /
+  add-RMSNorm variant. The smaller workgroup is correctness-safe but a clear
+  negative on the target shape: for `n=2816`, current 256-thread RMSNorm is
+  about `11.20 us` GPU and add-RMSNorm about `11.37 us`, while the 128-thread
+  variants are about `21.18 us` and `21.47 us`. Keep r128 bench-only.
+- The same microbench showed the production norm hotspot was not reduction
+  shape alone: device-local synthetic RMSNorm is about `11 us`, while full
+  generation had `dense_ffn.rmsnorm` around `26 us`. Moved the fused
+  post-attention residual stream inside `runLayerAttnResidualDenseFfnQ8_1`
+  from HOST_COHERENT `shared_vec` to device-local `x_vram`, copying the 2816-f32
+  residual through the existing staging buffer at the beginning/end of the
+  fused block. The MoE tail contract now conservatively treats `shared_vec` as
+  stale after that block, so `runExpertBatch` re-uploads `x` when it needs the
+  tail input.
+- Correctness: `zig build test` passes, and full
+  `compare ... "explain MoE" --chat` keeps all layer argmaxes and final argmax
+  matching CPU.
+- Short profiled generation after the `x_vram` residual change:
+  `dense_ffn.rmsnorm` improved from `25.785 ms` total / `26.05 us` avg to
+  `16.768 ms` / `16.94 us`, and `post_attn.residual_add` improved from
+  `2.112 ms` / `2.13 us` to `0.888 ms` / `0.90 us`. Overall profiled GPU
+  dispatch improved from `490.638 ms` to `478.714 ms`; generation remained
+  about `20.08 tok/s` on the 8-token run.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
