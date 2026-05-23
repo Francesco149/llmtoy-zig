@@ -1506,6 +1506,21 @@ MoE dispatch follow-up:
   `2.112 ms` / `2.13 us` to `0.888 ms` / `0.90 us`. Overall profiled GPU
   dispatch improved from `490.638 ms` to `478.714 ms`; generation remained
   about `20.08 tok/s` on the 8-token run.
+- Removed the redundant MoE-tail upload of the post-attention residual after
+  `runLayerAttnResidualDenseFfnQ8_1`. The full fused dense path now marks
+  `x_vram` current, and the MoE residual tail updates/downloads that
+  device-local buffer directly instead of re-uploading the CPU copy into
+  `shared_vec`. The older `shared_vec` tail remains for bench/fallback paths.
+- Correctness: `compare ... "explain MoE" --chat` keeps all layer argmaxes and
+  final argmax matching CPU.
+- Short profiled generation (`LLMTOY_GPU_PROFILE=1 ... generate "Briefly
+  explain the full forward pass of a MoE model" --chat --max-tokens 8 --gpu`)
+  measured prefill `23.18 tok/s`, generation `20.53 tok/s`, `478.336 ms`
+  profiled GPU dispatch, `36.352 ms` in-batch gap, and `514.688 ms` profiled
+  batch span. Main hot labels were effectively unchanged: `moe.fused_gate_up`
+  `50.644 ms` / `51.16 us`, `dense_ffn.rmsnorm` `16.776 ms` / `16.95 us`, and
+  `ffn_moe.residual_add_scale` `0.849 ms` / `0.86 us`. Treat this as a data
+  movement cleanup, not a new throughput milestone.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
