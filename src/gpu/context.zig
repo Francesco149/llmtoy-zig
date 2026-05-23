@@ -571,6 +571,15 @@ pub const GpuContext = struct {
         return self.submitBatchCopy(cmd);
     }
 
+    pub fn submitBatchWithDescriptorFrees(
+        self: *const GpuContext,
+        cmd: vk.VkCommandBuffer,
+        descriptor_frees: []const DeferredDescriptorFree,
+    ) !void {
+        try self.submitBatch(cmd);
+        self.freeDeferredDescriptorSets(descriptor_frees);
+    }
+
     pub fn submitBatchAsync(self: *GpuContext, cmd: vk.VkCommandBuffer) !PendingBatch {
         return self.submitBatchAsyncWithDescriptorFrees(cmd, &.{});
     }
