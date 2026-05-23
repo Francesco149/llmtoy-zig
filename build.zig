@@ -44,6 +44,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(matvec_fused_gu_q3k_q8_1_spv, "matvec_fused_gu_q3k_q8_1.spv");
     const expert_gate_up_id_q3_k_q8_1_spv = compileShader(b, "src/gpu/shaders/expert_gate_up_id_q3_k_q8_1.glsl");
     _ = wf.addCopyFile(expert_gate_up_id_q3_k_q8_1_spv, "expert_gate_up_id_q3_k_q8_1.spv");
+    const expert_gate_up_id_q3_k_q8_1_r2_spv = compileShader(b, "src/gpu/shaders/expert_gate_up_id_q3_k_q8_1_r2.glsl");
+    _ = wf.addCopyFile(expert_gate_up_id_q3_k_q8_1_r2_spv, "expert_gate_up_id_q3_k_q8_1_r2.spv");
     const matvec_q5_0_q8_1_spv = compileShader(b, "src/gpu/shaders/matvec_q5_0_q8_1.glsl");
     _ = wf.addCopyFile(matvec_q5_0_q8_1_spv, "matvec_q5_0_q8_1.spv");
     const matvec_q5_0_q8_1_mmvq_spv = compileShader(b, "src/gpu/shaders/matvec_q5_0_q8_1_mmvq.glsl");
@@ -113,6 +115,7 @@ pub fn build(b: *std.Build) void {
         \\pub const matvec_q3_k_q8_1_mmvq align(4) = @embedFile("matvec_q3_k_q8_1_mmvq.spv").*;
         \\pub const matvec_fused_gu_q3k_q8_1 align(4) = @embedFile("matvec_fused_gu_q3k_q8_1.spv").*;
         \\pub const expert_gate_up_id_q3_k_q8_1 align(4) = @embedFile("expert_gate_up_id_q3_k_q8_1.spv").*;
+        \\pub const expert_gate_up_id_q3_k_q8_1_r2 align(4) = @embedFile("expert_gate_up_id_q3_k_q8_1_r2.spv").*;
         \\pub const matvec_q5_0_q8_1    align(4) = @embedFile("matvec_q5_0_q8_1.spv").*;
         \\pub const matvec_q5_0_q8_1_mmvq align(4) = @embedFile("matvec_q5_0_q8_1_mmvq.spv").*;
         \\pub const matvec_q5_1_q8_1    align(4) = @embedFile("matvec_q5_1_q8_1.spv").*;

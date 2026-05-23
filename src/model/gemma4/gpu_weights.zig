@@ -314,9 +314,9 @@ pub const GpuWeights = struct {
         var pl_fused_gu_q8_1 = try FusedGateUpPipeline.initQ8_1(&ctx);
         errdefer pl_fused_gu_q8_1.deinit();
         std.debug.print("  init: pl_fused_gu_q8_1 ok\n", .{});
-        var pl_expert_gate_up_id_q3_k = try ExpertGateUpIdPipeline.initQ3KQ8_1(&ctx);
+        var pl_expert_gate_up_id_q3_k = try ExpertGateUpIdPipeline.initQ3KQ8_1R2(&ctx);
         errdefer pl_expert_gate_up_id_q3_k.deinit();
-        std.debug.print("  init: pl_expert_gate_up_id_q3_k ok\n", .{});
+        std.debug.print("  init: pl_expert_gate_up_id_q3_k.r2 ok\n", .{});
         var pl_expert_down_id_q5_1 = try ExpertDownIdPipeline.initQ5_1Q8_1(&ctx);
         errdefer pl_expert_down_id_q5_1.deinit();
         std.debug.print("  init: pl_expert_down_id_q5_1 ok\n", .{});

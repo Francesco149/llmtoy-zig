@@ -1461,6 +1461,28 @@ MoE dispatch follow-up:
   `16.91 us/iter`, with `ffn_moe.combine` and `ffn_moe.post_norm` counts at
   zero. Total measured layer-10 wall was `269.15 us/iter`, GPU phases
   `128.13 us/iter`, host/submit `141.02 us/iter`.
+- Added a two-row workgroup variant of the selected-expert Q3_K gate/up-ID
+  shader. The first version incorrectly used a full-workgroup subgroup
+  reduction on wave64 hardware; the fixed version uses 32-lane clustered
+  subgroup reductions and has direct fuzz coverage alongside the original
+  one-row shader. Production now routes `pl_expert_gate_up_id_q3_k` through the
+  r2 shader while keeping the original shader available for microbench
+  comparison.
+- Layer 10 focused check:
+  `LLMTOY_GPU_PROFILE=1 LLMTOY_EXPERT_GU_ID=1 bench-moe --iters 64 --layer 10
+  --skip-readback` measured production `moe.fused_gate_up` at `48.28 us/iter`
+  with r2. The same bench's explicit shape comparison measured original
+  `moe.gate_up_id` at `51.95 us` GPU and r2 at `47.89 us` GPU. Total isolated
+  MoE wall improved to `167.94 us/iter`, GPU phases `95.30 us/iter`.
+- Correctness: `zig build test` passes, including r2 fuzz. Full
+  `compare ... "explain MoE" --chat` keeps all layer argmaxes and final argmax
+  matching CPU.
+- Short profiled generation (`GPU=1 TOKENS=8 LLMTOY_GPU_PROFILE=1
+  scripts/profile_gemma4.sh stat`) measured `moe.fused_gate_up` at
+  `50.652 ms` total / `51.16 us` avg, down from the previous `54.131 ms` /
+  `54.68 us`. Overall GPU dispatch time moved only slightly
+  (`492.717 ms` -> `490.638 ms`) and generation stayed about `20 tok/s`, so this
+  is a narrow shader-shape win rather than an end-to-end milestone.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

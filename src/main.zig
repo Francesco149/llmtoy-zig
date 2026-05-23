@@ -852,6 +852,8 @@ fn benchExpertGateUpIdShape(
 
     var pipeline = try gpu_matvec.ExpertGateUpIdPipeline.initQ3KQ8_1(&gpu_weights.ctx);
     defer pipeline.deinit();
+    var pipeline_r2 = try gpu_matvec.ExpertGateUpIdPipeline.initQ3KQ8_1R2(&gpu_weights.ctx);
+    defer pipeline_r2.deinit();
 
     const flat_session_opt = try gpu_matvec.MatvecSession.initFromRaw(
         &gpu_weights.ctx,
@@ -894,15 +896,8 @@ fn benchExpertGateUpIdShape(
         _ = vk.vkFreeDescriptorSets(gpu_weights.ctx.device, gpu_weights.pl_quantize_q8_1.desc_pool, 1, &ds_mut);
     }
 
-    {
-        const cmd = try gpu_weights.ctx.beginBatch();
-        const p_gu = gpu_weights.ctx.profileBegin(cmd, "moe.gate_up_id");
-        const ds = try pipeline.record(cmd, &flat_session.mat_buf, &act_q8_buf, &ids_buf, &out_buf, @intCast(cfg.d_expert), @intCast(cfg.d_model), @intCast(top_idx.len));
-        gpu_weights.ctx.profileEnd(cmd, p_gu);
-        try gpu_weights.ctx.submitBatch(cmd);
-        var ds_mut = ds;
-        _ = vk.vkFreeDescriptorSets(gpu_weights.ctx.device, pipeline.desc_pool, 1, &ds_mut);
-    }
+    try warmExpertGateUpId(&gpu_weights.ctx, &pipeline, &flat_session.mat_buf, &act_q8_buf, &ids_buf, &out_buf, @intCast(cfg.d_expert), @intCast(cfg.d_model), @intCast(top_idx.len), "moe.gate_up_id");
+    try warmExpertGateUpId(&gpu_weights.ctx, &pipeline_r2, &flat_session.mat_buf, &act_q8_buf, &ids_buf, &out_buf, @intCast(cfg.d_expert), @intCast(cfg.d_model), @intCast(top_idx.len), "moe.gate_up_id.r2");
 
     const before = gpu_weights.ctx.profileStats("moe.gate_up_id");
     const clk = std.Io.Clock.real;
@@ -931,6 +926,54 @@ fn benchExpertGateUpIdShape(
     try out.print("expert-id gate-up shape: type={s} active={} wall_us={d:.2} gpu_us={d:.2} host_us={d:.2}\n", .{
         lw.gate_up_exps.type_.label(), top_idx.len, wall_us, gpu_us, @max(0.0, wall_us - gpu_us),
     });
+
+    const before_r2 = gpu_weights.ctx.profileStats("moe.gate_up_id.r2");
+    const t2 = clk.now(io);
+    for (0..iters) |_| {
+        const cmd = try gpu_weights.ctx.beginBatch();
+        const p_gu = gpu_weights.ctx.profileBegin(cmd, "moe.gate_up_id.r2");
+        const ds = try pipeline_r2.record(cmd, &flat_session.mat_buf, &act_q8_buf, &ids_buf, &out_buf, @intCast(cfg.d_expert), @intCast(cfg.d_model), @intCast(top_idx.len));
+        gpu_weights.ctx.profileEnd(cmd, p_gu);
+        try gpu_weights.ctx.submitBatch(cmd);
+        var ds_mut = ds;
+        _ = vk.vkFreeDescriptorSets(gpu_weights.ctx.device, pipeline_r2.desc_pool, 1, &ds_mut);
+    }
+    const t3 = clk.now(io);
+    const after_r2 = gpu_weights.ctx.profileStats("moe.gate_up_id.r2");
+
+    const wall_r2_ns = t2.durationTo(t3).nanoseconds;
+    const wall_r2_us = @as(f64, @floatFromInt(wall_r2_ns)) / @as(f64, @floatFromInt(iters)) / 1000.0;
+    const count_r2_delta = after_r2.count - before_r2.count;
+    const gpu_r2_ns = after_r2.total_ns - before_r2.total_ns;
+    const gpu_r2_us = if (count_r2_delta == 0)
+        0.0
+    else
+        @as(f64, @floatFromInt(gpu_r2_ns)) / @as(f64, @floatFromInt(count_r2_delta)) / 1000.0;
+
+    try out.print("expert-id gate-up shape r2: type={s} active={} wall_us={d:.2} gpu_us={d:.2} host_us={d:.2}\n", .{
+        lw.gate_up_exps.type_.label(), top_idx.len, wall_r2_us, gpu_r2_us, @max(0.0, wall_r2_us - gpu_r2_us),
+    });
+}
+
+fn warmExpertGateUpId(
+    ctx: *const gpu_ctx.GpuContext,
+    pipeline: *const gpu_matvec.ExpertGateUpIdPipeline,
+    weights_buf: *const gpu_buffer.GpuBuffer,
+    acts_buf: *const gpu_buffer.GpuBuffer,
+    ids_buf: *const gpu_buffer.GpuBuffer,
+    out_buf: *const gpu_buffer.GpuBuffer,
+    rows: u32,
+    cols: u32,
+    active: u32,
+    label: []const u8,
+) !void {
+    const cmd = try ctx.beginBatch();
+    const p_gu = ctx.profileBegin(cmd, label);
+    const ds = try pipeline.record(cmd, weights_buf, acts_buf, ids_buf, out_buf, rows, cols, active);
+    ctx.profileEnd(cmd, p_gu);
+    try ctx.submitBatch(cmd);
+    var ds_mut = ds;
+    _ = vk.vkFreeDescriptorSets(ctx.device, pipeline.desc_pool, 1, &ds_mut);
 }
 
 fn benchExpertDownIdShape(

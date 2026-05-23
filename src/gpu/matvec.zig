@@ -1328,16 +1328,27 @@ pub const ExpertGateUpIdPipeline = struct {
     dset_layout: vk.VkDescriptorSetLayout,
     desc_pool: vk.VkDescriptorPool,
     device: vk.VkDevice,
+    rows_per_workgroup: u32,
 
     pub fn initQ3KQ8_1(ctx: *const GpuContext) !ExpertGateUpIdPipeline {
         comptime std.debug.assert(shaders.expert_gate_up_id_q3_k_q8_1.len % 4 == 0);
-        const built = try buildSimplePipeline(ctx, &shaders.expert_gate_up_id_q3_k_q8_1, 4, @sizeOf(ExpertGateUpIdPushConst), 64);
+        return initFromSpv(ctx, &shaders.expert_gate_up_id_q3_k_q8_1, 1);
+    }
+
+    pub fn initQ3KQ8_1R2(ctx: *const GpuContext) !ExpertGateUpIdPipeline {
+        comptime std.debug.assert(shaders.expert_gate_up_id_q3_k_q8_1_r2.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.expert_gate_up_id_q3_k_q8_1_r2, 2);
+    }
+
+    fn initFromSpv(ctx: *const GpuContext, spv: []align(4) const u8, rows_per_workgroup: u32) !ExpertGateUpIdPipeline {
+        const built = try buildSimplePipeline(ctx, spv, 4, @sizeOf(ExpertGateUpIdPushConst), 64);
         return .{
             .pipeline = built.pipeline,
             .layout = built.layout,
             .dset_layout = built.dset_layout,
             .desc_pool = built.desc_pool,
             .device = ctx.device,
+            .rows_per_workgroup = rows_per_workgroup,
         };
     }
 
@@ -1405,7 +1416,8 @@ pub const ExpertGateUpIdPipeline = struct {
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = ExpertGateUpIdPushConst{ .rows = rows, .cols = cols, .n_active = active };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ExpertGateUpIdPushConst), &pc);
-        vk.vkCmdDispatch(cmd, rows, active, 1);
+        const groups_x = (rows + self.rows_per_workgroup - 1) / self.rows_per_workgroup;
+        vk.vkCmdDispatch(cmd, groups_x, active, 1);
     }
 
     pub fn deinit(self: *ExpertGateUpIdPipeline) void {
@@ -3578,6 +3590,8 @@ test "gpu expert-id gate-up Q3_K x Q8_1 fuzz" {
 
     var pipeline = try ExpertGateUpIdPipeline.initQ3KQ8_1(&gpu);
     defer pipeline.deinit();
+    var pipeline_r2 = try ExpertGateUpIdPipeline.initQ3KQ8_1R2(&gpu);
+    defer pipeline_r2.deinit();
 
     var weights_buf = try GpuBuffer.initHostCoherent(&gpu, flat_bytes, @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer weights_buf.deinit();
@@ -3613,6 +3627,33 @@ test "gpu expert-id gate-up Q3_K x Q8_1 fuzz" {
     const rel = max_abs / (max_ref + 1e-6);
     std.debug.print("expert-id Q3_K×Q8_1 GU fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs, rel });
     try std.testing.expect(rel < 1e-4);
+
+    {
+        const zeroes = try al.alloc(f32, active * rows);
+        defer al.free(zeroes);
+        @memset(zeroes, 0.0);
+        try out_buf.upload(std.mem.sliceAsBytes(zeroes));
+
+        const cmd_r2 = try gpu.beginBatch();
+        var ds_r2 = try pipeline_r2.record(cmd_r2, &weights_buf, &acts_buf, &ids_buf, &out_buf, @intCast(rows), @intCast(cols), @intCast(active));
+        try gpu.submitBatch(cmd_r2);
+        _ = vk.vkFreeDescriptorSets(gpu.device, pipeline_r2.desc_pool, 1, &ds_r2);
+
+        const gpu_out_r2 = try al.alloc(f32, active * rows);
+        defer al.free(gpu_out_r2);
+        try out_buf.download(std.mem.sliceAsBytes(gpu_out_r2));
+
+        var max_abs_r2: f32 = 0.0;
+        var max_ref_r2: f32 = 0.0;
+        for (cpu_out, gpu_out_r2) |c, g| {
+            const d = @abs(c - g);
+            if (d > max_abs_r2) max_abs_r2 = d;
+            if (@abs(c) > max_ref_r2) max_ref_r2 = @abs(c);
+        }
+        const rel_r2 = max_abs_r2 / (max_ref_r2 + 1e-6);
+        std.debug.print("expert-id Q3_K×Q8_1 GU r2 fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs_r2, rel_r2 });
+        try std.testing.expect(rel_r2 < 1e-4);
+    }
 }
 
 test "gpu quantize Q8_1 batched round-trip" {
