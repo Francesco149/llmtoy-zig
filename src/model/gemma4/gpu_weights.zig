@@ -1482,12 +1482,18 @@ pub const GpuWeights = struct {
             av_dset = try self.pl_attn_av.record(cmd, scores_buf, v_cache, attn_buf, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap);
             self.ctx.profileEnd(cmd, p_av);
         }
-        try self.ctx.submitBatch(cmd);
+        var descriptor_frees: [gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree = undefined;
+        var descriptor_free_count: usize = 0;
+        try self.collectRunLayerAttentionDescriptorFrees(
+            &descriptor_frees,
+            &descriptor_free_count,
+            fused_dset,
+            qk_dset,
+            av_dset,
+        );
 
-        const dev = self.ctx.device;
-        if (fused_dset) |*ds| _ = vk.vkFreeDescriptorSets(dev, self.pl_attn_fused_small.desc_pool, 1, ds);
-        if (qk_dset) |*ds| _ = vk.vkFreeDescriptorSets(dev, self.pl_attn_qk.desc_pool, 1, ds);
-        if (av_dset) |*ds| _ = vk.vkFreeDescriptorSets(dev, self.pl_attn_av.desc_pool, 1, ds);
+        try self.ctx.submitBatch(cmd);
+        self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
 
         if (attn_out) |o| {
             try attn_buf.download(std.mem.sliceAsBytes(o));
@@ -2468,6 +2474,22 @@ pub const GpuWeights = struct {
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_quantize_q8_1.desc_pool, quant_dset);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, gate_pl.desc_pool, gate_dset);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, up_pl.desc_pool, up_dset);
+    }
+
+    fn collectRunLayerAttentionDescriptorFrees(
+        self: *const GpuWeights,
+        descriptor_frees: *[gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree,
+        descriptor_free_count: *usize,
+        fused_dset: ?vk.VkDescriptorSet,
+        qk_dset: ?vk.VkDescriptorSet,
+        av_dset: ?vk.VkDescriptorSet,
+    ) !void {
+        if (fused_dset) |set|
+            try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_attn_fused_small.desc_pool, set);
+        if (qk_dset) |set|
+            try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_attn_qk.desc_pool, set);
+        if (av_dset) |set|
+            try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_attn_av.desc_pool, set);
     }
 
     fn collectRunLayerAttnResidualDenseFfnDescriptorFrees(
