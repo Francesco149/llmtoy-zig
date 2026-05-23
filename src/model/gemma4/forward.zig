@@ -135,7 +135,7 @@ pub fn forwardOne(
     const attn_cpu_kv_shadow = if (std.c.getenv("LLMTOY_ATTN_CPU_KV_SHADOW")) |raw|
         !std.mem.eql(u8, std.mem.span(raw), "0")
     else
-        true;
+        false;
 
     for (0..cfg.n_layers) |l| {
         const lw = &w.layers[l];

@@ -146,6 +146,9 @@ for all layers of the target model. Layer 19 uses the RMSNorm shader's
 CPU-order reduction mode for single-row norms to preserve the final compare
 argmax. Set `LLMTOY_MOE_VRAM_TAIL=0` to force the old readback/combine path, or
 use `LLMTOY_MOE_VRAM_TAIL_LIMIT` / `LLMTOY_MOE_VRAM_TAIL_SKIP` for diagnostics.
+Default GPU attention also leaves K/V cache state in VRAM only; set
+`LLMTOY_ATTN_CPU_KV_SHADOW=1` when debugging CPU attention fallback paths that
+need the shadow cache populated.
 
 ## Sampling Profile
 
