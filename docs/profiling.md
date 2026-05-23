@@ -132,12 +132,14 @@ the current descriptor/command-recording overhead that llama.cpp avoids with its
 expert-id pipeline shape.
 
 Flat expert gate/up ID is enabled by default for supported layers. Set
-`LLMTOY_EXPERT_GU_ID=0` to force the older per-expert gate/up route. Use
-`LLMTOY_EXPERT_REUSE_DSETS=1` to test persistent descriptor sets, and add
-`LLMTOY_EXPERT_REUSE_CMD=1` to reuse one command buffer per fully persistent
-ID-GU + ID-down layer while still re-recording commands each iteration. These
-are experiments for isolating descriptor churn from command-buffer allocation,
-queue submission, wait-idle, and readback overhead.
+`LLMTOY_EXPERT_GU_ID=0` to force the older per-expert gate/up route. Persistent
+descriptor sets are also enabled by default on the expert-ID path; set
+`LLMTOY_EXPERT_REUSE_DSETS=0` to force transient descriptor allocation/free
+when isolating descriptor churn. Add `LLMTOY_EXPERT_REUSE_CMD=1` to reuse one
+command buffer per fully persistent ID-GU + ID-down layer while still
+re-recording commands each iteration. Command-buffer reuse remains an experiment
+for separating command-buffer allocation from queue submission, wait-idle, and
+readback overhead.
 
 Use `--skip-readback` only as a `bench-moe` diagnostic. It skips the final CPU
 read of the GPU-accumulated MoE output and therefore does not produce a valid

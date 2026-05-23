@@ -2080,7 +2080,7 @@ pub const GpuWeights = struct {
         const use_id_dn = use_q8_1_dn and pl_dn_id != null and down_flat != null;
         const gate_up_flat = if (self.expert_gate_up_flat) |gufs| gufs[layer] else null;
         const use_id_gu = gate_up_type == .q3_k and use_q8_1_dn and gate_up_flat != null;
-        const reuse_id_dsets = std.c.getenv("LLMTOY_EXPERT_REUSE_DSETS") != null;
+        const reuse_id_dsets = envFlagDefaultTrue("LLMTOY_EXPERT_REUSE_DSETS");
         const reuse_quant_input_dset = reuse_id_dsets and use_id_gu;
         const reuse_gate_up_id_dset = reuse_id_dsets and use_id_gu;
         const reuse_quant_mid_batched_dset = reuse_id_dsets and use_id_gu;
@@ -2603,6 +2603,11 @@ pub const GpuWeights = struct {
             return error.TooManyDeferredDescriptorFrees;
         descriptor_frees[descriptor_free_count.*] = .{ .pool = pool, .set = set };
         descriptor_free_count.* += 1;
+    }
+
+    fn envFlagDefaultTrue(name: [:0]const u8) bool {
+        const raw = std.c.getenv(name) orelse return true;
+        return !std.mem.eql(u8, std.mem.span(raw), "0");
     }
 
     // Finish Gemma's dense-FFN + MoE block on GPU after runExpertBatch has
