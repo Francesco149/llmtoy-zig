@@ -1401,6 +1401,7 @@ fn cmdGenerate(
                 const t_gpu1 = clk.now(io);
                 const ms = @divTrunc(t_gpu0.durationTo(t_gpu1).nanoseconds, std.time.ns_per_ms);
                 std.debug.print("GPU upload done in {} ms\n", .{ms});
+                printGemma4GpuRuntimeOptions();
             }
         }
         defer if (gpu_weights) |*gw| gw.deinit();
@@ -1511,6 +1512,18 @@ fn printSetupTiming(start: anytype, end: anytype) void {
     std.debug.print("  setup: {} ms\n", .{ms});
 }
 
+fn envFlagEnabled(name: [:0]const u8, default: bool) bool {
+    if (std.c.getenv(name)) |raw|
+        return !std.mem.eql(u8, std.mem.span(raw), "0");
+    return default;
+}
+
+fn printGemma4GpuRuntimeOptions() void {
+    std.debug.print("  Gemma4 GPU options: attn_cpu_kv_shadow={}\n", .{
+        envFlagEnabled("LLMTOY_ATTN_CPU_KV_SHADOW", true),
+    });
+}
+
 fn printTokenTiming(label: []const u8, tokens: anytype, start: anytype, end: anytype) void {
     const ns = start.durationTo(end).nanoseconds;
     const ms = @divTrunc(ns, std.time.ns_per_ms);
@@ -1588,6 +1601,7 @@ fn cmdCompare(
     };
     defer gpu_weights.deinit();
     const gpu_ptr = &gpu_weights;
+    printGemma4GpuRuntimeOptions();
 
     const d = g4cfg.d_model;
     const nl = g4cfg.n_layers;
