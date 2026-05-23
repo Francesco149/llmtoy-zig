@@ -1551,12 +1551,21 @@ pub const GpuWeights = struct {
         const gate_dset = try gate_pl.record(cmd, &w_gate.mat_buf, acts_buf, gate_buf, w_gate.rows, w_gate.cols);
         const up_dset = try up_pl.record(cmd, &w_up.mat_buf, acts_buf, up_buf, w_up.rows, w_up.cols);
 
-        try self.ctx.submitBatch(cmd);
+        var descriptor_frees: [gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree = undefined;
+        var descriptor_free_count: usize = 0;
+        try self.collectRunLayerQ8_1GateUpDescriptorFrees(
+            &descriptor_frees,
+            &descriptor_free_count,
+            gate_pl,
+            up_pl,
+            null,
+            quant_dset,
+            gate_dset,
+            up_dset,
+        );
 
-        const dev = self.ctx.device;
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_quantize_q8_1.desc_pool, 1, &quant_dset);
-        _ = vk.vkFreeDescriptorSets(dev, gate_pl.desc_pool, 1, &gate_dset);
-        _ = vk.vkFreeDescriptorSets(dev, up_pl.desc_pool, 1, &up_dset);
+        try self.ctx.submitBatch(cmd);
+        self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
 
         try gate_buf.download(std.mem.sliceAsBytes(gate_out));
         try up_buf.download(std.mem.sliceAsBytes(up_out));
@@ -1602,13 +1611,21 @@ pub const GpuWeights = struct {
         const gate_dset = try gate_pl.record(cmd, &w_gate.mat_buf, acts_buf, gate_buf, w_gate.rows, w_gate.cols);
         const up_dset = try up_pl.record(cmd, &w_up.mat_buf, acts_buf, up_buf, w_up.rows, w_up.cols);
 
-        try self.ctx.submitBatch(cmd);
+        var descriptor_frees: [gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree = undefined;
+        var descriptor_free_count: usize = 0;
+        try self.collectRunLayerQ8_1GateUpDescriptorFrees(
+            &descriptor_frees,
+            &descriptor_free_count,
+            gate_pl,
+            up_pl,
+            norm_dset,
+            quant_dset,
+            gate_dset,
+            up_dset,
+        );
 
-        const dev = self.ctx.device;
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &norm_dset);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_quantize_q8_1.desc_pool, 1, &quant_dset);
-        _ = vk.vkFreeDescriptorSets(dev, gate_pl.desc_pool, 1, &gate_dset);
-        _ = vk.vkFreeDescriptorSets(dev, up_pl.desc_pool, 1, &up_dset);
+        try self.ctx.submitBatch(cmd);
+        self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
 
         try gate_buf.download(std.mem.sliceAsBytes(gate_out));
         try up_buf.download(std.mem.sliceAsBytes(up_out));
@@ -2433,6 +2450,24 @@ pub const GpuWeights = struct {
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, wk_pl.desc_pool, k_mv_dset);
         if (v_mv_dset) |set|
             try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, wv_pl.?.desc_pool, set);
+    }
+
+    fn collectRunLayerQ8_1GateUpDescriptorFrees(
+        self: *const GpuWeights,
+        descriptor_frees: *[gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree,
+        descriptor_free_count: *usize,
+        gate_pl: *const MatvecPipeline,
+        up_pl: *const MatvecPipeline,
+        norm_dset: ?vk.VkDescriptorSet,
+        quant_dset: vk.VkDescriptorSet,
+        gate_dset: vk.VkDescriptorSet,
+        up_dset: vk.VkDescriptorSet,
+    ) !void {
+        if (norm_dset) |set|
+            try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm.desc_pool, set);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_quantize_q8_1.desc_pool, quant_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, gate_pl.desc_pool, gate_dset);
+        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, up_pl.desc_pool, up_dset);
     }
 
     fn collectRunLayerAttnResidualDenseFfnDescriptorFrees(
