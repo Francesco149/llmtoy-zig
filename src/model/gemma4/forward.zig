@@ -388,13 +388,19 @@ pub fn forwardOne(
         // GPU residual-tail submit. Falls back to per-expert CPU path if
         // experts aren't on GPU.
         const expert_gpu_ok = if (gpu != null and gpu_here)
-            gpu.?.runExpertBatch(l, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, use_moe_vram_tail)
+            gpu.?.runExpertBatch(l, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, use_moe_vram_tail, if (use_moe_vram_tail) .{
+                .eps = cfg.eps,
+                .x = x,
+                .dense_ffn = ffn_buf,
+                .layer_output_scale = lw.layer_output_scale,
+                .x_buf_current = x_current_in_gpu_shared_vec,
+                .dense_buf_current = dense_current_in_gpu_out_buf,
+            } else null)
         else
             error.ExpertNotOnGpu;
 
         if (expert_gpu_ok) |_| {
             if (use_moe_vram_tail) {
-                try gpu.?.runLayerMoeResidualOnGpu(l, cfg.eps, x, ffn_buf, lw.layer_output_scale, x_current_in_gpu_shared_vec, dense_current_in_gpu_out_buf);
                 moe_residual_done_on_gpu = true;
             }
         } else |_| {

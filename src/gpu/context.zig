@@ -5,6 +5,8 @@ const max_profile_events = 4096;
 const max_profile_labels = 256;
 const profile_label_len = 72;
 const max_pipeline_cache_bytes = 64 * 1024 * 1024;
+const async_fence_pool_cap = 4;
+pub const max_deferred_descriptor_frees = 64;
 
 const ProfileEvent = struct {
     label: [profile_label_len]u8 = [_]u8{0} ** profile_label_len,
@@ -272,6 +274,9 @@ pub const GpuContext = struct {
     queue: vk.VkQueue,
     queue_family: u32,
     cmd_pool: vk.VkCommandPool,
+    sync_fence: vk.VkFence,
+    async_fence_pool: [async_fence_pool_cap]vk.VkFence,
+    async_fence_count: u32,
     pipeline_cache: vk.VkPipelineCache,
     pipeline_cache_path: ?[:0]u8,
     profiler: ?*GpuProfiler,
@@ -282,6 +287,13 @@ pub const GpuContext = struct {
     pub const PendingBatch = struct {
         cmd: vk.VkCommandBuffer,
         fence: vk.VkFence,
+        descriptor_frees: [max_deferred_descriptor_frees]DeferredDescriptorFree = undefined,
+        descriptor_free_count: u32 = 0,
+    };
+
+    pub const DeferredDescriptorFree = struct {
+        pool: vk.VkDescriptorPool,
+        set: vk.VkDescriptorSet,
     };
 
     pub fn init() !GpuContext {
@@ -423,6 +435,16 @@ pub const GpuContext = struct {
             return error.VkCommandPoolCreateFailed;
         errdefer vk.vkDestroyCommandPool(device, cmd_pool, null);
 
+        const fence_ci = vk.VkFenceCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+        };
+        var sync_fence: vk.VkFence = null;
+        if (vk.vkCreateFence(device, &fence_ci, null, &sync_fence) != vk.VK_SUCCESS)
+            return error.VkFenceCreateFailed;
+        errdefer vk.vkDestroyFence(device, sync_fence, null);
+
         const pipeline_cache_path = pipelineCachePath(std.heap.page_allocator) catch null;
         errdefer if (pipeline_cache_path) |path| std.heap.page_allocator.free(path);
 
@@ -457,6 +479,9 @@ pub const GpuContext = struct {
             .queue = queue,
             .queue_family = queue_family,
             .cmd_pool = cmd_pool,
+            .sync_fence = sync_fence,
+            .async_fence_pool = undefined,
+            .async_fence_count = 0,
             .pipeline_cache = pipeline_cache,
             .pipeline_cache_path = pipeline_cache_path,
             .profiler = profiler,
@@ -475,6 +500,9 @@ pub const GpuContext = struct {
         self.savePipelineCache() catch {};
         if (self.pipeline_cache_path) |path| std.heap.page_allocator.free(path);
         vk.vkDestroyPipelineCache(self.device, self.pipeline_cache, null);
+        for (self.async_fence_pool[0..self.async_fence_count]) |fence|
+            vk.vkDestroyFence(self.device, fence, null);
+        vk.vkDestroyFence(self.device, self.sync_fence, null);
         vk.vkDestroyCommandPool(self.device, self.cmd_pool, null);
         vk.vkDestroyDevice(self.device, null);
         vk.vkDestroyInstance(self.instance, null);
@@ -543,23 +571,26 @@ pub const GpuContext = struct {
         return self.submitBatchCopy(cmd);
     }
 
-    pub fn submitBatchAsync(self: *const GpuContext, cmd: vk.VkCommandBuffer) !PendingBatch {
+    pub fn submitBatchAsync(self: *GpuContext, cmd: vk.VkCommandBuffer) !PendingBatch {
+        return self.submitBatchAsyncWithDescriptorFrees(cmd, &.{});
+    }
+
+    pub fn submitBatchAsyncWithDescriptorFrees(
+        self: *GpuContext,
+        cmd: vk.VkCommandBuffer,
+        descriptor_frees: []const DeferredDescriptorFree,
+    ) !PendingBatch {
         // The profiler owns one query pool and resets it at beginBatch(), so keep
         // async submits out of profiled runs until the profiler can snapshot
         // per-submit event ranges.
         std.debug.assert(self.profiler == null);
+        if (descriptor_frees.len > max_deferred_descriptor_frees)
+            return error.TooManyDeferredDescriptorFrees;
         _ = vk.vkEndCommandBuffer(cmd);
         errdefer vk.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, &cmd);
 
-        const fence_ci = vk.VkFenceCreateInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-            .pNext = null,
-            .flags = 0,
-        };
-        var fence: vk.VkFence = null;
-        if (vk.vkCreateFence(self.device, &fence_ci, null, &fence) != vk.VK_SUCCESS)
-            return error.VkFenceCreateFailed;
-        errdefer vk.vkDestroyFence(self.device, fence, null);
+        const fence = try self.acquireAsyncFence();
+        errdefer self.recycleAsyncFence(fence);
 
         const submit = vk.VkSubmitInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -574,15 +605,58 @@ pub const GpuContext = struct {
         };
         if (vk.vkQueueSubmit(self.queue, 1, &submit, fence) != vk.VK_SUCCESS)
             return error.VkQueueSubmitFailed;
-        return .{ .cmd = cmd, .fence = fence };
+        var pending = PendingBatch{
+            .cmd = cmd,
+            .fence = fence,
+            .descriptor_free_count = @intCast(descriptor_frees.len),
+        };
+        @memcpy(pending.descriptor_frees[0..descriptor_frees.len], descriptor_frees);
+        return pending;
     }
 
-    pub fn waitPendingBatch(self: *const GpuContext, pending: PendingBatch) !void {
+    pub fn waitPendingBatch(self: *GpuContext, pending: PendingBatch) !void {
         const rc = vk.vkWaitForFences(self.device, 1, &pending.fence, vk.VK_TRUE, std.math.maxInt(u64));
-        defer vk.vkDestroyFence(self.device, pending.fence, null);
+        defer if (rc == vk.VK_SUCCESS) self.recycleAsyncFence(pending.fence) else vk.vkDestroyFence(self.device, pending.fence, null);
         defer vk.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, &pending.cmd);
         if (rc != vk.VK_SUCCESS)
             return error.VkFenceWaitFailed;
+        self.freeDeferredDescriptorSets(pending.descriptor_frees[0..pending.descriptor_free_count]);
+    }
+
+    pub fn freeDeferredDescriptorSets(self: *const GpuContext, frees: []const DeferredDescriptorFree) void {
+        for (frees) |free| {
+            var set = free.set;
+            _ = vk.vkFreeDescriptorSets(self.device, free.pool, 1, &set);
+        }
+    }
+
+    fn acquireAsyncFence(self: *GpuContext) !vk.VkFence {
+        if (self.async_fence_count != 0) {
+            self.async_fence_count -= 1;
+            const fence = self.async_fence_pool[self.async_fence_count];
+            if (vk.vkResetFences(self.device, 1, &fence) != vk.VK_SUCCESS)
+                return error.VkFenceResetFailed;
+            return fence;
+        }
+
+        const fence_ci = vk.VkFenceCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+        };
+        var fence: vk.VkFence = null;
+        if (vk.vkCreateFence(self.device, &fence_ci, null, &fence) != vk.VK_SUCCESS)
+            return error.VkFenceCreateFailed;
+        return fence;
+    }
+
+    fn recycleAsyncFence(self: *GpuContext, fence: vk.VkFence) void {
+        if (self.async_fence_count < async_fence_pool_cap) {
+            self.async_fence_pool[self.async_fence_count] = fence;
+            self.async_fence_count += 1;
+        } else {
+            vk.vkDestroyFence(self.device, fence, null);
+        }
     }
 
     pub fn allocReusableCommandBuffer(self: *const GpuContext) !vk.VkCommandBuffer {
@@ -618,20 +692,7 @@ pub const GpuContext = struct {
 
     pub fn submitReusableBatch(self: *const GpuContext, cmd: vk.VkCommandBuffer) !void {
         _ = vk.vkEndCommandBuffer(cmd);
-        const submit = vk.VkSubmitInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .pNext = null,
-            .waitSemaphoreCount = 0,
-            .pWaitSemaphores = null,
-            .pWaitDstStageMask = null,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &cmd,
-            .signalSemaphoreCount = 0,
-            .pSignalSemaphores = null,
-        };
-        if (vk.vkQueueSubmit(self.queue, 1, &submit, null) != vk.VK_SUCCESS)
-            return error.VkQueueSubmitFailed;
-        _ = vk.vkQueueWaitIdle(self.queue);
+        try self.submitAndWait(&cmd);
         if (self.profiler) |p| p.collectBatch(self.device);
     }
 
@@ -787,20 +848,7 @@ pub const GpuContext = struct {
     pub fn submitBatchCopy(self: *const GpuContext, cmd: vk.VkCommandBuffer) !void {
         _ = vk.vkEndCommandBuffer(cmd);
         defer vk.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, &cmd);
-        const submit = vk.VkSubmitInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .pNext = null,
-            .waitSemaphoreCount = 0,
-            .pWaitSemaphores = null,
-            .pWaitDstStageMask = null,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &cmd,
-            .signalSemaphoreCount = 0,
-            .pSignalSemaphores = null,
-        };
-        if (vk.vkQueueSubmit(self.queue, 1, &submit, null) != vk.VK_SUCCESS)
-            return error.VkQueueSubmitFailed;
-        _ = vk.vkQueueWaitIdle(self.queue);
+        try self.submitAndWait(&cmd);
         if (self.profiler) |p| p.collectBatch(self.device);
     }
 
@@ -839,48 +887,16 @@ pub const GpuContext = struct {
         vk.vkCmdCopyBuffer(cmd, src, dst, 1, &region);
         _ = vk.vkEndCommandBuffer(cmd);
 
-        const submit = vk.VkSubmitInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .pNext = null,
-            .waitSemaphoreCount = 0,
-            .pWaitSemaphores = null,
-            .pWaitDstStageMask = null,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &cmd,
-            .signalSemaphoreCount = 0,
-            .pSignalSemaphores = null,
-        };
-        if (vk.vkQueueSubmit(self.queue, 1, &submit, null) != vk.VK_SUCCESS)
-            return error.VkQueueSubmitFailed;
-        _ = vk.vkQueueWaitIdle(self.queue);
+        try self.submitAndWait(&cmd);
     }
 
     // Copy `size` bytes from src to dst using a one-shot command buffer.
     // Blocks until the transfer completes. Used for staging uploads/downloads.
     pub fn copyBuffer(self: *const GpuContext, src: vk.VkBuffer, dst: vk.VkBuffer, size: vk.VkDeviceSize) !void {
-        const alloc_ci = vk.VkCommandBufferAllocateInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            .pNext = null,
-            .commandPool = self.cmd_pool,
-            .level = vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            .commandBufferCount = 1,
-        };
-        var cmd: vk.VkCommandBuffer = undefined;
-        if (vk.vkAllocateCommandBuffers(self.device, &alloc_ci, &cmd) != vk.VK_SUCCESS)
-            return error.VkCommandBufferAllocFailed;
-        defer vk.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, &cmd);
+        return self.copyBufferRegion(src, dst, 0, 0, size);
+    }
 
-        const begin_ci = vk.VkCommandBufferBeginInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            .pNext = null,
-            .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            .pInheritanceInfo = null,
-        };
-        _ = vk.vkBeginCommandBuffer(cmd, &begin_ci);
-        const region = vk.VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = size };
-        vk.vkCmdCopyBuffer(cmd, src, dst, 1, &region);
-        _ = vk.vkEndCommandBuffer(cmd);
-
+    fn submitAndWait(self: *const GpuContext, cmd: *const vk.VkCommandBuffer) !void {
         const submit = vk.VkSubmitInfo{
             .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .pNext = null,
@@ -888,13 +904,16 @@ pub const GpuContext = struct {
             .pWaitSemaphores = null,
             .pWaitDstStageMask = null,
             .commandBufferCount = 1,
-            .pCommandBuffers = &cmd,
+            .pCommandBuffers = cmd,
             .signalSemaphoreCount = 0,
             .pSignalSemaphores = null,
         };
-        if (vk.vkQueueSubmit(self.queue, 1, &submit, null) != vk.VK_SUCCESS)
+        if (vk.vkResetFences(self.device, 1, &self.sync_fence) != vk.VK_SUCCESS)
+            return error.VkFenceResetFailed;
+        if (vk.vkQueueSubmit(self.queue, 1, &submit, self.sync_fence) != vk.VK_SUCCESS)
             return error.VkQueueSubmitFailed;
-        _ = vk.vkQueueWaitIdle(self.queue);
+        if (vk.vkWaitForFences(self.device, 1, &self.sync_fence, vk.VK_TRUE, std.math.maxInt(u64)) != vk.VK_SUCCESS)
+            return error.VkFenceWaitFailed;
     }
 };
 

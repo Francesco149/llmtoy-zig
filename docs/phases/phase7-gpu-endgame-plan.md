@@ -118,8 +118,8 @@ Important remaining fallbacks and caveats:
   verified with profiling rather than assumed.
 - Descriptor sets and command buffers are allocated/freed at dispatch frequency.
   This is probably not the 20x gap, but it will matter once matmul is faster.
-- `submitBatchCopy` always waits idle. There is no fence ring or async graph
-  execution yet.
+- Blocking submits now wait a context-owned fence, but there is no broad fence
+  ring or async graph execution yet.
 
 ---
 
@@ -706,7 +706,8 @@ Known remaining CPU/GPU synchronization points:
   output back to CPU.
 - MoE top-k routing is still CPU-side.
 - Global layers without explicit V still use CPU attention.
-- Command submission waits idle after every batch.
+- Command submission still blocks after most batches, now via a context-owned
+  fence rather than `vkQueueWaitIdle`.
 
 Do not attack these blindly. Use Phase 7m profile data. If matvec is still 90%
 of GPU time and CPU wait is just waiting for matvec, round-trip removal will not
@@ -717,7 +718,8 @@ High-value cleanup once matvec is faster:
 - Keep `x`, dense FFN output, and MoE output in VRAM until final logits.
 - Move router top-k to GPU or at least avoid readback of intermediate vectors.
 - Add a V-from-K shader/path for the 6 global layers so they use GPU attention.
-- Replace per-submit `vkQueueWaitIdle` with a small fence ring.
+- Expand the first-pass submit fences into a real fence ring once profiling
+  shows queue wait as a bottleneck.
 
 ---
 
@@ -727,7 +729,9 @@ Status: STARTED after VRAM-tail work exposed host overhead. `GpuContext` now
 owns one Vulkan pipeline cache handle, all compute pipeline builders route
 through it, and cache data is serialized under `$XDG_CACHE_HOME/llmtoy` (or
 `$HOME/.cache/llmtoy`) by default. `LLMTOY_PIPELINE_CACHE=/path/file` overrides
-the location and `LLMTOY_PIPELINE_CACHE=0` disables disk persistence.
+the location and `LLMTOY_PIPELINE_CACHE=0` disables disk persistence. The
+synchronous submit helpers now wait on a context-owned fence instead of
+`vkQueueWaitIdle`, and the narrow async MoE path recycles a tiny fence pool.
 
 The current wrappers allocate/update/free descriptor sets for nearly every
 dispatch and allocate/free command buffers for every submit. That overhead is
@@ -741,7 +745,8 @@ Roadmap:
 - Pre-allocate per-layer/per-dispatch descriptor sets where buffers are stable.
 - Reuse command buffers where the sequence is fixed and only push constants
   change.
-- Replace immediate `vkQueueWaitIdle` with fences.
+- Expand the current one-fence synchronous submit path into a measured fence
+  ring only if CPU profiles show queue wait as material.
 - Measure warm-start pipeline creation after cache serialization.
 
 Acceptance criteria:
@@ -829,19 +834,42 @@ prompt, max token count, GPU, and driver. Record:
 The reported 80-100 tok/s target may be real, stale, or measured with different
 batching/model flags. Future agents need a hard local reference, not folklore.
 
-Updated next target:
+Updated next target after local llama.cpp Vulkan trace:
 
-1. Stop broad isolated MMVQ ports unless a reference timing points directly at
-   that tensor type.
-2. Use `llmtoy bench-moe` to track the current top-k expert path while porting
-   llama.cpp's real decode shape: selected experts as one `MUL_MAT_ID_VEC`-style
-   dispatch with `n_expert=128`, `n=8`, and fused expert score multiply for
-   down projections.
-3. Port llama.cpp's `mul_mat_vec_id_*_q8_1_f32` / fused
-   `MUL_MAT_ID_MUL` structure for Q3_K gate/up and Q5_0/IQ4_NL down before
-   more single-matrix shader tuning.
-4. Separately compare llmtoy attention to llama.cpp `FLASH_ATTN_EXT`; the
-   current llmtoy attention path is structurally behind the reference.
+The key reference result is that llama.cpp's `MUL_MAT_VEC q6_K
+m=262144 n=1 k=2816` is about 1.03 ms, essentially matching llmtoy's
+`lm_head` Q6_K timing. The 4x end-to-end gap is therefore not explained by the
+largest logits matvec. Do not spend the next session on broad isolated MMVQ
+variants unless a same-shape llama.cpp timing proves that tensor is materially
+faster there.
+
+Next-session plan:
+
+1. Fix the async/graph prerequisites from the reverted attempt: give
+   `GpuContext` a stable address and add deferred descriptor-set free lists so
+   descriptor sets are released only after the owning fence signals. Current
+   status: `runExpertBatch` now attaches transient descriptor sets to the
+   pending async fence and passes `compare` without descriptor reuse enabled.
+   General async command buffers still need the same conversion in attention,
+   dense FFN, post-attention, and one-shot helper paths before they can be
+   allowed in flight.
+2. Build a steady decode command-buffer path that records a larger per-token or
+   per-layer graph and blocks at real host boundaries, not after every local
+   phase. Keep current synchronous code as the fallback while proving this.
+3. Port llama.cpp's selected-expert decode shape before more single-matrix
+   shader tuning: `MUL_MAT_ID_VEC` for Q3_K gate/up and fused
+   `MUL_MAT_ID_MUL`-style score multiply for Q5_0/Q5_1/IQ4_NL down.
+4. Port the small-op fusions that are clearly visible in the llama.cpp trace:
+   `RMS_NORM_MUL`, `RMS_NORM_MUL_ROPE`, and where practical
+   `RMS_NORM_MUL_ROPE_VIEW_SET_ROWS`.
+5. Replace or substantially rework the current attention fused-small shader
+   toward llama.cpp `FLASH_ATTN_EXT`, including q8_0 KV cache compatibility.
+6. Keep top-k/router fusion (`TOPK_MOE_EARLY_SOFTMAX_NORM`) as a follow-up once
+   the selected-expert matvec and graph submission shape are closer to the
+   reference.
+
+Reference commands and kernel timings are recorded in
+`docs/benchmarks/phase7_gpu.md` under the llama.cpp Vulkan reference section.
 
 ---
 
@@ -854,14 +882,15 @@ Updated next target:
 | 7n | STARTED | Matvec + MoE microbench harness | Blocks shader iteration |
 | 7o | TODO | Faithful llama.cpp expert-id matvecs | Main MoE lever |
 | 7p | TODO | Real batched prefill / MMQ | Prefill parity |
-| 7q | TODO | Remove proven CPU round trips | Secondary after matvec |
-| 7r | TODO | Descriptor/command/fence reuse | Secondary after matvec |
+| 7q | TODO | Remove proven CPU round trips | Secondary after graph shape |
+| 7r | STARTED | Descriptor/command/fence reuse | Immediate next unblocker |
 | 7s | TODO | Feature/stats introspection | Supports shader tuning |
-| 7t | TODO | Repeatable llama.cpp reference | Keeps target honest |
+| 7t | STARTED | Repeatable llama.cpp reference | Keeps target honest |
 
-Priority order is strict: **profile, microbench, matvec kernel shape, then
-plumbing cleanup**. If an agent wants to do something else first, require a
-profile showing why it beats matvec work.
+Priority has changed after the llama.cpp trace: **graph/submit lifetime first,
+then selected-expert fusion, then attention/norm fusion, then more MMVQ**. If
+an agent wants to tune another isolated quant matvec first, require a
+same-shape llama.cpp timing that shows llmtoy is behind on that exact kernel.
 
 ---
 

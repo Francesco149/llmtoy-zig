@@ -14,7 +14,8 @@ const math = @import("../../ops/math.zig");
 const vk_mod = @import("../../gpu/vk.zig");
 const vk = vk_mod.vk;
 const GgmlType = @import("../../gguf/types.zig").GgmlType;
-const GpuCtx = @import("../../gpu/context.zig").GpuContext;
+const gpu_context_mod = @import("../../gpu/context.zig");
+const GpuCtx = gpu_context_mod.GpuContext;
 const GpuBuffer = @import("../../gpu/buffer.zig").GpuBuffer;
 const mv_mod = @import("../../gpu/matvec.zig");
 const MatvecPipeline = mv_mod.MatvecPipeline;
@@ -26,9 +27,11 @@ const AccumPipeline = mv_mod.AccumPipeline;
 const QuantizeQ8_1Pipeline = mv_mod.QuantizeQ8_1Pipeline;
 const QuantizeQ8_1BatchedPipeline = mv_mod.QuantizeQ8_1BatchedPipeline;
 const RmsnormPipeline = mv_mod.RmsnormPipeline;
+const AddRmsnormPipeline = mv_mod.AddRmsnormPipeline;
 const RmsnormPerHeadPipeline = mv_mod.RmsnormPerHeadPipeline;
 const ElemAddPipeline = mv_mod.ElemAddPipeline;
 const ElemScalePipeline = mv_mod.ElemScalePipeline;
+const ElemAddScalePipeline = mv_mod.ElemAddScalePipeline;
 const GeluMulPipeline = mv_mod.GeluMulPipeline;
 const RopeNeoxTablePipeline = mv_mod.RopeNeoxTablePipeline;
 const RopeNeoxThetaPipeline = mv_mod.RopeNeoxThetaPipeline;
@@ -83,6 +86,15 @@ pub const GpuLayerWeights = struct {
     }
 };
 
+pub const MoeTailParams = struct {
+    eps: f32,
+    x: []f32,
+    dense_ffn: []const f32,
+    layer_output_scale: f32,
+    x_buf_current: bool,
+    dense_buf_current: bool,
+};
+
 pub const GpuWeights = struct {
     ctx: GpuCtx,
     pl_f32: MatvecPipeline,
@@ -108,9 +120,11 @@ pub const GpuWeights = struct {
     pl_accum: AccumPipeline,
     // 7j primitives — per-token f32 ops on VRAM residual stream.
     pl_rmsnorm: RmsnormPipeline,
+    pl_add_rmsnorm: AddRmsnormPipeline,
     pl_rmsnorm_perhead: RmsnormPerHeadPipeline,
     pl_elem_add: ElemAddPipeline,
     pl_elem_scale: ElemScalePipeline,
+    pl_elem_add_scale: ElemAddScalePipeline,
     pl_gelu_mul: GeluMulPipeline,
     pl_rope_table: RopeNeoxTablePipeline,
     pl_rope_theta: RopeNeoxThetaPipeline,
@@ -202,6 +216,13 @@ pub const GpuWeights = struct {
     expert_down_id_dset_is_iq4: ?[]bool,
     expert_reuse_cmds: ?[]?vk.VkCommandBuffer,
     pending_moe_batch: ?GpuCtx.PendingBatch,
+    moe_tail_moe_norm_dsets: ?[]?vk.VkDescriptorSet,
+    moe_tail_post_ffw_dsets: ?[]?vk.VkDescriptorSet,
+    moe_tail_add_rmsnorm_dsets: ?[]?vk.VkDescriptorSet,
+    moe_tail_combine_dset: ?vk.VkDescriptorSet,
+    moe_tail_residual_dset: ?vk.VkDescriptorSet,
+    moe_tail_scale_dset: ?vk.VkDescriptorSet,
+    moe_tail_residual_scale_dset: ?vk.VkDescriptorSet,
     // Per-projection output buffers for batched dispatch.
     // QKV: all three read the same input → one upload, three parallel dispatches.
     // gate+up: both read the same FFN-norm input → same pattern.
@@ -307,12 +328,16 @@ pub const GpuWeights = struct {
         std.debug.print("  init: pl_accum ok\n", .{});
         var pl_rmsnorm = try RmsnormPipeline.init(&ctx);
         errdefer pl_rmsnorm.deinit();
+        var pl_add_rmsnorm = try AddRmsnormPipeline.init(&ctx);
+        errdefer pl_add_rmsnorm.deinit();
         var pl_rmsnorm_perhead = try RmsnormPerHeadPipeline.init(&ctx);
         errdefer pl_rmsnorm_perhead.deinit();
         var pl_elem_add = try ElemAddPipeline.init(&ctx);
         errdefer pl_elem_add.deinit();
         var pl_elem_scale = try ElemScalePipeline.init(&ctx);
         errdefer pl_elem_scale.deinit();
+        var pl_elem_add_scale = try ElemAddScalePipeline.init(&ctx);
+        errdefer pl_elem_add_scale.deinit();
         var pl_gelu_mul = try GeluMulPipeline.init(&ctx);
         errdefer pl_gelu_mul.deinit();
         var pl_rope_table = try RopeNeoxTablePipeline.init(&ctx);
@@ -372,9 +397,11 @@ pub const GpuWeights = struct {
             .pl_expert_down_id_iq4_nl = pl_expert_down_id_iq4_nl,
             .pl_accum = pl_accum,
             .pl_rmsnorm = pl_rmsnorm,
+            .pl_add_rmsnorm = pl_add_rmsnorm,
             .pl_rmsnorm_perhead = pl_rmsnorm_perhead,
             .pl_elem_add = pl_elem_add,
             .pl_elem_scale = pl_elem_scale,
+            .pl_elem_add_scale = pl_elem_add_scale,
             .pl_gelu_mul = pl_gelu_mul,
             .pl_rope_table = pl_rope_table,
             .pl_rope_theta = pl_rope_theta,
@@ -427,6 +454,13 @@ pub const GpuWeights = struct {
             .expert_down_id_dset_is_iq4 = null,
             .expert_reuse_cmds = null,
             .pending_moe_batch = null,
+            .moe_tail_moe_norm_dsets = null,
+            .moe_tail_post_ffw_dsets = null,
+            .moe_tail_add_rmsnorm_dsets = null,
+            .moe_tail_combine_dset = null,
+            .moe_tail_residual_dset = null,
+            .moe_tail_scale_dset = null,
+            .moe_tail_residual_scale_dset = null,
             .q_out_buf = null,
             .k_out_buf = null,
             .v_out_buf = null,
@@ -800,6 +834,43 @@ pub const GpuWeights = struct {
             for (cmds) |cmd| if (cmd) |c| self.ctx.freeReusableCommandBuffer(c);
             self.allocator.free(cmds);
         }
+        if (self.moe_tail_scale_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_elem_scale.desc_pool, 1, &tmp);
+        }
+        if (self.moe_tail_residual_scale_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_elem_add_scale.desc_pool, 1, &tmp);
+        }
+        if (self.moe_tail_residual_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_elem_add.desc_pool, 1, &tmp);
+        }
+        if (self.moe_tail_combine_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_elem_add.desc_pool, 1, &tmp);
+        }
+        if (self.moe_tail_post_ffw_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
+        if (self.moe_tail_add_rmsnorm_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_add_rmsnorm.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
+        if (self.moe_tail_moe_norm_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
         if (self.expert_down_id_dsets) |sets| {
             for (sets, 0..) |*ds, i| if (ds.*) |set| {
                 var tmp = set;
@@ -916,9 +987,11 @@ pub const GpuWeights = struct {
         self.pl_rope_theta.deinit();
         self.pl_rope_table.deinit();
         self.pl_gelu_mul.deinit();
+        self.pl_elem_add_scale.deinit();
         self.pl_elem_scale.deinit();
         self.pl_elem_add.deinit();
         self.pl_rmsnorm_perhead.deinit();
+        self.pl_add_rmsnorm.deinit();
         self.pl_rmsnorm.deinit();
         self.pl_quantize_q8_1_batched.deinit();
         self.pl_quantize_q8_1.deinit();
@@ -1872,6 +1945,7 @@ pub const GpuWeights = struct {
         router_out: []const f32,
         moe_buf: []f32,
         skip_readback: bool,
+        tail: ?MoeTailParams,
     ) !void {
         try self.finishPendingMoeBatch();
 
@@ -1913,17 +1987,15 @@ pub const GpuWeights = struct {
             !std.mem.eql(u8, std.mem.span(raw), "0")
         else
             true;
+        // Async MoE is safe for transient descriptor sets now that the sets are
+        // attached to the pending fence and freed in finishPendingMoeBatch().
         const async_moe = async_moe_env and
+            tail == null and
             skip_readback and
             self.ctx.profiler == null and
             !reuse_cmd and
             use_id_gu and
-            use_id_dn and
-            reuse_quant_input_dset and
-            reuse_gate_up_id_dset and
-            reuse_quant_mid_batched_dset and
-            reuse_down_id_dset and
-            reuse_accum_dset;
+            use_id_dn;
 
         for (top_idx) |eidx| {
             if (!use_id_gu) {
@@ -1951,6 +2023,14 @@ pub const GpuWeights = struct {
 
         // Write inputs and per-expert scales to HOST_COHERENT buffers.
         @memcpy(in_slice, moe_in);
+        if (tail) |tp| {
+            if (!tp.x_buf_current) {
+                try self.shared_vec.?.upload(std.mem.sliceAsBytes(tp.x));
+            }
+            if (!tp.dense_buf_current) {
+                try (self.dense_ffn_out_buf orelse return error.ExpertNotOnGpu).upload(std.mem.sliceAsBytes(tp.dense_ffn));
+            }
+        }
         for (0..n) |k| {
             const eidx = top_idx[k];
             scales_slice[k] = down_exps_scale[eidx] * router_out[eidx];
@@ -2105,47 +2185,79 @@ pub const GpuWeights = struct {
         }
         self.ctx.profileEnd(cmd, p_accum);
 
+        if (tail) |tp| {
+            GpuCtx.recordShaderBarrier(cmd);
+            try self.recordMoeResidualTail(cmd, layer, tp.eps, tp.x.len, tp.layer_output_scale);
+        }
+
+        const pl_dn_used = if (use_q8_1_dn) pl_dn_q8_1.? else pl_dn_f32.?;
+        var descriptor_frees: [gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree = undefined;
+        var descriptor_free_count: usize = 0;
         if (async_moe) {
-            self.pending_moe_batch = try self.ctx.submitBatchAsync(cmd);
+            try self.collectRunExpertBatchDescriptorFrees(
+                &descriptor_frees,
+                &descriptor_free_count,
+                reuse_gate_up_id_dset,
+                use_id_gu,
+                gate_up_id_dset,
+                &fused_dsets,
+                n,
+                pl_gu.desc_pool,
+                reuse_down_id_dset,
+                use_id_dn,
+                down_id_dset,
+                pl_dn_id,
+                &down_dsets,
+                pl_dn_used.desc_pool,
+                use_q8_1_dn,
+                reuse_quant_mid_batched_dset,
+                quant_mid_id_dset,
+                &quant_dn_dsets,
+                reuse_quant_input_dset,
+                quant_dset,
+                reuse_accum_dset,
+                accum_dset,
+            );
+            var async_submit_succeeded = false;
+            errdefer if (!async_submit_succeeded)
+                self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
+            self.pending_moe_batch = try self.ctx.submitBatchAsyncWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
+            async_submit_succeeded = true;
         } else if (reused_cmd) {
             try self.ctx.submitReusableBatch(cmd);
         } else {
             try self.ctx.submitBatch(cmd);
         }
 
-        const pl_dn_used = if (use_q8_1_dn) pl_dn_q8_1.? else pl_dn_f32.?;
-        if (reuse_gate_up_id_dset and use_id_gu) {
-            // Persistent descriptor set is owned by GpuWeights.
-        } else if (gate_up_id_dset) |*ds| {
-            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_expert_gate_up_id_q3_k.desc_pool, 1, ds);
-        } else {
-            for (fused_dsets[0..n]) |*ds|
-                _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_gu.desc_pool, 1, ds);
+        if (!async_moe) {
+            try self.collectRunExpertBatchDescriptorFrees(
+                &descriptor_frees,
+                &descriptor_free_count,
+                reuse_gate_up_id_dset,
+                use_id_gu,
+                gate_up_id_dset,
+                &fused_dsets,
+                n,
+                pl_gu.desc_pool,
+                reuse_down_id_dset,
+                use_id_dn,
+                down_id_dset,
+                pl_dn_id,
+                &down_dsets,
+                pl_dn_used.desc_pool,
+                use_q8_1_dn,
+                reuse_quant_mid_batched_dset,
+                quant_mid_id_dset,
+                &quant_dn_dsets,
+                reuse_quant_input_dset,
+                quant_dset,
+                reuse_accum_dset,
+                accum_dset,
+            );
+            self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
         }
-        if (reuse_down_id_dset and use_id_dn) {
-            // Persistent descriptor set is owned by GpuWeights.
-        } else if (use_id_dn) {
-            var ds = down_id_dset.?;
-            _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_dn_id.?.desc_pool, 1, &ds);
-        } else {
-            for (down_dsets[0..n]) |*ds|
-                _ = vk.vkFreeDescriptorSets(self.ctx.device, pl_dn_used.desc_pool, 1, ds);
-        }
-        if (use_q8_1_dn) {
-            if (reuse_quant_mid_batched_dset and use_id_gu and use_id_dn) {
-                // Persistent descriptor set is owned by GpuWeights.
-            } else if (quant_mid_id_dset) |*ds| {
-                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1_batched.desc_pool, 1, ds);
-            } else {
-                for (quant_dn_dsets[0..n]) |*ds|
-                    _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, ds);
-            }
-        }
-        if (quant_dset) |*ds|
-            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, ds);
-        if (accum_dset) |set| {
-            var accum_ds = set;
-            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_accum.desc_pool, 1, &accum_ds);
+        if (tail) |tp| {
+            try self.shared_vec.?.download(std.mem.sliceAsBytes(tp.x));
         }
 
         // Add GPU-accumulated expert result into moe_buf only for legacy/debug
@@ -2157,11 +2269,87 @@ pub const GpuWeights = struct {
         }
     }
 
+    fn collectRunExpertBatchDescriptorFrees(
+        self: *const GpuWeights,
+        descriptor_frees: *[gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree,
+        descriptor_free_count: *usize,
+        reuse_gate_up_id_dset: bool,
+        use_id_gu: bool,
+        gate_up_id_dset: ?vk.VkDescriptorSet,
+        fused_dsets: *const [16]vk.VkDescriptorSet,
+        n: usize,
+        pl_gu_pool: vk.VkDescriptorPool,
+        reuse_down_id_dset: bool,
+        use_id_dn: bool,
+        down_id_dset: ?vk.VkDescriptorSet,
+        pl_dn_id: ?*const ExpertDownIdPipeline,
+        down_dsets: *const [16]vk.VkDescriptorSet,
+        pl_dn_pool: vk.VkDescriptorPool,
+        use_q8_1_dn: bool,
+        reuse_quant_mid_batched_dset: bool,
+        quant_mid_id_dset: ?vk.VkDescriptorSet,
+        quant_dn_dsets: *const [16]vk.VkDescriptorSet,
+        reuse_quant_input_dset: bool,
+        quant_dset: ?vk.VkDescriptorSet,
+        reuse_accum_dset: bool,
+        accum_dset: ?vk.VkDescriptorSet,
+    ) !void {
+        if (reuse_gate_up_id_dset and use_id_gu) {
+            // Persistent descriptor set is owned by GpuWeights.
+        } else if (gate_up_id_dset) |set| {
+            try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_expert_gate_up_id_q3_k.desc_pool, set);
+        } else {
+            for (fused_dsets[0..n]) |set|
+                try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, pl_gu_pool, set);
+        }
+
+        if (reuse_down_id_dset and use_id_dn) {
+            // Persistent descriptor set is owned by GpuWeights.
+        } else if (use_id_dn) {
+            try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, pl_dn_id.?.desc_pool, down_id_dset.?);
+        } else {
+            for (down_dsets[0..n]) |set|
+                try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, pl_dn_pool, set);
+        }
+
+        if (use_q8_1_dn) {
+            if (reuse_quant_mid_batched_dset and use_id_gu and use_id_dn) {
+                // Persistent descriptor set is owned by GpuWeights.
+            } else if (quant_mid_id_dset) |set| {
+                try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_quantize_q8_1_batched.desc_pool, set);
+            } else {
+                for (quant_dn_dsets[0..n]) |set|
+                    try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_quantize_q8_1.desc_pool, set);
+            }
+        }
+
+        if (!reuse_quant_input_dset) {
+            if (quant_dset) |set|
+                try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_quantize_q8_1.desc_pool, set);
+        }
+        if (!reuse_accum_dset) {
+            if (accum_dset) |set|
+                try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_accum.desc_pool, set);
+        }
+    }
+
+    fn appendDeferredDescriptorFree(
+        descriptor_frees: *[gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree,
+        descriptor_free_count: *usize,
+        pool: vk.VkDescriptorPool,
+        set: vk.VkDescriptorSet,
+    ) !void {
+        if (descriptor_free_count.* >= descriptor_frees.len)
+            return error.TooManyDeferredDescriptorFrees;
+        descriptor_frees[descriptor_free_count.*] = .{ .pool = pool, .set = set };
+        descriptor_free_count.* += 1;
+    }
+
     // Finish Gemma's dense-FFN + MoE block on GPU after runExpertBatch has
     // produced moe_gpu_buf in VRAM. The final residual is downloaded because
     // the current layer orchestration still uses CPU router/compare state.
     pub fn runLayerMoeResidualOnGpu(
-        self: *const GpuWeights,
+        self: *GpuWeights,
         layer: usize,
         eps: f32,
         x: []f32,
@@ -2170,14 +2358,8 @@ pub const GpuWeights = struct {
         x_buf_current: bool,
         dense_buf_current: bool,
     ) !void {
-        const lw = &self.layers[layer];
-        const post_ffw_norm_2_buf = &(lw.post_ffw_norm_2_buf orelse return error.NotOnGpu);
-        const post_ffw_norm_buf = &(lw.post_ffw_norm_buf orelse return error.NotOnGpu);
         const x_buf = &self.shared_vec.?;
         const dense_buf = &(self.dense_ffn_out_buf orelse return error.NotOnGpu);
-        const moe_buf = &(self.moe_gpu_buf orelse return error.NotOnGpu);
-        const moe_norm_buf = &(self.ffn_vram orelse return error.NotOnGpu);
-        const combined_norm_buf = &(self.xb_vram orelse return error.NotOnGpu);
 
         std.debug.assert(x.len == dense_ffn.len);
         std.debug.assert(x.len % 256 == 0);
@@ -2190,45 +2372,119 @@ pub const GpuWeights = struct {
         }
 
         const cmd = try self.ctx.beginBatch();
+        try self.recordMoeResidualTail(cmd, layer, eps, x.len, layer_output_scale);
+        try self.ctx.submitBatch(cmd);
+
+        try x_buf.download(std.mem.sliceAsBytes(x));
+    }
+
+    fn recordMoeResidualTail(
+        self: *GpuWeights,
+        cmd: vk.VkCommandBuffer,
+        layer: usize,
+        eps: f32,
+        len: usize,
+        layer_output_scale: f32,
+    ) !void {
+        const lw = &self.layers[layer];
+        const post_ffw_norm_2_buf = &(lw.post_ffw_norm_2_buf orelse return error.NotOnGpu);
+        const post_ffw_norm_buf = &(lw.post_ffw_norm_buf orelse return error.NotOnGpu);
+        const x_buf = &self.shared_vec.?;
+        const dense_buf = &(self.dense_ffn_out_buf orelse return error.NotOnGpu);
+        const moe_buf = &(self.moe_gpu_buf orelse return error.NotOnGpu);
+        const moe_norm_buf = &(self.ffn_vram orelse return error.NotOnGpu);
+        const combined_norm_buf = &(self.xb_vram orelse return error.NotOnGpu);
+        const n: u32 = @intCast(len);
 
         const p_moe_norm = self.ctx.profileBegin(cmd, "moe.post_norm");
-        const moe_norm_dset = try self.recordLayerRmsnorm(cmd, layer, moe_buf, post_ffw_norm_2_buf, moe_norm_buf, @intCast(x.len), eps, false);
+        const moe_norm_dset = try self.moeTailRmsnormSet(&self.moe_tail_moe_norm_dsets, layer, moe_buf, post_ffw_norm_2_buf, moe_norm_buf);
+        self.recordLayerRmsnormWithSet(cmd, layer, moe_norm_dset, n, eps, false);
         self.ctx.profileEnd(cmd, p_moe_norm);
         GpuCtx.recordShaderBarrier(cmd);
 
-        const p_combine = self.ctx.profileBegin(cmd, "ffn_moe.combine");
-        const combine_dset = try self.pl_elem_add.record(cmd, dense_buf, moe_norm_buf, @intCast(x.len));
-        self.ctx.profileEnd(cmd, p_combine);
-        GpuCtx.recordShaderBarrier(cmd);
-
-        const p_post_ffw = self.ctx.profileBegin(cmd, "ffn_moe.post_norm");
-        const post_ffw_dset = try self.recordLayerRmsnorm(cmd, layer, dense_buf, post_ffw_norm_buf, combined_norm_buf, @intCast(x.len), eps, false);
+        const p_post_ffw = self.ctx.profileBegin(cmd, "ffn_moe.add_post_norm");
+        const post_ffw_dset = try self.moeTailAddRmsnormSet(layer, dense_buf, moe_norm_buf, post_ffw_norm_buf, combined_norm_buf);
+        self.recordLayerAddRmsnormWithSet(cmd, layer, post_ffw_dset, n, eps, false);
         self.ctx.profileEnd(cmd, p_post_ffw);
         GpuCtx.recordShaderBarrier(cmd);
 
-        const p_residual = self.ctx.profileBegin(cmd, "ffn_moe.residual_add");
-        const residual_dset = try self.pl_elem_add.record(cmd, x_buf, combined_norm_buf, @intCast(x.len));
-        self.ctx.profileEnd(cmd, p_residual);
-
-        var scale_dset: ?vk.VkDescriptorSet = null;
         if (layer_output_scale != 1.0) {
-            GpuCtx.recordShaderBarrier(cmd);
-            const p_scale = self.ctx.profileBegin(cmd, "ffn_moe.layer_scale");
-            scale_dset = try self.pl_elem_scale.record(cmd, x_buf, @intCast(x.len), layer_output_scale);
-            self.ctx.profileEnd(cmd, p_scale);
+            const p_residual = self.ctx.profileBegin(cmd, "ffn_moe.residual_add_scale");
+            if (self.moe_tail_residual_scale_dset == null)
+                self.moe_tail_residual_scale_dset = try self.pl_elem_add_scale.allocSet(x_buf, combined_norm_buf);
+            self.pl_elem_add_scale.recordWithSet(cmd, self.moe_tail_residual_scale_dset.?, n, layer_output_scale);
+            self.ctx.profileEnd(cmd, p_residual);
+        } else {
+            const p_residual = self.ctx.profileBegin(cmd, "ffn_moe.residual_add");
+            if (self.moe_tail_residual_dset == null)
+                self.moe_tail_residual_dset = try self.pl_elem_add.allocSet(x_buf, combined_norm_buf);
+            self.pl_elem_add.recordWithSet(cmd, self.moe_tail_residual_dset.?, n);
+            self.ctx.profileEnd(cmd, p_residual);
         }
+    }
 
-        try self.ctx.submitBatch(cmd);
+    fn moeTailRmsnormSet(
+        self: *GpuWeights,
+        sets_opt: *?[]?vk.VkDescriptorSet,
+        layer: usize,
+        x_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+        y_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        if (sets_opt.* == null) {
+            sets_opt.* = try self.allocator.alloc(?vk.VkDescriptorSet, self.layers.len);
+            @memset(sets_opt.*.?, null);
+        }
+        const sets = sets_opt.*.?;
+        if (sets[layer] == null)
+            sets[layer] = try self.pl_rmsnorm.allocSet(x_buf, w_buf, y_buf);
+        return sets[layer].?;
+    }
 
-        const dev = self.ctx.device;
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &moe_norm_dset);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_elem_add.desc_pool, 1, &combine_dset);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_rmsnorm.desc_pool, 1, &post_ffw_dset);
-        _ = vk.vkFreeDescriptorSets(dev, self.pl_elem_add.desc_pool, 1, &residual_dset);
-        if (scale_dset) |*ds|
-            _ = vk.vkFreeDescriptorSets(dev, self.pl_elem_scale.desc_pool, 1, ds);
+    fn moeTailAddRmsnormSet(
+        self: *GpuWeights,
+        layer: usize,
+        a_buf: *const GpuBuffer,
+        b_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+        y_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        if (self.moe_tail_add_rmsnorm_dsets == null) {
+            self.moe_tail_add_rmsnorm_dsets = try self.allocator.alloc(?vk.VkDescriptorSet, self.layers.len);
+            @memset(self.moe_tail_add_rmsnorm_dsets.?, null);
+        }
+        const sets = self.moe_tail_add_rmsnorm_dsets.?;
+        if (sets[layer] == null)
+            sets[layer] = try self.pl_add_rmsnorm.allocSet(a_buf, b_buf, w_buf, y_buf);
+        return sets[layer].?;
+    }
 
-        try x_buf.download(std.mem.sliceAsBytes(x));
+    fn recordLayerRmsnormWithSet(
+        self: *const GpuWeights,
+        cmd: vk.VkCommandBuffer,
+        layer: usize,
+        dset: vk.VkDescriptorSet,
+        n: u32,
+        eps: f32,
+        weight_offset: bool,
+    ) void {
+        if (layer == 19) {
+            self.pl_rmsnorm.recordPreciseWithSet(cmd, dset, n, eps, weight_offset);
+        } else {
+            self.pl_rmsnorm.recordWithSet(cmd, dset, n, eps, weight_offset);
+        }
+    }
+
+    fn recordLayerAddRmsnormWithSet(
+        self: *const GpuWeights,
+        cmd: vk.VkCommandBuffer,
+        layer: usize,
+        dset: vk.VkDescriptorSet,
+        n: u32,
+        eps: f32,
+        weight_offset: bool,
+    ) void {
+        self.pl_add_rmsnorm.recordWithSet(cmd, dset, n, eps, weight_offset, layer == 19);
     }
 };
 

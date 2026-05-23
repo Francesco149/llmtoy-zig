@@ -399,6 +399,9 @@ const BenchPipelines = struct {
     q5_1_mmvq_b64_r2: gpu_matvec.MatvecPipeline,
     q5_1_mmvq_b64_r4: gpu_matvec.MatvecPipeline,
     q5_k: gpu_matvec.MatvecPipeline,
+    q5_k_mmvq_b64_r1: gpu_matvec.MatvecPipeline,
+    q5_k_mmvq_b64_r2: gpu_matvec.MatvecPipeline,
+    q5_k_mmvq_b64_r4: gpu_matvec.MatvecPipeline,
     q6_k: gpu_matvec.MatvecPipeline,
     q6_k_fast: gpu_matvec.MatvecPipeline,
     q6_k_mmvq_b32_r1: gpu_matvec.MatvecPipeline,
@@ -493,6 +496,24 @@ const BenchPipelines = struct {
         errdefer q5_1_mmvq_b64_r4.deinit();
         var q5_k = try gpu_matvec.MatvecPipeline.initQ5KQ8_1(ctx);
         errdefer q5_k.deinit();
+        var q5_k_mmvq_b64_r1 = try gpu_matvec.MatvecPipeline.initQ5KQ8_1Mmvq(ctx, .{
+            .block_size = 64,
+            .num_rows = 1,
+            .num_cols = 1,
+        });
+        errdefer q5_k_mmvq_b64_r1.deinit();
+        var q5_k_mmvq_b64_r2 = try gpu_matvec.MatvecPipeline.initQ5KQ8_1Mmvq(ctx, .{
+            .block_size = 64,
+            .num_rows = 2,
+            .num_cols = 1,
+        });
+        errdefer q5_k_mmvq_b64_r2.deinit();
+        var q5_k_mmvq_b64_r4 = try gpu_matvec.MatvecPipeline.initQ5KQ8_1Mmvq(ctx, .{
+            .block_size = 64,
+            .num_rows = 4,
+            .num_cols = 1,
+        });
+        errdefer q5_k_mmvq_b64_r4.deinit();
         var q6_k = try gpu_matvec.MatvecPipeline.initQ6KQ8_1(ctx);
         errdefer q6_k.deinit();
         var q6_k_fast = try gpu_matvec.MatvecPipeline.initQ6KQ8_1Fast(ctx);
@@ -544,6 +565,9 @@ const BenchPipelines = struct {
             .q5_1_mmvq_b64_r2 = q5_1_mmvq_b64_r2,
             .q5_1_mmvq_b64_r4 = q5_1_mmvq_b64_r4,
             .q5_k = q5_k,
+            .q5_k_mmvq_b64_r1 = q5_k_mmvq_b64_r1,
+            .q5_k_mmvq_b64_r2 = q5_k_mmvq_b64_r2,
+            .q5_k_mmvq_b64_r4 = q5_k_mmvq_b64_r4,
             .q6_k = q6_k,
             .q6_k_fast = q6_k_fast,
             .q6_k_mmvq_b32_r1 = q6_k_mmvq_b32_r1,
@@ -564,6 +588,9 @@ const BenchPipelines = struct {
         self.q6_k_mmvq_b32_r1.deinit();
         self.q6_k_fast.deinit();
         self.q6_k.deinit();
+        self.q5_k_mmvq_b64_r4.deinit();
+        self.q5_k_mmvq_b64_r2.deinit();
+        self.q5_k_mmvq_b64_r1.deinit();
         self.q5_k.deinit();
         self.q5_1_mmvq_b64_r4.deinit();
         self.q5_1_mmvq_b64_r2.deinit();
@@ -645,6 +672,9 @@ fn cmdBenchMatvec(
     try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_mmvq_b64_r4, &pipes.quant, opts, &ran, "L0.attn_v.mmvq.b64.r4", weights.layers[0].wv.?, .q4_k, gpa, io);
     try benchWithPipelineIfSelected(out, &ctx, &pipes.q4_k_r4, &pipes.quant, opts, &ran, "L0.attn_v.r4", weights.layers[0].wv.?, .q4_k, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L3.attn_v", weights.layers[3].wv.?, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q5_k_mmvq_b64_r1, &pipes.quant, opts, &ran, "L3.attn_v.mmvq.b64.r1", weights.layers[3].wv.?, .q5_k, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q5_k_mmvq_b64_r2, &pipes.quant, opts, &ran, "L3.attn_v.mmvq.b64.r2", weights.layers[3].wv.?, .q5_k, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q5_k_mmvq_b64_r4, &pipes.quant, opts, &ran, "L3.attn_v.mmvq.b64.r4", weights.layers[3].wv.?, .q5_k, gpa, io);
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "L5.attn_q", weights.layers[5].wq, gpa, io);
     try benchWithPipelineIfSelected(out, &ctx, &pipes.q3_k_mmvq_b32_r1, &pipes.quant, opts, &ran, "L5.attn_q.mmvq.b32.r1", weights.layers[5].wq, .q3_k, gpa, io);
     try benchWithPipelineIfSelected(out, &ctx, &pipes.q3_k_mmvq_b64_r1, &pipes.quant, opts, &ran, "L5.attn_q.mmvq.b64.r1", weights.layers[5].wq, .q3_k, gpa, io);
@@ -735,10 +765,15 @@ fn cmdBenchMoe(
     }
 
     @memset(moe_buf, 0.0);
-    try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, opts.skip_readback);
-    if (opts.tail) {
-        try gpu_weights.runLayerMoeResidualOnGpu(layer, cfg.eps, x, dense_ffn, lw.layer_output_scale, true, true);
-    }
+    const tail_params: ?g4_gpu.MoeTailParams = if (opts.tail) .{
+        .eps = cfg.eps,
+        .x = x,
+        .dense_ffn = dense_ffn,
+        .layer_output_scale = lw.layer_output_scale,
+        .x_buf_current = true,
+        .dense_buf_current = true,
+    } else null;
+    try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, opts.skip_readback, tail_params);
 
     const labels = [_][]const u8{
         "moe.quantize_input",
@@ -747,8 +782,10 @@ fn cmdBenchMoe(
         "moe.down",
         "moe.accum",
         "moe.post_norm",
+        "ffn_moe.add_post_norm",
         "ffn_moe.combine",
         "ffn_moe.post_norm",
+        "ffn_moe.residual_add_scale",
         "ffn_moe.residual_add",
         "ffn_moe.layer_scale",
     };
@@ -759,10 +796,7 @@ fn cmdBenchMoe(
     const t0 = clk.now(io);
     for (0..opts.iters) |_| {
         @memset(moe_buf, 0.0);
-        try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, opts.skip_readback);
-        if (opts.tail) {
-            try gpu_weights.runLayerMoeResidualOnGpu(layer, cfg.eps, x, dense_ffn, lw.layer_output_scale, true, true);
-        }
+        try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, opts.skip_readback, tail_params);
     }
     const t1 = clk.now(io);
 

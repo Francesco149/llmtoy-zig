@@ -137,6 +137,11 @@ pub const MatvecPipeline = struct {
         return initFromSpv(ctx, &shaders.matvec_q5_k_q8_1, 1);
     }
 
+    pub fn initQ5KQ8_1Mmvq(ctx: *const GpuContext, spec: MmvqSpec) !MatvecPipeline {
+        comptime std.debug.assert(shaders.matvec_q5_k_q8_1_mmvq.len % 4 == 0);
+        return initFromSpvMmvq(ctx, &shaders.matvec_q5_k_q8_1_mmvq, spec);
+    }
+
     pub fn initIQ4NLQ8_1(ctx: *const GpuContext) !MatvecPipeline {
         comptime std.debug.assert(shaders.matvec_iq4_nl_q8_1.len % 4 == 0);
         return initFromSpv(ctx, &shaders.matvec_iq4_nl_q8_1, 1);
@@ -274,7 +279,8 @@ pub const MatvecPipeline = struct {
 
     // Record one dispatch into an already-open command buffer.
     // Returns the descriptor set allocated from this pipeline's pool.
-    // Caller must free the returned set after vkQueueWaitIdle.
+    // Caller must free the returned set after the submitted command buffer has
+    // completed.
     pub fn record(
         self: *const MatvecPipeline,
         cmd: vk.VkCommandBuffer,
@@ -1620,13 +1626,13 @@ pub const RmsnormPipeline = struct {
 
         const pool_size = vk.VkDescriptorPoolSize{
             .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = 3 * 32,
+            .descriptorCount = 3 * 128,
         };
         const pool_ci = vk.VkDescriptorPoolCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = null,
             .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = 32,
+            .maxSets = 128,
             .poolSizeCount = 1,
             .pPoolSizes = &pool_size,
         };
@@ -1681,7 +1687,17 @@ pub const RmsnormPipeline = struct {
         precise_sum: bool,
     ) !vk.VkDescriptorSet {
         std.debug.assert(n % 256 == 0);
-        const dev = self.device;
+        const dset = try self.allocSet(x_buf, w_buf, y_buf);
+        self.recordWithSetMode(cmd, dset, n, eps, weight_offset, precise_sum);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const RmsnormPipeline,
+        x_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+        y_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .pNext = null,
@@ -1690,7 +1706,7 @@ pub const RmsnormPipeline = struct {
             .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
-        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
 
         const buf_infos = [3]vk.VkDescriptorBufferInfo{
@@ -1703,8 +1719,42 @@ pub const RmsnormPipeline = struct {
             mkWrite(dset, 1, &buf_infos[1]),
             mkWrite(dset, 2, &buf_infos[2]),
         };
-        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+        vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+        return dset;
+    }
 
+    pub fn recordWithSet(
+        self: *const RmsnormPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        n: u32,
+        eps: f32,
+        weight_offset: bool,
+    ) void {
+        self.recordWithSetMode(cmd, dset, n, eps, weight_offset, false);
+    }
+
+    pub fn recordPreciseWithSet(
+        self: *const RmsnormPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        n: u32,
+        eps: f32,
+        weight_offset: bool,
+    ) void {
+        self.recordWithSetMode(cmd, dset, n, eps, weight_offset, true);
+    }
+
+    fn recordWithSetMode(
+        self: *const RmsnormPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        n: u32,
+        eps: f32,
+        weight_offset: bool,
+        precise_sum: bool,
+    ) void {
+        std.debug.assert(n % 256 == 0);
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
 
@@ -1716,11 +1766,98 @@ pub const RmsnormPipeline = struct {
         };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(RmsnormPushConst), &pc);
         vk.vkCmdDispatch(cmd, 1, 1, 1);
-
-        return dset;
     }
 
     pub fn deinit(self: *RmsnormPipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
+// ── AddRmsnormPipeline ────────────────────────────────────────────────────────
+//
+// Fuses an elementwise add with the following RMSNorm:
+//   y[i] = (a[i] + b[i]) * rms_inv * (bias + w[i])
+// This is used by the MoE tail to replace combine + post_ffw_norm.
+
+pub const AddRmsnormPipeline = struct {
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !AddRmsnormPipeline {
+        comptime std.debug.assert(shaders.add_rmsnorm.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.add_rmsnorm, 4, @sizeOf(RmsnormPushConst), 64);
+        return .{
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn allocSet(
+        self: *const AddRmsnormPipeline,
+        a_buf: *const GpuBuffer,
+        b_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+        y_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [4]vk.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = b_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = w_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = y_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [4]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+            mkWrite(dset, 2, &buf_infos[2]),
+            mkWrite(dset, 3, &buf_infos[3]),
+        };
+        vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+        return dset;
+    }
+
+    pub fn recordWithSet(
+        self: *const AddRmsnormPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        n: u32,
+        eps: f32,
+        weight_offset: bool,
+        precise_sum: bool,
+    ) void {
+        std.debug.assert(n % 256 == 0);
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
+        const pc = RmsnormPushConst{
+            .n = n,
+            .eps = eps,
+            .weight_offset = (if (weight_offset) @as(u32, 1) else 0) |
+                (if (precise_sum) @as(u32, 2) else 0),
+        };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(RmsnormPushConst), &pc);
+        vk.vkCmdDispatch(cmd, 1, 1, 1);
+    }
+
+    pub fn deinit(self: *AddRmsnormPipeline) void {
         vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
         vk.vkDestroyPipeline(self.device, self.pipeline, null);
         vk.vkDestroyPipelineLayout(self.device, self.layout, null);
@@ -2037,7 +2174,7 @@ pub const ElemAddPipeline = struct {
 
     pub fn init(ctx: *const GpuContext) !ElemAddPipeline {
         comptime std.debug.assert(shaders.elem_add.len % 4 == 0);
-        const built = try buildSimplePipeline(ctx, &shaders.elem_add, 2, @sizeOf(ElemPushConst), 32);
+        const built = try buildSimplePipeline(ctx, &shaders.elem_add, 2, @sizeOf(ElemPushConst), 64);
         return .{
             .pipeline = built.pipeline,
             .layout = built.layout,
@@ -2054,7 +2191,16 @@ pub const ElemAddPipeline = struct {
         b_buf: *const GpuBuffer,
         n: u32,
     ) !vk.VkDescriptorSet {
-        const dev = self.device;
+        const dset = try self.allocSet(a_buf, b_buf);
+        self.recordWithSet(cmd, dset, n);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const ElemAddPipeline,
+        a_buf: *const GpuBuffer,
+        b_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .pNext = null,
@@ -2063,7 +2209,7 @@ pub const ElemAddPipeline = struct {
             .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
-        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
 
         const buf_infos = [2]vk.VkDescriptorBufferInfo{
@@ -2074,15 +2220,22 @@ pub const ElemAddPipeline = struct {
             mkWrite(dset, 0, &buf_infos[0]),
             mkWrite(dset, 1, &buf_infos[1]),
         };
-        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+        vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+        return dset;
+    }
 
+    pub fn recordWithSet(
+        self: *const ElemAddPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        n: u32,
+    ) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = ElemPushConst{ .n = n };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ElemPushConst), &pc);
         const groups = (n + 255) / 256;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
-        return dset;
     }
 
     pub fn deinit(self: *ElemAddPipeline) void {
@@ -2102,7 +2255,7 @@ pub const ElemScalePipeline = struct {
 
     pub fn init(ctx: *const GpuContext) !ElemScalePipeline {
         comptime std.debug.assert(shaders.elem_scale.len % 4 == 0);
-        const built = try buildSimplePipeline(ctx, &shaders.elem_scale, 1, @sizeOf(ElemScalePushConst), 32);
+        const built = try buildSimplePipeline(ctx, &shaders.elem_scale, 1, @sizeOf(ElemScalePushConst), 64);
         return .{
             .pipeline = built.pipeline,
             .layout = built.layout,
@@ -2119,7 +2272,12 @@ pub const ElemScalePipeline = struct {
         n: u32,
         s: f32,
     ) !vk.VkDescriptorSet {
-        const dev = self.device;
+        const dset = try self.allocSet(x_buf);
+        self.recordWithSet(cmd, dset, n, s);
+        return dset;
+    }
+
+    pub fn allocSet(self: *const ElemScalePipeline, x_buf: *const GpuBuffer) !vk.VkDescriptorSet {
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .pNext = null,
@@ -2128,7 +2286,7 @@ pub const ElemScalePipeline = struct {
             .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
-        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
 
         const buf_info = vk.VkDescriptorBufferInfo{
@@ -2137,18 +2295,109 @@ pub const ElemScalePipeline = struct {
             .range = vk.VK_WHOLE_SIZE,
         };
         const write = mkWrite(dset, 0, &buf_info);
-        vk.vkUpdateDescriptorSets(dev, 1, &write, 0, null);
+        vk.vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
+        return dset;
+    }
 
+    pub fn recordWithSet(
+        self: *const ElemScalePipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        n: u32,
+        s: f32,
+    ) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = ElemScalePushConst{ .n = n, .s = s };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ElemScalePushConst), &pc);
         const groups = (n + 255) / 256;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
-        return dset;
     }
 
     pub fn deinit(self: *ElemScalePipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
+pub const ElemAddScalePipeline = struct {
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !ElemAddScalePipeline {
+        comptime std.debug.assert(shaders.elem_add_scale.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.elem_add_scale, 2, @sizeOf(ElemScalePushConst), 64);
+        return .{
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn record(
+        self: *const ElemAddScalePipeline,
+        cmd: vk.VkCommandBuffer,
+        a_buf: *const GpuBuffer,
+        b_buf: *const GpuBuffer,
+        n: u32,
+        s: f32,
+    ) !vk.VkDescriptorSet {
+        const dset = try self.allocSet(a_buf, b_buf);
+        self.recordWithSet(cmd, dset, n, s);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const ElemAddScalePipeline,
+        a_buf: *const GpuBuffer,
+        b_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [2]vk.VkDescriptorBufferInfo{
+            .{ .buffer = a_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = b_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [2]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+        };
+        vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+        return dset;
+    }
+
+    pub fn recordWithSet(
+        self: *const ElemAddScalePipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        n: u32,
+        s: f32,
+    ) void {
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
+        const pc = ElemScalePushConst{ .n = n, .s = s };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ElemScalePushConst), &pc);
+        const groups = (n + 255) / 256;
+        vk.vkCmdDispatch(cmd, groups, 1, 1);
+    }
+
+    pub fn deinit(self: *ElemAddScalePipeline) void {
         vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
         vk.vkDestroyPipeline(self.device, self.pipeline, null);
         vk.vkDestroyPipelineLayout(self.device, self.layout, null);
@@ -4346,6 +4595,46 @@ test "gpu matvec Q5_K × Q8_1 fuzz attn-v-shaped cols" {
     try fuzzQuantQ8_1(.q5_k, 176, 256, MatvecPipeline.initQ5KQ8_1, MatvecSession.initQ5K, 64, 2816, 79);
 }
 
+fn initQ5KQ8_1MmvqB64R1(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ5KQ8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 1,
+        .num_cols = 1,
+    });
+}
+
+fn initQ5KQ8_1MmvqB64R2(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ5KQ8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 2,
+        .num_cols = 1,
+    });
+}
+
+fn initQ5KQ8_1MmvqB64R4(ctx: *const GpuContext) !MatvecPipeline {
+    return MatvecPipeline.initQ5KQ8_1Mmvq(ctx, .{
+        .block_size = 64,
+        .num_rows = 4,
+        .num_cols = 1,
+    });
+}
+
+test "gpu matvec Q5_K × Q8_1 MMVQ b64 r1 fuzz small" {
+    try fuzzQuantQ8_1(.q5_k, 176, 256, initQ5KQ8_1MmvqB64R1, MatvecSession.initQ5K, 32, 256, 101);
+}
+
+test "gpu matvec Q5_K × Q8_1 MMVQ b64 r1 fuzz attn-v-shaped cols" {
+    try fuzzQuantQ8_1(.q5_k, 176, 256, initQ5KQ8_1MmvqB64R1, MatvecSession.initQ5K, 64, 2816, 103);
+}
+
+test "gpu matvec Q5_K × Q8_1 MMVQ b64 r2 fuzz attn-v-shaped cols" {
+    try fuzzQuantQ8_1(.q5_k, 176, 256, initQ5KQ8_1MmvqB64R2, MatvecSession.initQ5K, 64, 2816, 105);
+}
+
+test "gpu matvec Q5_K × Q8_1 MMVQ b64 r4 fuzz attn-v-shaped cols" {
+    try fuzzQuantQ8_1(.q5_k, 176, 256, initQ5KQ8_1MmvqB64R4, MatvecSession.initQ5K, 64, 2816, 107);
+}
+
 test "gpu matvec IQ4_NL × Q8_1 fuzz small" {
     try fuzzQuantQ8_1(.iq4_nl, 18, 32, MatvecPipeline.initIQ4NLQ8_1, MatvecSession.initIQ4NL, 32, 256, 67);
 }
@@ -4444,6 +4733,101 @@ test "gpu rmsnorm n=2816 fuzz with (1+w) convention" {
 }
 test "gpu rmsnorm n=2816 precise-sum fuzz" {
     try fuzzRmsnorm(2816, 83, false, true);
+}
+
+// ── add_rmsnorm fuzz test ─────────────────────────────────────────────────────
+
+fn runAddRmsnormShader(
+    gpu: *const GpuContext,
+    a: []const f32,
+    b: []const f32,
+    w: []const f32,
+    eps: f32,
+    weight_offset: bool,
+    precise_sum: bool,
+    out: []f32,
+) !void {
+    var pl = try AddRmsnormPipeline.init(gpu);
+    defer pl.deinit();
+
+    var a_buf = try GpuBuffer.initHostCoherent(gpu, a.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer a_buf.deinit();
+    try a_buf.upload(std.mem.sliceAsBytes(a));
+
+    var b_buf = try GpuBuffer.initHostCoherent(gpu, b.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer b_buf.deinit();
+    try b_buf.upload(std.mem.sliceAsBytes(b));
+
+    var w_buf = try GpuBuffer.initHostCoherent(gpu, w.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer w_buf.deinit();
+    try w_buf.upload(std.mem.sliceAsBytes(w));
+
+    var y_buf = try GpuBuffer.initHostCoherent(gpu, out.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer y_buf.deinit();
+
+    const dset = try pl.allocSet(&a_buf, &b_buf, &w_buf, &y_buf);
+    const cmd = try gpu.beginBatch();
+    pl.recordWithSet(cmd, dset, @intCast(a.len), eps, weight_offset, precise_sum);
+    try gpu.submitBatch(cmd);
+    try y_buf.download(std.mem.sliceAsBytes(out));
+}
+
+fn fuzzAddRmsnorm(n: usize, seed: u64, weight_offset: bool, precise_sum: bool) !void {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    const al = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+
+    const a = try al.alloc(f32, n);
+    defer al.free(a);
+    const b = try al.alloc(f32, n);
+    defer al.free(b);
+    const w = try al.alloc(f32, n);
+    defer al.free(w);
+    const cpu_out = try al.alloc(f32, n);
+    defer al.free(cpu_out);
+    const gpu_out = try al.alloc(f32, n);
+    defer al.free(gpu_out);
+
+    for (a) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
+    for (b) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
+    for (w) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+
+    var ss: f32 = 0.0;
+    for (a, b) |av, bv| {
+        const v = av + bv;
+        ss += v * v;
+    }
+    const eps: f32 = 1e-6;
+    const rms_inv: f32 = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(n)) + eps);
+    const bias: f32 = if (weight_offset) 1.0 else 0.0;
+    for (cpu_out, a, b, w) |*o, av, bv, wi| o.* = (av + bv) * rms_inv * (bias + wi);
+
+    try runAddRmsnormShader(&gpu, a, b, w, eps, weight_offset, precise_sum, gpu_out);
+
+    var max_abs: f32 = 0.0;
+    var max_ref: f32 = 0.0;
+    for (cpu_out, gpu_out) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs) max_abs = d;
+        if (@abs(c) > max_ref) max_ref = @abs(c);
+    }
+    const rel = max_abs / (max_ref + 1e-6);
+    std.debug.print("add_rmsnorm fuzz n={} bias={} precise={} max|D|={d:.6} rel={e:.3}\n", .{ n, weight_offset, precise_sum, max_abs, rel });
+    try std.testing.expect(rel < 1e-5);
+}
+
+test "gpu add_rmsnorm n=2816 fuzz" {
+    try fuzzAddRmsnorm(2816, 89, false, false);
+}
+test "gpu add_rmsnorm n=2816 precise-sum fuzz" {
+    try fuzzAddRmsnorm(2816, 97, false, true);
 }
 
 // ── rmsnorm_perhead fuzz test ─────────────────────────────────────────────────

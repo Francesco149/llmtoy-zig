@@ -407,6 +407,24 @@ Focused `bench-matvec --iters 128 --target all` GPU timestamps:
 Conclusion: keep Q5 MMVQ as bench-only reference code. The existing simple Q5
 Q8_1 kernels are faster for these decode shapes on this device.
 
+## Phase 7o — Q5_K MMVQ bench-only probe
+
+Added a Q5_K MMVQ shader and `L3.attn_v.mmvq.b64.r{1,2,4}` bench targets. It
+passes the GPU fuzz tests on both 256-column and 2816-column shapes, but it is
+not a production win.
+
+Focused `LLMTOY_GPU_PROFILE=1 bench-matvec --iters 128 --target all` snapshot:
+
+| Target | GPU us |
+|--------|-------:|
+| `L3.attn_v` current Q5_K | 15.71 |
+| `L3.attn_v.mmvq.b64.r1` | 17.85 |
+| `L3.attn_v.mmvq.b64.r2` | 18.32 |
+| `L3.attn_v.mmvq.b64.r4` | 21.42 |
+
+Conclusion: keep Q5_K MMVQ bench-only. The narrow Q5_K fallback-removal kernel
+is faster for this attention-V shape.
+
 ## llama.cpp Vulkan Reference — Nix package
 
 Reference package:
@@ -1251,6 +1269,25 @@ at pre-recorded graphs, fence rings, queue wait, or readback as the limiting
 factor. The next meaningful MoE work is still the Q3_K gate/up-ID kernel shape
 or removing the final per-batch wait/readback.
 
+Fence cleanup:
+
+- `GpuContext.submitBatchCopy`, `submitReusableBatch`, and one-shot copies now
+  submit with a context-owned fence and wait that fence instead of calling
+  `vkQueueWaitIdle`. The narrow async MoE path also recycles a small fence pool
+  instead of creating/destroying a fence for each async batch.
+- This is primarily structural cleanup for later fence-ring work, not a
+  measured tok/s win. Layer 0 `bench-moe --iters 64 --layer 0 --skip-readback`
+  with `LLMTOY_EXPERT_REUSE_DSETS=1` measured baseline `150.03 us/iter` and
+  the fence-reuse tree `149.28 us/iter` in one same-host check. The non-reuse
+  path similarly stayed within noise (`158.06 us/iter` baseline vs
+  `157.91 us/iter`).
+- Correctness: `compare ... "explain MoE" --chat` keeps all layer argmaxes and
+  final argmax matching CPU.
+- Follow-up cleanup removed duplicated one-shot copy submission code by making
+  `copyBuffer()` delegate to `copyBufferRegion()`, and refreshed stale comments
+  that still described descriptor lifetime and host-coherent reads in terms of
+  `vkQueueWaitIdle`.
+
 Gate/up-ID mixed-down correctness fix:
 
 - The flat gate/up-ID route was failing on layers whose down projection could
@@ -1354,6 +1391,76 @@ VRAM-tail upload cleanup:
 - The matching `LLMTOY_GPU_PROFILE=1` run measured prefill `20.74 tok/s`,
   generation `20.81 tok/s`, with `5436` GPU batches, `544.445 ms` dispatch,
   `44.934 ms` in-batch gap, and `589.379 ms` profiled batch span.
+
+MoE tail submit/descriptor probe:
+
+- Rechecked the post-fence-cleanup MoE tail with
+  `LLMTOY_GPU_PROFILE=1 LLMTOY_EXPERT_GU_ID=1 LLMTOY_EXPERT_REUSE_DSETS=1`.
+  Layer 0 `bench-moe --iters 64 --layer 0 --skip-readback --tail` measured
+  `314.69 us/iter` wall, `120.82 us/iter` GPU phases, and
+  `193.87 us/iter` host/submit residual. Layer 10 measured `333.78 us/iter`
+  wall, `131.30 us/iter` GPU phases, and `202.48 us/iter` host residual.
+- The existing `LLMTOY_EXPERT_REUSE_CMD=1` probe improved the isolated
+  expert-id shape slightly, but did not move the full MoE+tail iteration:
+  layer 0 stayed at `309.31 us/iter` wall with `115.95 us/iter` GPU phases.
+- Added persistent descriptor sets for the stable MoE residual tail bindings
+  and recorded that residual tail into the expert-batch command buffer when
+  the VRAM-tail path is active. This is structurally closer to the final graph
+  shape and correctness still passes `compare ... "explain MoE" --chat`, but
+  it did not improve the isolated layer-0 wall number: `316.43 us/iter` wall,
+  `120.12 us/iter` GPU phases.
+- Rechecked the narrow async MoE path after the fence cleanup. It is now
+  intentionally limited to `LLMTOY_EXPERT_GU_ID=1
+  LLMTOY_EXPERT_REUSE_DSETS=1`, no tail, no readback, and no profiler, so every
+  descriptor set used by the in-flight command buffer is persistent. A same-host
+  layer-10 `bench-moe --iters 32 --layer 10 --skip-readback` smoke run measured
+  `193.08 us/iter` with `LLMTOY_EXPERT_ASYNC=0` and `180.61 us/iter` with
+  `LLMTOY_EXPERT_ASYNC=1`, but those two runs overlapped on the host and should
+  be treated as a safety/shape check rather than a benchmark claim. Correctness:
+  async `compare ... "explain MoE" --chat` kept all layer argmaxes and the final
+  argmax matching CPU.
+- Added a first fence-owned descriptor-free list on `GpuContext.PendingBatch`
+  and converted `runExpertBatch` transient descriptor sets to use it. Async MoE
+  no longer requires `LLMTOY_EXPERT_REUSE_DSETS=1`; `LLMTOY_EXPERT_GU_ID=1
+  LLMTOY_EXPERT_ASYNC=1 compare ... "explain MoE" --chat` passes with all layer
+  argmaxes and the final argmax matching CPU. A parallel layer-10 smoke bench
+  without descriptor reuse measured sync `164.09 us/iter` and async
+  `177.49 us/iter`; treat this only as a no-crash/no-regression-shape check
+  because both runs shared the host/GPU.
+- Conclusion: broad descriptor/submit cleanup is not the next high-leverage
+  path. The next target should return to measured dispatch work: expert
+  gate/up-ID kernel shape and dense/down MMVQ-style kernels, with host cleanup
+  revisited only after dispatch time drops.
+
+MoE dispatch follow-up:
+
+- Cross-checked llmtoy's selected-expert Q3_K route against llama.cpp's Vulkan
+  `mul_mat_vec_id_q3_k_q8_1_f32` / `mul_mat_vec_base.glsl` shape. A direct
+  packed16 repack experiment in `expert_gate_up_id_q3_k_q8_1.glsl` was
+  correctness-safe but slower on this layer-10 bench: gate/up-ID rose from
+  about `52 us` GPU to about `71 us`. That experiment was reverted; the current
+  byte-load gate/up-ID shader remains the faster production choice.
+- Added `elem_add_scale.glsl` and routed scaled MoE residual tails through one
+  `ffn_moe.residual_add_scale` dispatch instead of separate residual-add and
+  layer-scale dispatches. Layer 10
+  `LLMTOY_GPU_PROFILE=1 LLMTOY_EXPERT_GU_ID=1
+  LLMTOY_EXPERT_REUSE_DSETS=1 bench-moe --iters 64 --layer 10
+  --skip-readback --tail` now reports `ffn_moe.residual_add_scale` at about
+  `1.88 us/iter`, with the old `ffn_moe.residual_add` and
+  `ffn_moe.layer_scale` counts at zero. Total measured layer-10 wall was
+  `265.80 us/iter`, GPU phases `129.80 us/iter`, host/submit `136.00 us/iter`.
+- Correctness: `compare ... "explain MoE" --chat` keeps all layer argmaxes and
+  final argmax matching CPU after the add-scale fusion.
+- Added `add_rmsnorm.glsl` and routed the MoE tail's dense/MoE combine plus
+  `post_ffw_norm` through one `ffn_moe.add_post_norm` dispatch. This removes
+  the standalone `ffn_moe.combine` dispatch and the intermediate dense-buffer
+  write/read before the second tail RMSNorm. Layer 10
+  `LLMTOY_GPU_PROFILE=1 LLMTOY_EXPERT_GU_ID=1
+  LLMTOY_EXPERT_REUSE_DSETS=1 bench-moe --iters 64 --layer 10
+  --skip-readback --tail` reports `ffn_moe.add_post_norm` at about
+  `16.91 us/iter`, with `ffn_moe.combine` and `ffn_moe.post_norm` counts at
+  zero. Total measured layer-10 wall was `269.15 us/iter`, GPU phases
+  `128.13 us/iter`, host/submit `141.02 us/iter`.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

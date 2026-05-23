@@ -12,8 +12,7 @@ pub const GpuBuffer = struct {
     // Used for per-token activations and for staging uploads/downloads.
     // Simple but limited by PCIe bandwidth (≈ 64 GB/s peak for PCIe 4.0 x16).
     pub fn initHostCoherent(ctx: *const GpuContext, size: usize, usage: vk.VkBufferUsageFlags) !GpuBuffer {
-        const props: vk.VkMemoryPropertyFlags = @intCast(
-            vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        const props: vk.VkMemoryPropertyFlags = @intCast(vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         return initMem(ctx, size, usage, props);
     }
 
@@ -22,17 +21,13 @@ pub const GpuBuffer = struct {
     // Use for weight matrices that are uploaded once and read many times per token.
     pub fn initDeviceLocal(ctx: *const GpuContext, size: usize, usage: vk.VkBufferUsageFlags) !GpuBuffer {
         const props: vk.VkMemoryPropertyFlags = @intCast(vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        return initMem(ctx, size,
-            usage | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            props);
+        return initMem(ctx, size, usage | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, props);
     }
 
     // Staging buffer: host-coherent, used only for transfer source/dest.
     pub fn initStaging(ctx: *const GpuContext, size: usize) !GpuBuffer {
-        const props: vk.VkMemoryPropertyFlags = @intCast(
-            vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        const usage: vk.VkBufferUsageFlags = @intCast(
-            vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const props: vk.VkMemoryPropertyFlags = @intCast(vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        const usage: vk.VkBufferUsageFlags = @intCast(vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         return initMem(ctx, size, usage, props);
     }
 
@@ -101,13 +96,14 @@ pub const GpuBuffer = struct {
     }
 
     // Map host-coherent buffer for direct CPU read/write. Call unmap() when done.
-    // Safe to read immediately after vkQueueWaitIdle; writes visible to GPU after unmap.
+    // Safe to read after the producing submit's fence has completed; writes are
+    // visible to GPU after unmap.
     pub fn mapSlice(self: *const GpuBuffer, comptime T: type, count: usize) ![]T {
         std.debug.assert(count * @sizeOf(T) <= self.size);
         var ptr: ?*anyopaque = null;
         if (vk.vkMapMemory(self.device, self.memory, 0, count * @sizeOf(T), 0, &ptr) != vk.VK_SUCCESS)
             return error.VkMapFailed;
-        const typed: [*]T = @alignCast(@ptrCast(ptr.?));
+        const typed: [*]T = @ptrCast(@alignCast(ptr.?));
         return typed[0..count];
     }
 
