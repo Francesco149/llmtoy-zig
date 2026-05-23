@@ -216,7 +216,11 @@ pub const GpuWeights = struct {
     expert_down_id_dsets: ?[]?vk.VkDescriptorSet,
     expert_down_id_dset_is_iq4: ?[]bool,
     expert_reuse_cmds: ?[]?vk.VkCommandBuffer,
-    pending_moe_batch: ?GpuCtx.PendingBatch,
+    // One in-flight async submit whose transient descriptor sets must stay
+    // alive until its fence signals. Currently used by the MoE expert batch,
+    // but intentionally not named after MoE so attention/dense graph work can
+    // share the same lifetime path.
+    pending_gpu_batch: ?GpuCtx.PendingBatch,
     moe_tail_moe_norm_dsets: ?[]?vk.VkDescriptorSet,
     moe_tail_post_ffw_dsets: ?[]?vk.VkDescriptorSet,
     moe_tail_add_rmsnorm_dsets: ?[]?vk.VkDescriptorSet,
@@ -456,7 +460,7 @@ pub const GpuWeights = struct {
             .expert_down_id_dsets = null,
             .expert_down_id_dset_is_iq4 = null,
             .expert_reuse_cmds = null,
-            .pending_moe_batch = null,
+            .pending_gpu_batch = null,
             .moe_tail_moe_norm_dsets = null,
             .moe_tail_post_ffw_dsets = null,
             .moe_tail_add_rmsnorm_dsets = null,
@@ -823,7 +827,7 @@ pub const GpuWeights = struct {
     }
 
     pub fn deinit(self: *GpuWeights) void {
-        self.finishPendingMoeBatch() catch {};
+        self.finishPendingGpuBatch() catch {};
         if (self.scores_vram) |*b| b.deinit();
         if (self.kv_stage) |*b| b.deinit();
         if (self.kv_cap) |c| self.allocator.free(c);
@@ -1014,9 +1018,9 @@ pub const GpuWeights = struct {
         self.ctx.deinit();
     }
 
-    fn finishPendingMoeBatch(self: *GpuWeights) !void {
-        if (self.pending_moe_batch) |pending| {
-            self.pending_moe_batch = null;
+    fn finishPendingGpuBatch(self: *GpuWeights) !void {
+        if (self.pending_gpu_batch) |pending| {
+            self.pending_gpu_batch = null;
             try self.ctx.waitPendingBatch(pending);
         }
     }
@@ -2026,7 +2030,7 @@ pub const GpuWeights = struct {
         skip_readback: bool,
         tail: ?MoeTailParams,
     ) !void {
-        try self.finishPendingMoeBatch();
+        try self.finishPendingGpuBatch();
 
         const n = top_idx.len;
         const eg_sessions = self.expert_gate orelse return error.ExpertNotOnGpu;
@@ -2067,7 +2071,8 @@ pub const GpuWeights = struct {
         else
             true;
         // Async MoE is safe for transient descriptor sets now that the sets are
-        // attached to the pending fence and freed in finishPendingMoeBatch().
+        // attached to the generic pending fence and freed in
+        // finishPendingGpuBatch().
         const async_moe = async_moe_env and
             tail == null and
             skip_readback and
@@ -2306,7 +2311,7 @@ pub const GpuWeights = struct {
             var async_submit_succeeded = false;
             errdefer if (!async_submit_succeeded)
                 self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
-            self.pending_moe_batch = try self.ctx.submitBatchAsyncWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
+            self.pending_gpu_batch = try self.ctx.submitBatchAsyncWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
             async_submit_succeeded = true;
         } else {
             try self.collectRunExpertBatchDescriptorFrees(
