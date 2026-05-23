@@ -204,7 +204,7 @@ pub fn forwardOne(
                 g.q8_1PipelineFor(lw.wv.?.type_)
             else
                 null;
-            try g.runLayerAttnQ8_1KvVram(l, cfg.eps, wq_q8_pl, wk_q8_pl, wv_q8_pl, @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd), @intCast(pos), is_swa, cfg.rope_theta_swa, @intCast(kv_slot_l), x, q[0..nq_l], k_cur, v_cur);
+            try g.runLayerAttnQ8_1KvVram(l, cfg.eps, wq_q8_pl, wk_q8_pl, wv_q8_pl, @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd), @intCast(pos), is_swa, cfg.rope_theta_swa, @intCast(kv_slot_l), x, null, k_cur, v_cur);
             gpu_did_norms_and_rope = true;
         } else if (can_q8_1_qkv) {
             const g = gpu.?;

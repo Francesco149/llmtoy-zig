@@ -1278,7 +1278,7 @@ pub const GpuWeights = struct {
         rope_theta_swa: f32,
         kv_slot: u32,
         x: []const f32,
-        q_out: []f32,
+        q_out: ?[]f32,
         k_out: []f32,
         v_out: []f32,
     ) !void {
@@ -1419,7 +1419,7 @@ pub const GpuWeights = struct {
         try self.ctx.submitBatch(cmd);
         self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
 
-        try q_buf.download(std.mem.sliceAsBytes(q_out));
+        if (q_out) |q| try q_buf.download(std.mem.sliceAsBytes(q));
         try k_buf.download(std.mem.sliceAsBytes(k_out));
         try v_buf.download(std.mem.sliceAsBytes(v_out));
     }
