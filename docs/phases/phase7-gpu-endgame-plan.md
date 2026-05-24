@@ -758,17 +758,24 @@ Acceptance criteria:
 
 ## Phase 7s - Device Feature and Shader Introspection
 
-Status: TODO, useful alongside 7o.
+Status: STARTED, useful alongside 7o.
 
-Add `llmtoy gpu-info --verbose` or extend the existing command to print:
+`llmtoy gpu-info --verbose` now prints the first-pass device facts needed for
+shader tuning:
 
 - subgroup size and supported subgroup operations
 - integer dot product feature and acceleration booleans
 - subgroup size control support
-- cooperative matrix support and supported shapes
 - timestamp period
 - memory heaps/types relevant to VRAM/GTT
 - pipeline executable properties support
+- cooperative matrix extension support
+
+On the RX 7800 XT/RADV target, the verbose probe reports subgroup size 64,
+subgroup size control with min 32/max 64 for compute, accelerated packed 4x8
+integer dot product, `VK_KHR_pipeline_executable_properties`, and
+`VK_KHR_cooperative_matrix`. This explains why 32-lane shader assumptions need
+explicit handling on this driver.
 
 If `VK_KHR_pipeline_executable_properties` is available, add an opt-in debug
 path to dump register usage/occupancy-like stats for the hot matvec pipelines.

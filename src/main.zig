@@ -55,7 +55,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, args[1], "gpu-info")) {
-        try cmdGpuInfo(out);
+        var verbose = false;
+        for (args[2..]) |arg| {
+            if (std.mem.eql(u8, arg, "--verbose")) verbose = true;
+        }
+        try cmdGpuInfo(out, verbose);
     } else if (std.mem.eql(u8, args[1], "info")) {
         if (args.len < 3) {
             std.debug.print("usage: llmtoy info <model.gguf>\n", .{});
@@ -229,7 +233,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
     try out.writeAll(
         \\llmtoy-zig  —  educational LLM inference
         \\
-        \\  llmtoy gpu-info                        list Vulkan device and run a matvec smoke test
+        \\  llmtoy gpu-info [--verbose]            list Vulkan device and run a matvec smoke test
         \\  llmtoy info <model.gguf>               print model metadata and tensor summary
         \\  llmtoy tokenize <model.gguf> <text>    BPE-encode text, print IDs and decoded tokens
         \\  llmtoy bench-matvec <model.gguf> [--iters N] [--target NAME] [--reuse-descriptor]
@@ -249,7 +253,7 @@ fn usagePrint(out: *std.Io.Writer) !void {
     );
 }
 
-fn cmdGpuInfo(out: *std.Io.Writer) !void {
+fn cmdGpuInfo(out: *std.Io.Writer, verbose: bool) !void {
     var ctx = gpu_ctx.GpuContext.init() catch |e| {
         try out.print("gpu init failed: {}\n", .{e});
         return;
@@ -263,6 +267,7 @@ fn cmdGpuInfo(out: *std.Io.Writer) !void {
         ctx.subgroup_supported_stages & vk.VK_SHADER_STAGE_COMPUTE_BIT != 0,
         ctx.hasSubgroupArithmetic(),
     });
+    if (verbose) try printGpuVerbose(out, &ctx);
 
     // Smoke test: 4×4 identity * [1,2,3,4] = [1,2,3,4]
     var pipeline = gpu_matvec.MatvecPipeline.initF32(&ctx) catch |e| {
@@ -277,6 +282,169 @@ fn cmdGpuInfo(out: *std.Io.Writer) !void {
     try gpu_matvec.matvecF32(&ctx, &pipeline, &mat, &vec, &result, 4, 4);
 
     try out.print("matvec smoke test: [{d:.0}, {d:.0}, {d:.0}, {d:.0}] (expect [1, 2, 3, 4])\n", .{ result[0], result[1], result[2], result[3] });
+}
+
+fn vkBool(v: vk.VkBool32) bool {
+    return v != vk.VK_FALSE;
+}
+
+fn printGpuVerbose(out: *std.Io.Writer, ctx: *const gpu_ctx.GpuContext) !void {
+    var idot_props = std.mem.zeroes(vk.VkPhysicalDeviceShaderIntegerDotProductProperties);
+    idot_props.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
+
+    var subgroup_size_props = std.mem.zeroes(vk.VkPhysicalDeviceSubgroupSizeControlProperties);
+    subgroup_size_props.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+    subgroup_size_props.pNext = &idot_props;
+
+    var subgroup_props = std.mem.zeroes(vk.VkPhysicalDeviceSubgroupProperties);
+    subgroup_props.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+    subgroup_props.pNext = &subgroup_size_props;
+
+    var props2 = std.mem.zeroes(vk.VkPhysicalDeviceProperties2);
+    props2.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &subgroup_props;
+    vk.vkGetPhysicalDeviceProperties2(ctx.phys_dev, &props2);
+
+    var idot_feats = std.mem.zeroes(vk.VkPhysicalDeviceShaderIntegerDotProductFeatures);
+    idot_feats.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+
+    var subgroup_size_feats = std.mem.zeroes(vk.VkPhysicalDeviceSubgroupSizeControlFeatures);
+    subgroup_size_feats.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
+    subgroup_size_feats.pNext = &idot_feats;
+
+    var feats2 = std.mem.zeroes(vk.VkPhysicalDeviceFeatures2);
+    feats2.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    feats2.pNext = &subgroup_size_feats;
+    vk.vkGetPhysicalDeviceFeatures2(ctx.phys_dev, &feats2);
+
+    try out.print("api: {}.{}.{}  driver=0x{x}  vendor=0x{x}  device=0x{x}\n", .{
+        vk.VK_VERSION_MAJOR(props2.properties.apiVersion),
+        vk.VK_VERSION_MINOR(props2.properties.apiVersion),
+        vk.VK_VERSION_PATCH(props2.properties.apiVersion),
+        props2.properties.driverVersion,
+        props2.properties.vendorID,
+        props2.properties.deviceID,
+    });
+    try out.print("device type: {s}\n", .{deviceTypeName(props2.properties.deviceType)});
+    try out.print("limits: maxComputeWorkGroupInvocations={} timestampPeriod={d:.3} ns\n", .{
+        props2.properties.limits.maxComputeWorkGroupInvocations,
+        props2.properties.limits.timestampPeriod,
+    });
+
+    try out.print("subgroup stages: {s}\n", .{shaderStageFlags(ctx.subgroup_supported_stages)});
+    try out.print("subgroup ops: {s}\n", .{subgroupOpFlags(ctx.subgroup_supported_operations)});
+    try out.print("subgroup size control: feature={} fullSubgroups={} min={} max={} requiredStages={s}\n", .{
+        vkBool(subgroup_size_feats.subgroupSizeControl),
+        vkBool(subgroup_size_feats.computeFullSubgroups),
+        subgroup_size_props.minSubgroupSize,
+        subgroup_size_props.maxSubgroupSize,
+        shaderStageFlags(subgroup_size_props.requiredSubgroupSizeStages),
+    });
+    try out.print("integer dot: feature={} s8x4_accel={} u8x4_accel={} mixed_s8x4_accel={} mixed_u8x4_accel={}\n", .{
+        vkBool(idot_feats.shaderIntegerDotProduct),
+        vkBool(idot_props.integerDotProduct4x8BitPackedSignedAccelerated),
+        vkBool(idot_props.integerDotProduct4x8BitPackedUnsignedAccelerated),
+        vkBool(idot_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated),
+        vkBool(idot_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated),
+    });
+
+    try printExtensionSupport(out, ctx.phys_dev);
+    try printMemoryInfo(out, ctx.phys_dev);
+}
+
+fn printExtensionSupport(out: *std.Io.Writer, phys_dev: vk.VkPhysicalDevice) !void {
+    const exts = [_][]const u8{
+        "VK_KHR_pipeline_executable_properties",
+        "VK_KHR_cooperative_matrix",
+        "VK_KHR_shader_subgroup_uniform_control_flow",
+    };
+    var count: u32 = 0;
+    _ = vk.vkEnumerateDeviceExtensionProperties(phys_dev, null, &count, null);
+    var props: [256]vk.VkExtensionProperties = undefined;
+    const n = @min(count, props.len);
+    count = @intCast(n);
+    _ = vk.vkEnumerateDeviceExtensionProperties(phys_dev, null, &count, &props);
+
+    try out.writeAll("extensions:");
+    for (exts) |name| {
+        var supported = false;
+        for (props[0..count]) |prop| {
+            if (std.mem.eql(u8, std.mem.sliceTo(&prop.extensionName, 0), name)) {
+                supported = true;
+                break;
+            }
+        }
+        try out.print(" {s}={}", .{ name, supported });
+    }
+    try out.writeByte('\n');
+}
+
+fn printMemoryInfo(out: *std.Io.Writer, phys_dev: vk.VkPhysicalDevice) !void {
+    var mem: vk.VkPhysicalDeviceMemoryProperties = undefined;
+    vk.vkGetPhysicalDeviceMemoryProperties(phys_dev, &mem);
+
+    try out.writeAll("memory heaps:\n");
+    for (0..mem.memoryHeapCount) |i| {
+        const heap = mem.memoryHeaps[i];
+        try out.print("  heap {}: {d:.2} GiB flags={s}\n", .{
+            i,
+            @as(f64, @floatFromInt(heap.size)) / (1024.0 * 1024.0 * 1024.0),
+            memoryHeapFlags(heap.flags),
+        });
+    }
+
+    try out.writeAll("memory types:\n");
+    for (0..mem.memoryTypeCount) |i| {
+        const mt = mem.memoryTypes[i];
+        try out.print("  type {}: heap={} flags={s}\n", .{ i, mt.heapIndex, memoryPropertyFlags(mt.propertyFlags) });
+    }
+}
+
+fn deviceTypeName(t: vk.VkPhysicalDeviceType) []const u8 {
+    return switch (t) {
+        vk.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU => "integrated-gpu",
+        vk.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => "discrete-gpu",
+        vk.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU => "virtual-gpu",
+        vk.VK_PHYSICAL_DEVICE_TYPE_CPU => "cpu",
+        else => "other",
+    };
+}
+
+fn shaderStageFlags(flags: vk.VkShaderStageFlags) []const u8 {
+    if (flags & vk.VK_SHADER_STAGE_COMPUTE_BIT != 0) return "compute";
+    if (flags == 0) return "none";
+    return "non-compute";
+}
+
+fn subgroupOpFlags(flags: vk.VkSubgroupFeatureFlags) []const u8 {
+    const arithmetic = flags & vk.VK_SUBGROUP_FEATURE_ARITHMETIC_BIT != 0;
+    const clustered = flags & vk.VK_SUBGROUP_FEATURE_CLUSTERED_BIT != 0;
+    const ballot = flags & vk.VK_SUBGROUP_FEATURE_BALLOT_BIT != 0;
+    if (arithmetic and clustered and ballot) return "arithmetic,clustered,ballot";
+    if (arithmetic and clustered) return "arithmetic,clustered";
+    if (arithmetic) return "arithmetic";
+    if (flags == 0) return "none";
+    return "other";
+}
+
+fn memoryHeapFlags(flags: vk.VkMemoryHeapFlags) []const u8 {
+    if (flags & vk.VK_MEMORY_HEAP_DEVICE_LOCAL_BIT != 0) return "device-local";
+    if (flags == 0) return "none";
+    return "other";
+}
+
+fn memoryPropertyFlags(flags: vk.VkMemoryPropertyFlags) []const u8 {
+    const device = flags & vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT != 0;
+    const host_visible = flags & vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT != 0;
+    const coherent = flags & vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT != 0;
+    const cached = flags & vk.VK_MEMORY_PROPERTY_HOST_CACHED_BIT != 0;
+    if (device and host_visible and coherent and cached) return "device-local,host-visible,host-coherent,host-cached";
+    if (device and host_visible and coherent) return "device-local,host-visible,host-coherent";
+    if (host_visible and coherent and cached) return "host-visible,host-coherent,host-cached";
+    if (host_visible and coherent) return "host-visible,host-coherent";
+    if (device) return "device-local";
+    if (flags == 0) return "none";
+    return "other";
 }
 
 // ── commands ──────────────────────────────────────────────────────────────────
