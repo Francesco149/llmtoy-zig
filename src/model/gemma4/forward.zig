@@ -346,14 +346,14 @@ pub fn forwardOne(
         if (can_full_fused) {
             const g = gpu.?;
             const dense_readback: ?[]f32 = if (use_moe_vram_tail) null else ffn_buf;
-            try g.runLayerAttnResidualDenseFfnQ8_1(l, cfg.eps, wo_q8_pl.?, gate_q8_pl.?, up_q8_pl.?, g.pipelineFor(lw.w_down.type_), x, attn_concat[0..nq_l], dense_readback, use_gpu_attn);
+            try g.runLayerAttnResidualDenseFfnQ8_1(l, cfg.eps, wo_q8_pl.?, gate_q8_pl.?, up_q8_pl.?, g.pipelineFor(lw.w_down.type_), g.q8_1PipelineFor(lw.w_down.type_), x, attn_concat[0..nq_l], dense_readback, use_gpu_attn);
             // x updated with post-attn residual; dense_ffn_out_buf has post_ffw_norm_1.
             x_current_in_gpu_shared_vec = false;
             x_current_in_gpu_vram = true;
             dense_current_in_gpu_out_buf = true;
         } else if (can_fused_dense) {
             const g = gpu.?;
-            try g.runLayerDenseFfnQ8_1(l, cfg.eps, gate_q8_pl.?, up_q8_pl.?, g.pipelineFor(lw.w_down.type_), x, ffn_buf);
+            try g.runLayerDenseFfnQ8_1(l, cfg.eps, gate_q8_pl.?, up_q8_pl.?, g.pipelineFor(lw.w_down.type_), g.q8_1PipelineFor(lw.w_down.type_), x, ffn_buf);
             x_current_in_gpu_shared_vec = true;
             dense_current_in_gpu_out_buf = true;
         } else {

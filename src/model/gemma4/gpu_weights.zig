@@ -1684,11 +1684,12 @@ pub const GpuWeights = struct {
     //
     // Requirements:
     //   - w_gate/w_up have Q8_1 pipelines (caller passes gate_pl/up_pl).
-    //   - w_down has a regular (f32-acts) pipeline (caller passes down_pl).
+    //   - w_down has a regular fallback pipeline and may also have a Q8_1
+    //     pipeline (caller passes both).
     //   - x.len = d_model is a multiple of 256 (rmsnorm), of 32 (quantize),
     //     and of 256 (Q8_1 matvec for Q3_K/Q4_K weights).
-    //   - d_ffn (gate/up output) need not be 256-aligned — the gelu_mul +
-    //     w_down (f32-acts) dispatches handle any width.
+    //   - d_ffn (gate/up output) need not be 256-aligned; dense down uses a
+    //     Q8_1 re-quantized mid buffer when its weight format supports it.
     pub fn runLayerDenseFfnQ8_1(
         self: *const GpuWeights,
         layer: usize,
@@ -1696,6 +1697,7 @@ pub const GpuWeights = struct {
         gate_pl: *const MatvecPipeline, // Q8_1 pipeline for w_gate
         up_pl: *const MatvecPipeline, // Q8_1 pipeline for w_up
         down_pl: *const MatvecPipeline, // f32-acts pipeline for w_down
+        down_q8_pl: ?*const MatvecPipeline, // Q8_1 pipeline for w_down when available
         x: []const f32, // unnormalized residual (d_model)
         ffn_out: []f32, // post_ffw_norm_1 result (d_model)
     ) !void {
@@ -1737,9 +1739,16 @@ pub const GpuWeights = struct {
         const gelu_dset = try self.pl_gelu_mul.record(cmd, gate_buf, up_buf, w_gate.rows);
         GpuCtx.recordShaderBarrier(cmd);
 
-        // w_down: rows = d_model, cols = d_ffn (not 256-aligned for d_ffn=2112,
-        // so we deliberately run this on the f32-acts shader, not Q8_1).
-        const down_dset = try down_pl.record(cmd, &w_down.mat_buf, gate_buf, ffn_buf, w_down.rows, w_down.cols);
+        const use_down_q8 = envFlagDefaultTrue("LLMTOY_DENSE_DOWN_Q8_1") and down_q8_pl != null and w_down.cols % 32 == 0;
+        var down_quant_dset: ?vk.VkDescriptorSet = null;
+        const down_dset = blk: {
+            if (use_down_q8) {
+                down_quant_dset = try self.pl_quantize_q8_1.record(cmd, gate_buf, acts_buf, w_down.cols);
+                GpuCtx.recordShaderBarrier(cmd);
+                break :blk try down_q8_pl.?.record(cmd, &w_down.mat_buf, acts_buf, ffn_buf, w_down.rows, w_down.cols);
+            }
+            break :blk try down_pl.record(cmd, &w_down.mat_buf, gate_buf, ffn_buf, w_down.rows, w_down.cols);
+        };
         GpuCtx.recordShaderBarrier(cmd);
 
         const norm2_dset = try self.recordLayerRmsnorm(cmd, layer, ffn_buf, post_ffw_norm_1_buf, out_buf, @intCast(w_down.rows), eps, false);
@@ -1751,12 +1760,13 @@ pub const GpuWeights = struct {
             &descriptor_free_count,
             gate_pl,
             up_pl,
-            down_pl,
             norm_dset,
             quant_dset,
             gate_dset,
             up_dset,
             gelu_dset,
+            down_quant_dset,
+            if (use_down_q8) down_q8_pl.? else down_pl,
             down_dset,
             norm2_dset,
         );
@@ -1777,7 +1787,7 @@ pub const GpuWeights = struct {
     //   7. gate matvec  (Q8_1)                 → gate_vram
     //   8. up   matvec  (Q8_1)                 → up_vram
     //   9. gelu_mul: gate_vram = gelu(g)*u    (in place)
-    //  10. w_down matvec (f32-acts pl_q3_k)    → ffn_vram
+    //  10. quantize gelu output + w_down matvec → ffn_vram
     //  11. rmsnorm(ffn_vram, post_ffw_norm_1)  → dense_ffn_out_buf
     // After submit, x_vram is copied through stage_buf back into x, and
     // dense_ffn_out_buf holds the dense FFN output (post_ffw_norm_1 applied).
@@ -1790,8 +1800,8 @@ pub const GpuWeights = struct {
     // submit count drops from 4 to 3 on the Q8_1 path.
     //
     // Requirements:
-    //   - wo, w_gate, w_up have Q8_1 pipelines; w_down has a regular
-    //     (f32-acts) pipeline.
+    //   - wo, w_gate, w_up have Q8_1 pipelines; w_down uses Q8_1 when
+    //     available, otherwise the regular f32-activation pipeline.
     //   - Uploads x and attn_concat to shared_vec / attn_in_buf internally;
     //     caller just passes the slices.
     //   - On return, ffn_out holds post_ffw_norm_1(...) and x (input slice)
@@ -1804,6 +1814,7 @@ pub const GpuWeights = struct {
         gate_pl: *const MatvecPipeline, // Q8_1 pipeline for w_gate
         up_pl: *const MatvecPipeline, // Q8_1 pipeline for w_up
         down_pl: *const MatvecPipeline, // f32-acts pipeline for w_down
+        down_q8_pl: ?*const MatvecPipeline, // Q8_1 pipeline for w_down when available
         x: []f32, // in: unnormalized residual; out: x + post_attn_norm(wo(attn_concat))
         attn_concat: []const f32, // CPU sdpAttn output, length = nq
         ffn_out: ?[]f32, // post_ffw_norm_1 result (d_model)
@@ -1895,8 +1906,17 @@ pub const GpuWeights = struct {
         self.ctx.profileEnd(cmd, p_gelu);
         GpuCtx.recordShaderBarrier(cmd);
 
+        const use_down_q8 = envFlagDefaultTrue("LLMTOY_DENSE_DOWN_Q8_1") and down_q8_pl != null and w_down.cols % 32 == 0;
+        var down_quant_dset: ?vk.VkDescriptorSet = null;
         const p_down = self.ctx.profileBeginFmt(cmd, "dense_ffn.down.L{d:0>2}.{d}x{d}", .{ layer, w_down.rows, w_down.cols });
-        const down_dset = try down_pl.record(cmd, &w_down.mat_buf, gate_buf, ffn_buf, w_down.rows, w_down.cols);
+        const down_dset = blk: {
+            if (use_down_q8) {
+                down_quant_dset = try self.pl_quantize_q8_1.record(cmd, gate_buf, acts_buf, w_down.cols);
+                GpuCtx.recordShaderBarrier(cmd);
+                break :blk try down_q8_pl.?.record(cmd, &w_down.mat_buf, acts_buf, ffn_buf, w_down.rows, w_down.cols);
+            }
+            break :blk try down_pl.record(cmd, &w_down.mat_buf, gate_buf, ffn_buf, w_down.rows, w_down.cols);
+        };
         self.ctx.profileEnd(cmd, p_down);
         GpuCtx.recordShaderBarrier(cmd);
 
@@ -1914,7 +1934,7 @@ pub const GpuWeights = struct {
             wo_pl,
             gate_pl,
             up_pl,
-            down_pl,
+            if (use_down_q8) down_q8_pl.? else down_pl,
             wo_quant_dset,
             wo_dset,
             post_attn_dset,
@@ -1924,6 +1944,7 @@ pub const GpuWeights = struct {
             gate_dset,
             up_dset,
             gelu_dset,
+            down_quant_dset,
             down_dset,
             post_ffw_dset,
         );
@@ -2564,6 +2585,7 @@ pub const GpuWeights = struct {
         gate_dset: vk.VkDescriptorSet,
         up_dset: vk.VkDescriptorSet,
         gelu_dset: vk.VkDescriptorSet,
+        down_quant_dset: ?vk.VkDescriptorSet,
         down_dset: vk.VkDescriptorSet,
         post_ffw_dset: vk.VkDescriptorSet,
     ) !void {
@@ -2576,6 +2598,8 @@ pub const GpuWeights = struct {
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, gate_pl.desc_pool, gate_dset);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, up_pl.desc_pool, up_dset);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_gelu_mul.desc_pool, gelu_dset);
+        if (down_quant_dset) |set|
+            try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_quantize_q8_1.desc_pool, set);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, down_pl.desc_pool, down_dset);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm.desc_pool, post_ffw_dset);
     }
@@ -2586,12 +2610,13 @@ pub const GpuWeights = struct {
         descriptor_free_count: *usize,
         gate_pl: *const MatvecPipeline,
         up_pl: *const MatvecPipeline,
-        down_pl: *const MatvecPipeline,
         norm_dset: vk.VkDescriptorSet,
         quant_dset: vk.VkDescriptorSet,
         gate_dset: vk.VkDescriptorSet,
         up_dset: vk.VkDescriptorSet,
         gelu_dset: vk.VkDescriptorSet,
+        down_quant_dset: ?vk.VkDescriptorSet,
+        down_pl: *const MatvecPipeline,
         down_dset: vk.VkDescriptorSet,
         norm2_dset: vk.VkDescriptorSet,
     ) !void {
@@ -2600,6 +2625,8 @@ pub const GpuWeights = struct {
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, gate_pl.desc_pool, gate_dset);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, up_pl.desc_pool, up_dset);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_gelu_mul.desc_pool, gelu_dset);
+        if (down_quant_dset) |set|
+            try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_quantize_q8_1.desc_pool, set);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, down_pl.desc_pool, down_dset);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm.desc_pool, norm2_dset);
     }

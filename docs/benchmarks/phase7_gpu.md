@@ -1540,6 +1540,24 @@ MoE dispatch follow-up:
   `LLMTOY_Q6_K_FAST=0` restores the older Q6_K shader for A/B checks. The
   `bench-matvec` `lm_head` target now follows production, with `lm_head.q6_old`
   retained for direct old-shader comparisons.
+- Routed dense FFN down through the existing Q8_1 matvec path by quantizing the
+  post-`gelu_mul` mid buffer before `w_down` when the down weight type has a
+  Q8_1 shader. `LLMTOY_DENSE_DOWN_Q8_1=0` restores the older f32-activation
+  down path for A/B checks. This fixes the stale assumption that dense
+  `d_ffn=2112` prevented Q8_1 use; the quantizer and Q5_0/Q5_1 down shaders
+  only require 32-column alignment.
+- Correctness: `zig build test` passes, and
+  `llmtoy compare ... "explain MoE" --chat --gpu` keeps all layer argmaxes and
+  the final argmax matching CPU. Residual deltas rise as expected from the
+  additional Q8_1 quantization, with the worst checked layer still matching
+  argmax.
+- Short profiled generation before the change measured dense FFN down around
+  `103 us` per layer, `464.144 ms` profiled GPU dispatch, and `21.89 tok/s`
+  generation. After the change, dense FFN down measures about `13.6-14.3 us`
+  per layer including the new mid quantization, profiled GPU dispatch drops to
+  `374.377 ms`, and generation measured `23.72 tok/s` on the same 8-token
+  command. Treat the tok/s number as a short-run check; the dispatch reduction
+  is the durable result.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
