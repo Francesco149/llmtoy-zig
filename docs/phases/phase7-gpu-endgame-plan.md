@@ -770,12 +770,16 @@ shader tuning:
 - memory heaps/types relevant to VRAM/GTT
 - pipeline executable properties support
 - cooperative matrix extension support
+- cooperative matrix supported shapes when the extension function is available
 
 On the RX 7800 XT/RADV target, the verbose probe reports subgroup size 64,
 subgroup size control with min 32/max 64 for compute, accelerated packed 4x8
 integer dot product, `VK_KHR_pipeline_executable_properties`, and
-`VK_KHR_cooperative_matrix`. This explains why 32-lane shader assumptions need
-explicit handling on this driver.
+`VK_KHR_cooperative_matrix`. The cooperative-matrix shape query reports 14
+subgroup-scoped 16x16x16 shapes covering int8/u8 integer accumulation and f16
+variants. This explains why 32-lane shader assumptions need explicit handling
+on this driver and gives a concrete target shape if cooperative-matrix kernels
+are prototyped later.
 
 If `VK_KHR_pipeline_executable_properties` is available, add an opt-in debug
 path to dump register usage/occupancy-like stats for the hot matvec pipelines.

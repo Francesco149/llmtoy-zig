@@ -348,22 +348,22 @@ fn printGpuVerbose(out: *std.Io.Writer, ctx: *const gpu_ctx.GpuContext) !void {
         vkBool(idot_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated),
     });
 
-    try printExtensionSupport(out, ctx.phys_dev);
+    try printExtensionSupport(out, ctx);
     try printMemoryInfo(out, ctx.phys_dev);
 }
 
-fn printExtensionSupport(out: *std.Io.Writer, phys_dev: vk.VkPhysicalDevice) !void {
+fn printExtensionSupport(out: *std.Io.Writer, ctx: *const gpu_ctx.GpuContext) !void {
     const exts = [_][]const u8{
         "VK_KHR_pipeline_executable_properties",
         "VK_KHR_cooperative_matrix",
         "VK_KHR_shader_subgroup_uniform_control_flow",
     };
     var count: u32 = 0;
-    _ = vk.vkEnumerateDeviceExtensionProperties(phys_dev, null, &count, null);
+    _ = vk.vkEnumerateDeviceExtensionProperties(ctx.phys_dev, null, &count, null);
     var props: [256]vk.VkExtensionProperties = undefined;
     const n = @min(count, props.len);
     count = @intCast(n);
-    _ = vk.vkEnumerateDeviceExtensionProperties(phys_dev, null, &count, &props);
+    _ = vk.vkEnumerateDeviceExtensionProperties(ctx.phys_dev, null, &count, &props);
 
     try out.writeAll("extensions:");
     for (exts) |name| {
@@ -377,6 +377,50 @@ fn printExtensionSupport(out: *std.Io.Writer, phys_dev: vk.VkPhysicalDevice) !vo
         try out.print(" {s}={}", .{ name, supported });
     }
     try out.writeByte('\n');
+    try printCooperativeMatrixShapes(out, ctx);
+}
+
+fn printCooperativeMatrixShapes(out: *std.Io.Writer, ctx: *const gpu_ctx.GpuContext) !void {
+    const raw_fn = vk.vkGetInstanceProcAddr(ctx.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR") orelse {
+        try out.writeAll("cooperative matrix shapes: unavailable\n");
+        return;
+    };
+    const get_props: vk.PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR = @ptrCast(raw_fn);
+
+    var count: u32 = 0;
+    var rc = get_props.?(ctx.phys_dev, &count, null);
+    if (rc != vk.VK_SUCCESS or count == 0) {
+        try out.writeAll("cooperative matrix shapes: unavailable\n");
+        return;
+    }
+
+    var props: [64]vk.VkCooperativeMatrixPropertiesKHR = undefined;
+    const n = @min(count, props.len);
+    count = @intCast(n);
+    for (props[0..count]) |*prop| {
+        prop.* = std.mem.zeroes(vk.VkCooperativeMatrixPropertiesKHR);
+        prop.sType = vk.VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    }
+    rc = get_props.?(ctx.phys_dev, &count, &props);
+    if (rc != vk.VK_SUCCESS) {
+        try out.writeAll("cooperative matrix shapes: query failed\n");
+        return;
+    }
+
+    try out.print("cooperative matrix shapes: count={}\n", .{count});
+    for (props[0..count]) |prop| {
+        try out.print("  {}x{}x{} scope={s} A={s} B={s} C={s} R={s} saturating={}\n", .{
+            prop.MSize,
+            prop.NSize,
+            prop.KSize,
+            cooperativeMatrixScopeName(prop.scope),
+            componentTypeName(prop.AType),
+            componentTypeName(prop.BType),
+            componentTypeName(prop.CType),
+            componentTypeName(prop.ResultType),
+            vkBool(prop.saturatingAccumulation),
+        });
+    }
 }
 
 fn printMemoryInfo(out: *std.Io.Writer, phys_dev: vk.VkPhysicalDevice) !void {
@@ -445,6 +489,30 @@ fn memoryPropertyFlags(flags: vk.VkMemoryPropertyFlags) []const u8 {
     if (device) return "device-local";
     if (flags == 0) return "none";
     return "other";
+}
+
+fn cooperativeMatrixScopeName(scope: vk.VkScopeKHR) []const u8 {
+    return switch (scope) {
+        vk.VK_SCOPE_DEVICE_KHR => "device",
+        vk.VK_SCOPE_WORKGROUP_KHR => "workgroup",
+        vk.VK_SCOPE_SUBGROUP_KHR => "subgroup",
+        vk.VK_SCOPE_QUEUE_FAMILY_KHR => "queue-family",
+        else => "other",
+    };
+}
+
+fn componentTypeName(t: vk.VkComponentTypeKHR) []const u8 {
+    return switch (t) {
+        vk.VK_COMPONENT_TYPE_FLOAT16_KHR => "f16",
+        vk.VK_COMPONENT_TYPE_FLOAT32_KHR => "f32",
+        vk.VK_COMPONENT_TYPE_SINT8_KHR => "i8",
+        vk.VK_COMPONENT_TYPE_SINT16_KHR => "i16",
+        vk.VK_COMPONENT_TYPE_SINT32_KHR => "i32",
+        vk.VK_COMPONENT_TYPE_UINT8_KHR => "u8",
+        vk.VK_COMPONENT_TYPE_UINT16_KHR => "u16",
+        vk.VK_COMPONENT_TYPE_UINT32_KHR => "u32",
+        else => "other",
+    };
 }
 
 // ── commands ──────────────────────────────────────────────────────────────────
