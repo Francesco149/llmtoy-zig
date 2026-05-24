@@ -1558,6 +1558,15 @@ MoE dispatch follow-up:
   `374.377 ms`, and generation measured `23.72 tok/s` on the same 8-token
   command. Treat the tok/s number as a short-run check; the dispatch reduction
   is the durable result.
+- Routed F32 `quantMatvec` rows directly into `dotf32` when the row bytes are
+  naturally aligned, avoiding the row scratch copy/dequant step for the CPU
+  router matrix. This is mostly a CPU-side cleanup in the current GPU path, but
+  it keeps the per-layer router gate cheaper while the expert batch remains GPU
+  resident. Correctness: `zig build test` passes, and
+  `compare ... "explain MoE" --chat` keeps all layer argmaxes and the final
+  argmax matching CPU. Short unprofiled GPU stat after the change measured
+  prefill `30.22 tok/s` and generation `26.07 tok/s` for the usual 8-token
+  command; treat this as a sanity run, not a controlled A/B benchmark.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

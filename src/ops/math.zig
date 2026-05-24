@@ -103,6 +103,15 @@ pub inline fn dotf32(a: []const f32, b: []const f32) f32 {
     return sum;
 }
 
+inline fn dotF32RowBytes(row_data: []const u8, vec: []const f32) ?f32 {
+    const byte_len = vec.len * @sizeOf(f32);
+    std.debug.assert(row_data.len >= byte_len);
+    if (@intFromPtr(row_data.ptr) % @alignOf(f32) != 0) return null;
+
+    const aligned: []align(@alignOf(f32)) const u8 = @alignCast(row_data[0..byte_len]);
+    return dotf32(std.mem.bytesAsSlice(f32, aligned), vec);
+}
+
 /// Matrix-vector multiply with quantized weight matrix.
 ///
 /// Dequantizes one row at a time into a stack-allocated f32 buffer, computing
@@ -137,10 +146,36 @@ pub fn quantMatvec(
             out[i] = dq.dotIQ4NL(row_data, vec);
             continue;
         }
+        if (mat_type == .f32) {
+            if (dotF32RowBytes(row_data, vec)) |sum| {
+                out[i] = sum;
+                continue;
+            }
+        }
         const row = row_buf[0..cols];
         dequantRow(row_data, row, mat_type);
         out[i] = dotf32(row, vec);
     }
+}
+
+test "quantMatvec: f32 rows match matvec" {
+    const rows = 3;
+    const cols = 5;
+    const mat = [_]f32{
+        1.0, -2.0, 0.5, 4.0, -1.0,
+        0.25, 3.0, 2.0, -0.5, 1.5,
+        -1.0, 0.0, 0.0, 2.0, 3.0,
+    };
+    const vec = [_]f32{ 0.5, -1.0, 2.0, 0.25, -0.75 };
+    var got: [rows]f32 = undefined;
+    var want: [rows]f32 = undefined;
+    var scratch: [cols]f32 = undefined;
+
+    quantMatvec(&got, std.mem.sliceAsBytes(&mat), .f32, &vec, rows, cols, &scratch);
+    matvec(&want, &mat, &vec, rows, cols);
+
+    for (got, want) |g, w|
+        try std.testing.expectApproxEqAbs(w, g, 1e-6);
 }
 
 /// Bytes occupied by one row of a quantized matrix.
@@ -208,6 +243,12 @@ const RowJob = struct {
             if (job.mat_type == .iq4_nl) {
                 job.out[i] = dq.dotIQ4NL(row_data, job.vec);
                 continue;
+            }
+            if (job.mat_type == .f32) {
+                if (dotF32RowBytes(row_data, job.vec)) |sum| {
+                    job.out[i] = sum;
+                    continue;
+                }
             }
             const row = job.row_buf[0..job.cols];
             dequantRow(row_data, row, job.mat_type);
