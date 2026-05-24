@@ -387,11 +387,9 @@ pub fn forwardOne(
             cfg.eps,
         );
 
-        // Router logits → softmax → top-k indices.
+        // Router logits → top-k indices plus selected softmax probabilities.
         math.quantMatvec(router_out, lw.router_w.data, lw.router_w.type_, router_in, cfg.n_experts, d, scratch[0..d]);
-        math.softmax(router_out);
-
-        topK(router_out, top_idx);
+        softmaxTopK(router_out, top_idx);
 
         // Run each selected expert. The default path keeps the accumulated MoE
         // vector device-resident and finishes the FFN/MoE residual tail on GPU
@@ -541,5 +539,43 @@ fn topK(scores: []const f32, out: []usize) void {
             }
         }
         out[i] = best;
+    }
+}
+
+/// Select top-k from logits, then normalize only selected entries.
+///
+/// Softmax is monotonic, so selected expert indices are identical whether
+/// top-k runs before or after normalization. The MoE path only reads
+/// router_out[eidx] for selected experts, so non-selected entries can remain
+/// as logits.
+fn softmaxTopK(scores: []f32, out: []usize) void {
+    topK(scores, out);
+
+    var max = scores[0];
+    for (scores[1..]) |v| if (v > max) {
+        max = v;
+    };
+
+    var sum: f32 = 0.0;
+    for (scores) |v| sum += @exp(v - max);
+
+    for (out) |idx| {
+        scores[idx] = @exp(scores[idx] - max) / sum;
+    }
+}
+
+test "softmaxTopK: matches softmax then topK for selected experts" {
+    var ref = [_]f32{ 0.5, 4.0, -1.0, 2.5, 3.0, -0.25 };
+    var got = ref;
+    var ref_idx: [3]usize = undefined;
+    var got_idx: [3]usize = undefined;
+
+    math.softmax(&ref);
+    topK(&ref, &ref_idx);
+    softmaxTopK(&got, &got_idx);
+
+    for (got_idx, ref_idx) |g, r| {
+        try std.testing.expectEqual(r, g);
+        try std.testing.expectApproxEqAbs(ref[r], got[g], 1e-6);
     }
 }

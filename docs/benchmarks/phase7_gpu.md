@@ -1567,6 +1567,13 @@ MoE dispatch follow-up:
   argmax matching CPU. Short unprofiled GPU stat after the change measured
   prefill `30.22 tok/s` and generation `26.07 tok/s` for the usual 8-token
   command; treat this as a sanity run, not a controlled A/B benchmark.
+- The router now selects top-k experts from logits before softmax and only
+  writes normalized probabilities for the selected expert IDs. Softmax is
+  monotonic, and downstream code only reads selected probabilities, so this
+  avoids normalizing and storing non-selected router entries on the CPU path.
+  Correctness: `zig build test` passes, and
+  `compare ... "explain MoE" --chat` keeps all layer argmaxes and the final
+  argmax matching CPU.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
