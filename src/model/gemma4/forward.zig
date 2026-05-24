@@ -375,13 +375,17 @@ pub fn forwardOne(
 
         // ── MoE FFN path ──────────────────────────────────────────────────────
 
-        // Expert input (named norm).
-        math.rmsnorm(moe_in, x, lw.pre_ffw_norm_2, cfg.eps);
-
-        // Router input: raw rmsnorm(x) * (1/sqrt(d)) * router_scale.
-        math.rmsnormRaw(router_in, x, cfg.eps);
+        // Expert input and router input share the same residual RMS.
         const inv_sqrt_d = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
-        for (router_in, lw.router_scale) |*r, s| r.* *= inv_sqrt_d * s;
+        math.rmsnormWeightedAndRawScaled(
+            moe_in,
+            router_in,
+            x,
+            lw.pre_ffw_norm_2,
+            lw.router_scale,
+            inv_sqrt_d,
+            cfg.eps,
+        );
 
         // Router logits → softmax → top-k indices.
         math.quantMatvec(router_out, lw.router_w.data, lw.router_w.type_, router_in, cfg.n_experts, d, scratch[0..d]);

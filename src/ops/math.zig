@@ -47,6 +47,28 @@ pub fn rmsnormRaw(out: []f32, x: []const f32, eps: f32) void {
     for (out, x) |*o, v| o.* = v * rms_inv;
 }
 
+/// Compute both a weighted RMSNorm and a raw scaled RMSNorm from the same input.
+pub fn rmsnormWeightedAndRawScaled(
+    weighted_out: []f32,
+    raw_scaled_out: []f32,
+    x: []const f32,
+    weight: []const f32,
+    raw_scale: []const f32,
+    raw_global_scale: f32,
+    eps: f32,
+) void {
+    std.debug.assert(x.len == weight.len and weighted_out.len == x.len);
+    std.debug.assert(raw_scale.len == x.len and raw_scaled_out.len == x.len);
+    var ss: f32 = 0.0;
+    for (x) |v| ss += v * v;
+    const rms_inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(x.len)) + eps);
+    const raw_base = rms_inv * raw_global_scale;
+    for (weighted_out, raw_scaled_out, x, weight, raw_scale) |*wo, *ro, v, w, s| {
+        wo.* = v * rms_inv * w;
+        ro.* = v * raw_base * s;
+    }
+}
+
 /// GELU activation (approximate, tanh variant): x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715*x³)))
 pub fn gelu(x: f32) f32 {
     const c: f32 = 0.7978845608028654; // sqrt(2/π)
@@ -276,6 +298,28 @@ test "rmsnorm: all-ones weight is pure normalisation" {
     const rms = @sqrt((1.0 + 4.0 + 9.0 + 16.0) / 4.0);
     try std.testing.expectApproxEqAbs(x[0] / rms, out[0], 1e-5);
     try std.testing.expectApproxEqAbs(x[3] / rms, out[3], 1e-5);
+}
+
+test "rmsnormWeightedAndRawScaled: matches separate passes" {
+    const x = [_]f32{ 3, -4, 1, 2 };
+    const w = [_]f32{ 0.5, 1.25, -0.75, 2.0 };
+    const s = [_]f32{ 2.0, 0.25, -1.0, 0.5 };
+    const global_scale: f32 = 0.125;
+
+    var weighted_ref: [4]f32 = undefined;
+    var raw_ref: [4]f32 = undefined;
+    rmsnorm(&weighted_ref, &x, &w, 1e-6);
+    rmsnormRaw(&raw_ref, &x, 1e-6);
+    for (&raw_ref, s) |*v, scale| v.* *= global_scale * scale;
+
+    var weighted: [4]f32 = undefined;
+    var raw_scaled: [4]f32 = undefined;
+    rmsnormWeightedAndRawScaled(&weighted, &raw_scaled, &x, &w, &s, global_scale, 1e-6);
+
+    for (weighted, weighted_ref) |got, want|
+        try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    for (raw_scaled, raw_ref) |got, want|
+        try std.testing.expectApproxEqAbs(want, got, 1e-6);
 }
 
 test "softmax: sums to 1 and preserves order" {
