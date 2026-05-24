@@ -637,7 +637,7 @@ const BenchPipelines = struct {
             .q5_0 => &self.q5_0,
             .q5_1 => &self.q5_1,
             .q5_k => &self.q5_k,
-            .q6_k => &self.q6_k,
+            .q6_k => &self.q6_k_fast,
             .iq4_nl => &self.iq4_nl,
             else => null,
         };
@@ -816,6 +816,7 @@ fn cmdBenchMatvec(
 
     var ran: usize = 0;
     try benchIfSelected(out, &ctx, &pipes, opts, &ran, "lm_head", weights.lm_head, gpa, io);
+    try benchWithPipelineIfSelected(out, &ctx, &pipes.q6_k, &pipes.quant, opts, &ran, "lm_head.q6_old", weights.lm_head, .q6_k, gpa, io);
     try benchWithPipelineIfSelected(out, &ctx, &pipes.q6_k_fast, &pipes.quant, opts, &ran, "lm_head.fast", weights.lm_head, .q6_k, gpa, io);
     try benchWithPipelineIfSelected(out, &ctx, &pipes.q6_k_mmvq_b32_r1, &pipes.quant, opts, &ran, "lm_head.mmvq.b32.r1", weights.lm_head, .q6_k, gpa, io);
     try benchWithPipelineIfSelected(out, &ctx, &pipes.q6_k_mmvq_b64_r1, &pipes.quant, opts, &ran, "lm_head.mmvq.b64.r1", weights.lm_head, .q6_k, gpa, io);

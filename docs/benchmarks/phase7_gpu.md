@@ -1532,6 +1532,14 @@ MoE dispatch follow-up:
   `LLMTOY_ATTENTION_ASYNC=0` and `21.38 tok/s` with the default async path.
   Treat this as a small submit/wait overlap win; the profiler cannot measure
   it directly because async attention is disabled while `LLMTOY_GPU_PROFILE=1`.
+- Rechecked the existing Q6_K packed-decode `lm_head.fast` bench target after
+  the later data-movement cleanups. With `LLMTOY_GPU_PROFILE=1 bench-matvec
+  --iters 32`, current `lm_head` measured `1029.58 us` GPU / `1108.99 us` wall,
+  while `lm_head.fast` measured `994.40 us` GPU / `1074.91 us` wall. Production
+  now routes Q6_K Q8_1 matvecs through the packed-decode shader by default;
+  `LLMTOY_Q6_K_FAST=0` restores the older Q6_K shader for A/B checks. The
+  `bench-matvec` `lm_head` target now follows production, with `lm_head.q6_old`
+  retained for direct old-shader comparisons.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

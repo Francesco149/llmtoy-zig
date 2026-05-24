@@ -107,6 +107,8 @@ pub const GpuWeights = struct {
     pl_q5_0_q8_1: MatvecPipeline,
     pl_q5_1_q8_1: MatvecPipeline,
     pl_q6_k_q8_1: MatvecPipeline,
+    pl_q6_k_q8_1_fast: MatvecPipeline,
+    use_q6_k_fast: bool,
     pl_q5_k_q8_1: MatvecPipeline,
     pl_iq4_nl_q8_1: MatvecPipeline,
     pl_quantize_q8_1: QuantizeQ8_1Pipeline,
@@ -297,6 +299,13 @@ pub const GpuWeights = struct {
         var pl_q6_k_q8_1 = try MatvecPipeline.initQ6KQ8_1(&ctx);
         errdefer pl_q6_k_q8_1.deinit();
         std.debug.print("  init: pl_q6_k_q8_1 ok\n", .{});
+        var pl_q6_k_q8_1_fast = try MatvecPipeline.initQ6KQ8_1Fast(&ctx);
+        errdefer pl_q6_k_q8_1_fast.deinit();
+        std.debug.print("  init: pl_q6_k_q8_1_fast ok\n", .{});
+        const use_q6_k_fast = if (std.c.getenv("LLMTOY_Q6_K_FAST")) |raw|
+            !std.mem.eql(u8, std.mem.span(raw), "0")
+        else
+            true;
         var pl_q5_k_q8_1 = try MatvecPipeline.initQ5KQ8_1(&ctx);
         errdefer pl_q5_k_q8_1.deinit();
         std.debug.print("  init: pl_q5_k_q8_1 ok\n", .{});
@@ -391,6 +400,8 @@ pub const GpuWeights = struct {
             .pl_q5_0_q8_1 = pl_q5_0_q8_1,
             .pl_q5_1_q8_1 = pl_q5_1_q8_1,
             .pl_q6_k_q8_1 = pl_q6_k_q8_1,
+            .pl_q6_k_q8_1_fast = pl_q6_k_q8_1_fast,
+            .use_q6_k_fast = use_q6_k_fast,
             .pl_q5_k_q8_1 = pl_q5_k_q8_1,
             .pl_iq4_nl_q8_1 = pl_iq4_nl_q8_1,
             .pl_quantize_q8_1 = pl_quantize_q8_1,
@@ -1004,10 +1015,11 @@ pub const GpuWeights = struct {
         self.pl_rmsnorm.deinit();
         self.pl_quantize_q8_1_batched.deinit();
         self.pl_quantize_q8_1.deinit();
+        self.pl_q5_k_q8_1.deinit();
+        self.pl_q6_k_q8_1_fast.deinit();
+        self.pl_q6_k_q8_1.deinit();
         self.pl_q5_1_q8_1.deinit();
         self.pl_q5_0_q8_1.deinit();
-        self.pl_q6_k_q8_1.deinit();
-        self.pl_q5_k_q8_1.deinit();
         self.pl_iq4_nl_q8_1.deinit();
         self.pl_q4_k_q8_1.deinit();
         self.pl_q3_k_q8_1.deinit();
@@ -1523,16 +1535,15 @@ pub const GpuWeights = struct {
     }
 
     // Pipeline for the Q8_1-activation integer-dot path. Returns null when
-    // the weight type has no Q8_1 shader yet (Q5_K, Q5_0, Q5_1, Q8_0, IQ4_NL,
-    // F32 — these would either fall back to the f32-activation path or run
-    // on CPU).
+    // the weight type has no Q8_1 shader yet (Q8_0, F32, etc.). Unsupported
+    // types either fall back to the f32-activation path or run on CPU.
     pub fn q8_1PipelineFor(self: *const GpuWeights, t: GgmlType) ?*const MatvecPipeline {
         return switch (t) {
             .q3_k => &self.pl_q3_k_q8_1,
             .q4_k => &self.pl_q4_k_q8_1,
             .q5_0 => &self.pl_q5_0_q8_1,
             .q5_1 => &self.pl_q5_1_q8_1,
-            .q6_k => &self.pl_q6_k_q8_1,
+            .q6_k => if (self.use_q6_k_fast) &self.pl_q6_k_q8_1_fast else &self.pl_q6_k_q8_1,
             .q5_k => &self.pl_q5_k_q8_1,
             .iq4_nl => &self.pl_iq4_nl_q8_1,
             else => null,
