@@ -69,6 +69,25 @@ This is not a replacement for a real `lm_head` kernel improvement, but it keeps
 the final normalization in the same GPU submit as the expensive head matvec and
 removes the CPU final-norm pass from the GPU generation path.
 
+Follow-up: final logit softcapping now runs in that same GPU submit before the
+logits download. The CPU softcap loop remains on the non-GPU fallback path.
+
+Validation:
+
+- `nix develop --command zig build test`
+- `nix develop --command zig build -Doptimize=ReleaseFast`
+- `llmtoy compare ... "explain MoE" --chat`: all layer argmaxes match, final
+  argmax `1852` matches
+- GPU deterministic smoke, `what is 1+1? --max-tokens 1`: completed
+
+Profiled short run with `LLMTOY_GPU_PROFILE=1`, same 33-token forward workload:
+
+- setup: 4.24 s after warm filesystem cache
+- prefill: 25 tokens in 0.77 s, 32.4 tok/s
+- generation: 8 tokens in 0.25 s, 32.0 tok/s
+- `final.logit_softcap`: 33 calls, 1.26 ms total, 38.1 us avg
+- `matvec_q8_1.single.262144x2816`: 33 calls, 40.30 ms total, 1221.2 us avg
+
 ## Phase 7 attention fused-small probe
 
 Added a production-routed fused attention shader for `win_len <= 1024`, with

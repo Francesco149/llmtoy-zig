@@ -32,6 +32,7 @@ const RmsnormPerHeadPipeline = mv_mod.RmsnormPerHeadPipeline;
 const ElemAddPipeline = mv_mod.ElemAddPipeline;
 const ElemScalePipeline = mv_mod.ElemScalePipeline;
 const ElemAddScalePipeline = mv_mod.ElemAddScalePipeline;
+const LogitSoftcapPipeline = mv_mod.LogitSoftcapPipeline;
 const GeluMulPipeline = mv_mod.GeluMulPipeline;
 const RopeNeoxTablePipeline = mv_mod.RopeNeoxTablePipeline;
 const RopeNeoxThetaPipeline = mv_mod.RopeNeoxThetaPipeline;
@@ -129,6 +130,7 @@ pub const GpuWeights = struct {
     pl_elem_add: ElemAddPipeline,
     pl_elem_scale: ElemScalePipeline,
     pl_elem_add_scale: ElemAddScalePipeline,
+    pl_logit_softcap: LogitSoftcapPipeline,
     pl_gelu_mul: GeluMulPipeline,
     pl_rope_table: RopeNeoxTablePipeline,
     pl_rope_theta: RopeNeoxThetaPipeline,
@@ -358,6 +360,8 @@ pub const GpuWeights = struct {
         errdefer pl_elem_scale.deinit();
         var pl_elem_add_scale = try ElemAddScalePipeline.init(&ctx);
         errdefer pl_elem_add_scale.deinit();
+        var pl_logit_softcap = try LogitSoftcapPipeline.init(&ctx);
+        errdefer pl_logit_softcap.deinit();
         var pl_gelu_mul = try GeluMulPipeline.init(&ctx);
         errdefer pl_gelu_mul.deinit();
         var pl_rope_table = try RopeNeoxTablePipeline.init(&ctx);
@@ -425,6 +429,7 @@ pub const GpuWeights = struct {
             .pl_elem_add = pl_elem_add,
             .pl_elem_scale = pl_elem_scale,
             .pl_elem_add_scale = pl_elem_add_scale,
+            .pl_logit_softcap = pl_logit_softcap,
             .pl_gelu_mul = pl_gelu_mul,
             .pl_rope_table = pl_rope_table,
             .pl_rope_theta = pl_rope_theta,
@@ -1010,6 +1015,7 @@ pub const GpuWeights = struct {
         self.pl_rope_theta.deinit();
         self.pl_rope_table.deinit();
         self.pl_gelu_mul.deinit();
+        self.pl_logit_softcap.deinit();
         self.pl_elem_add_scale.deinit();
         self.pl_elem_scale.deinit();
         self.pl_elem_add.deinit();
@@ -1150,6 +1156,7 @@ pub const GpuWeights = struct {
     pub fn runFinalLogitsQ8_1(
         self: *const GpuWeights,
         eps: f32,
+        logit_softcap: f32,
         head_type: GgmlType,
         x: []const f32,
         logits: []f32,
@@ -1184,12 +1191,22 @@ pub const GpuWeights = struct {
         const p_mv = self.ctx.profileBegin(cmd, mv_label);
         const mv_dset = try pl.record(cmd, &sess.mat_buf, acts_buf, out_buf, sess.rows, sess.cols);
         self.ctx.profileEnd(cmd, p_mv);
+        var softcap_dset: ?vk.VkDescriptorSet = null;
+        if (logit_softcap != 0.0) {
+            GpuCtx.recordShaderBarrier(cmd);
+            const p_softcap = self.ctx.profileBegin(cmd, "final.logit_softcap");
+            softcap_dset = try self.pl_logit_softcap.record(cmd, out_buf, sess.rows, logit_softcap);
+            self.ctx.profileEnd(cmd, p_softcap);
+        }
 
         var descriptor_frees: [gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree = undefined;
         var descriptor_free_count: usize = 0;
         try appendDeferredDescriptorFree(&descriptor_frees, &descriptor_free_count, self.pl_rmsnorm.desc_pool, norm_dset);
         try appendDeferredDescriptorFree(&descriptor_frees, &descriptor_free_count, self.pl_quantize_q8_1.desc_pool, quant_dset);
         try appendDeferredDescriptorFree(&descriptor_frees, &descriptor_free_count, pl.desc_pool, mv_dset);
+        if (softcap_dset) |dset| {
+            try appendDeferredDescriptorFree(&descriptor_frees, &descriptor_free_count, self.pl_logit_softcap.desc_pool, dset);
+        }
 
         try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
 

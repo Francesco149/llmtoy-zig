@@ -2378,6 +2378,82 @@ pub const ElemScalePipeline = struct {
     }
 };
 
+pub const LogitSoftcapPipeline = struct {
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !LogitSoftcapPipeline {
+        comptime std.debug.assert(shaders.logit_softcap.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.logit_softcap, 1, @sizeOf(ElemScalePushConst), 8);
+        return .{
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn record(
+        self: *const LogitSoftcapPipeline,
+        cmd: vk.VkCommandBuffer,
+        x_buf: *const GpuBuffer,
+        n: u32,
+        cap: f32,
+    ) !vk.VkDescriptorSet {
+        const dset = try self.allocSet(x_buf);
+        self.recordWithSet(cmd, dset, n, cap);
+        return dset;
+    }
+
+    pub fn allocSet(self: *const LogitSoftcapPipeline, x_buf: *const GpuBuffer) !vk.VkDescriptorSet {
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_info = vk.VkDescriptorBufferInfo{
+            .buffer = x_buf.handle,
+            .offset = 0,
+            .range = vk.VK_WHOLE_SIZE,
+        };
+        const write = mkWrite(dset, 0, &buf_info);
+        vk.vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
+        return dset;
+    }
+
+    pub fn recordWithSet(
+        self: *const LogitSoftcapPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        n: u32,
+        cap: f32,
+    ) void {
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
+        const pc = ElemScalePushConst{ .n = n, .s = cap };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ElemScalePushConst), &pc);
+        const groups = (n + 255) / 256;
+        vk.vkCmdDispatch(cmd, groups, 1, 1);
+    }
+
+    pub fn deinit(self: *LogitSoftcapPipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
 pub const ElemAddScalePipeline = struct {
     pipeline: vk.VkPipeline,
     layout: vk.VkPipelineLayout,
@@ -5753,4 +5829,45 @@ test "gpu elem_scale fuzz" {
     defer al.free(got);
     try x_buf.download(std.mem.sliceAsBytes(got));
     for (got, x) |g, xi| try std.testing.expectApproxEqAbs(xi * s, g, 1e-6);
+}
+
+test "gpu logit_softcap fuzz" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    const al = std.testing.allocator;
+    const n: usize = 262144;
+    const cap: f32 = 30.0;
+    const x = try al.alloc(f32, n);
+    defer al.free(x);
+    var prng = std.Random.DefaultPrng.init(101);
+    const r = prng.random();
+    for (x) |*xi| xi.* = (r.float(f32) - 0.5) * 160.0;
+
+    var pl = try LogitSoftcapPipeline.init(&gpu);
+    defer pl.deinit();
+    var x_buf = try GpuBuffer.initHostCoherent(&gpu, n * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer x_buf.deinit();
+    try x_buf.upload(std.mem.sliceAsBytes(x));
+
+    const cmd = try gpu.beginBatch();
+    _ = try pl.record(cmd, &x_buf, @intCast(n), cap);
+    try gpu.submitBatch(cmd);
+
+    const got = try al.alloc(f32, n);
+    defer al.free(got);
+    try x_buf.download(std.mem.sliceAsBytes(got));
+
+    var max_abs: f32 = 0.0;
+    for (got, x) |g, xi| {
+        const expected = std.math.tanh(xi / cap) * cap;
+        const d = @abs(expected - g);
+        if (d > max_abs) max_abs = d;
+    }
+    std.debug.print("logit_softcap fuzz n={} max|D|={d:.6}\n", .{ n, max_abs });
+    try std.testing.expect(max_abs < 2e-5);
 }

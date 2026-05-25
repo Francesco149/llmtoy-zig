@@ -94,6 +94,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(elem_scale_spv, "elem_scale.spv");
     const elem_add_scale_spv = compileShader(b, "src/gpu/shaders/elem_add_scale.glsl");
     _ = wf.addCopyFile(elem_add_scale_spv, "elem_add_scale.spv");
+    const logit_softcap_spv = compileShader(b, "src/gpu/shaders/logit_softcap.glsl");
+    _ = wf.addCopyFile(logit_softcap_spv, "logit_softcap.spv");
     const gelu_mul_spv = compileShader(b, "src/gpu/shaders/gelu_mul.glsl");
     _ = wf.addCopyFile(gelu_mul_spv, "gelu_mul.spv");
     const rope_table_spv = compileShader(b, "src/gpu/shaders/rope_neox_table.glsl");
@@ -152,6 +154,7 @@ pub fn build(b: *std.Build) void {
         \\pub const elem_add            align(4) = @embedFile("elem_add.spv").*;
         \\pub const elem_scale          align(4) = @embedFile("elem_scale.spv").*;
         \\pub const elem_add_scale      align(4) = @embedFile("elem_add_scale.spv").*;
+        \\pub const logit_softcap       align(4) = @embedFile("logit_softcap.spv").*;
         \\pub const gelu_mul            align(4) = @embedFile("gelu_mul.spv").*;
         \\pub const rope_neox_table     align(4) = @embedFile("rope_neox_table.spv").*;
         \\pub const rope_neox_theta     align(4) = @embedFile("rope_neox_theta.spv").*;

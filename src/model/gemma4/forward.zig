@@ -462,7 +462,7 @@ pub fn forwardOne(
 
     const logits = try allocator.alloc(f32, cfg.vocab_size);
     const final_logits_on_gpu = if (gpu) |g| blk: {
-        g.runFinalLogitsQ8_1(cfg.eps, w.lm_head.type_, x, logits) catch |err| switch (err) {
+        g.runFinalLogitsQ8_1(cfg.eps, cfg.logit_softcap, w.lm_head.type_, x, logits) catch |err| switch (err) {
             error.NotOnGpu => break :blk false,
             else => return err,
         };
@@ -474,7 +474,7 @@ pub fn forwardOne(
     }
 
     // Soft-capping: tanh(logits / cap) * cap
-    if (cfg.logit_softcap != 0.0) {
+    if (!final_logits_on_gpu and cfg.logit_softcap != 0.0) {
         for (logits) |*v| {
             v.* = std.math.tanh(v.* / cfg.logit_softcap) * cfg.logit_softcap;
         }
