@@ -88,6 +88,15 @@ Profiled short run with `LLMTOY_GPU_PROFILE=1`, same 33-token forward workload:
 - `final.logit_softcap`: 33 calls, 1.26 ms total, 38.1 us avg
 - `matvec_q8_1.single.262144x2816`: 33 calls, 40.30 ms total, 1221.2 us avg
 
+Follow-up descriptor cleanup: the final logits submit now reuses persistent
+descriptor sets for `out_norm`, Q8_1 quantization, the `lm_head` matvec, and
+optional softcap. This removes four allocate/update/free cycles per generated
+token from the newest final-head path. Correctness:
+
+- `nix develop --command zig build test --summary all`: 142/142 tests passed
+- `llmtoy compare ... "explain MoE" --chat`: all layer argmaxes match, final
+  argmax `1852` matches
+
 ## Phase 7 attention fused-small probe
 
 Added a production-routed fused attention shader for `win_len <= 1024`, with

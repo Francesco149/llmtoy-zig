@@ -226,6 +226,11 @@ pub const GpuWeights = struct {
     // but intentionally not named after MoE so attention/dense graph work can
     // share the same lifetime path.
     pending_gpu_batch: ?GpuCtx.PendingBatch,
+    final_out_norm_dset: ?vk.VkDescriptorSet,
+    final_quant_dset: ?vk.VkDescriptorSet,
+    final_lm_head_dset: ?vk.VkDescriptorSet,
+    final_lm_head_dset_type: GgmlType,
+    final_softcap_dset: ?vk.VkDescriptorSet,
     moe_tail_moe_norm_dsets: ?[]?vk.VkDescriptorSet,
     moe_tail_post_ffw_dsets: ?[]?vk.VkDescriptorSet,
     moe_tail_add_rmsnorm_dsets: ?[]?vk.VkDescriptorSet,
@@ -482,6 +487,11 @@ pub const GpuWeights = struct {
             .expert_down_id_dset_type = null,
             .expert_reuse_cmds = null,
             .pending_gpu_batch = null,
+            .final_out_norm_dset = null,
+            .final_quant_dset = null,
+            .final_lm_head_dset = null,
+            .final_lm_head_dset_type = .f32,
+            .final_softcap_dset = null,
             .moe_tail_moe_norm_dsets = null,
             .moe_tail_post_ffw_dsets = null,
             .moe_tail_add_rmsnorm_dsets = null,
@@ -861,6 +871,23 @@ pub const GpuWeights = struct {
             for (cmds) |cmd| if (cmd) |c| self.ctx.freeReusableCommandBuffer(c);
             self.allocator.free(cmds);
         }
+        if (self.final_softcap_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_logit_softcap.desc_pool, 1, &tmp);
+        }
+        if (self.final_lm_head_dset) |set| {
+            var tmp = set;
+            if (self.q8_1PipelineFor(self.final_lm_head_dset_type)) |pl|
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, pl.desc_pool, 1, &tmp);
+        }
+        if (self.final_quant_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, &tmp);
+        }
+        if (self.final_out_norm_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
+        }
         if (self.moe_tail_scale_dset) |set| {
             var tmp = set;
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_elem_scale.desc_pool, 1, &tmp);
@@ -1154,7 +1181,7 @@ pub const GpuWeights = struct {
     // This removes the CPU out_norm pass and avoids routing the final head
     // through the generic mv() helper's separate upload/submit shape.
     pub fn runFinalLogitsQ8_1(
-        self: *const GpuWeights,
+        self: *GpuWeights,
         eps: f32,
         logit_softcap: f32,
         head_type: GgmlType,
@@ -1177,38 +1204,41 @@ pub const GpuWeights = struct {
 
         const cmd = try self.ctx.beginBatch();
         const p_norm = self.ctx.profileBegin(cmd, "final.out_norm");
-        const norm_dset = try self.pl_rmsnorm.record(cmd, vec_buf, norm_buf, xb_buf, @intCast(sess.cols), eps, false);
+        if (self.final_out_norm_dset == null)
+            self.final_out_norm_dset = try self.pl_rmsnorm.allocSet(vec_buf, norm_buf, xb_buf);
+        self.pl_rmsnorm.recordWithSet(cmd, self.final_out_norm_dset.?, @intCast(sess.cols), eps, false);
         self.ctx.profileEnd(cmd, p_norm);
         GpuCtx.recordShaderBarrier(cmd);
 
         const p_quant = self.ctx.profileBegin(cmd, "final.quantize_q8_1");
-        const quant_dset = try self.pl_quantize_q8_1.record(cmd, xb_buf, acts_buf, sess.cols);
+        if (self.final_quant_dset == null)
+            self.final_quant_dset = try self.pl_quantize_q8_1.allocSet(xb_buf, acts_buf);
+        self.pl_quantize_q8_1.recordWithSet(cmd, self.final_quant_dset.?, sess.cols);
         self.ctx.profileEnd(cmd, p_quant);
         GpuCtx.recordShaderBarrier(cmd);
 
         var mv_label_buf: [72]u8 = undefined;
         const mv_label = std.fmt.bufPrint(&mv_label_buf, "matvec_q8_1.single.{}x{}", .{ sess.rows, sess.cols }) catch "matvec_q8_1.single";
         const p_mv = self.ctx.profileBegin(cmd, mv_label);
-        const mv_dset = try pl.record(cmd, &sess.mat_buf, acts_buf, out_buf, sess.rows, sess.cols);
+        if (self.final_lm_head_dset == null) {
+            self.final_lm_head_dset = try pl.allocDescriptorSet();
+            pl.updateDescriptorSet(self.final_lm_head_dset.?, &sess.mat_buf, acts_buf, out_buf);
+            self.final_lm_head_dset_type = head_type;
+        } else {
+            std.debug.assert(self.final_lm_head_dset_type == head_type);
+        }
+        pl.recordDescriptor(cmd, self.final_lm_head_dset.?, sess.rows, sess.cols);
         self.ctx.profileEnd(cmd, p_mv);
-        var softcap_dset: ?vk.VkDescriptorSet = null;
         if (logit_softcap != 0.0) {
             GpuCtx.recordShaderBarrier(cmd);
             const p_softcap = self.ctx.profileBegin(cmd, "final.logit_softcap");
-            softcap_dset = try self.pl_logit_softcap.record(cmd, out_buf, sess.rows, logit_softcap);
+            if (self.final_softcap_dset == null)
+                self.final_softcap_dset = try self.pl_logit_softcap.allocSet(out_buf);
+            self.pl_logit_softcap.recordWithSet(cmd, self.final_softcap_dset.?, sess.rows, logit_softcap);
             self.ctx.profileEnd(cmd, p_softcap);
         }
 
-        var descriptor_frees: [gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree = undefined;
-        var descriptor_free_count: usize = 0;
-        try appendDeferredDescriptorFree(&descriptor_frees, &descriptor_free_count, self.pl_rmsnorm.desc_pool, norm_dset);
-        try appendDeferredDescriptorFree(&descriptor_frees, &descriptor_free_count, self.pl_quantize_q8_1.desc_pool, quant_dset);
-        try appendDeferredDescriptorFree(&descriptor_frees, &descriptor_free_count, pl.desc_pool, mv_dset);
-        if (softcap_dset) |dset| {
-            try appendDeferredDescriptorFree(&descriptor_frees, &descriptor_free_count, self.pl_logit_softcap.desc_pool, dset);
-        }
-
-        try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
+        try self.ctx.submitBatch(cmd);
 
         try out_buf.download(std.mem.sliceAsBytes(logits));
     }
