@@ -1398,6 +1398,8 @@ fn benchExpertDownIdShape(
     if (use_iq4) {
         if (envFlagEnabled("LLMTOY_EXPERT_DN_IQ4_B16", false)) {
             pipeline = try gpu_matvec.ExpertDownIdPipeline.initIQ4NLQ8_1B16(&gpu_weights.ctx);
+        } else if (envFlagEnabled("LLMTOY_EXPERT_DN_IQ4_IACC", false)) {
+            pipeline = try gpu_matvec.ExpertDownIdPipeline.initIQ4NLQ8_1Iacc(&gpu_weights.ctx);
         } else {
             pipeline = try gpu_matvec.ExpertDownIdPipeline.initIQ4NLQ8_1(&gpu_weights.ctx);
         }

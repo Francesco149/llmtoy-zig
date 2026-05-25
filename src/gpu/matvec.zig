@@ -1461,6 +1461,11 @@ pub const ExpertDownIdPipeline = struct {
         return initFromSpv(ctx, &shaders.expert_down_id_iq4_nl_q8_1_b16);
     }
 
+    pub fn initIQ4NLQ8_1Iacc(ctx: *const GpuContext) !ExpertDownIdPipeline {
+        comptime std.debug.assert(shaders.expert_down_id_iq4_nl_q8_1_iacc.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.expert_down_id_iq4_nl_q8_1_iacc);
+    }
+
     fn initFromSpv(ctx: *const GpuContext, spv: anytype) !ExpertDownIdPipeline {
         const built = try buildSimplePipeline(ctx, spv, 5, @sizeOf(ExpertDownIdPushConst), 64);
         return .{
@@ -4237,6 +4242,30 @@ test "gpu expert-id down IQ4_NL x Q8_1 fuzz" {
     const rel_b16 = max_abs_b16 / (max_ref_b16 + 1e-6);
     std.debug.print("expert-id IQ4_NL×Q8_1.b16 fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs_b16, rel_b16 });
     try std.testing.expect(rel_b16 < 1e-3);
+
+    var pipeline_iacc = try ExpertDownIdPipeline.initIQ4NLQ8_1Iacc(&gpu);
+    defer pipeline_iacc.deinit();
+
+    const cmd_iacc = try gpu.beginBatch();
+    const ds_iacc = try pipeline_iacc.record(cmd_iacc, &session.mat_buf, &acts_buf, &ids_buf, &scales_buf, &out_buf, @intCast(rows), @intCast(cols), @intCast(active));
+    try gpu.submitBatch(cmd_iacc);
+    var ds_iacc_mut = ds_iacc;
+    _ = vk.vkFreeDescriptorSets(gpu.device, pipeline_iacc.desc_pool, 1, &ds_iacc_mut);
+
+    const gpu_out_iacc = try al.alloc(f32, active * rows);
+    defer al.free(gpu_out_iacc);
+    try out_buf.download(std.mem.sliceAsBytes(gpu_out_iacc));
+
+    var max_abs_iacc: f32 = 0.0;
+    var max_ref_iacc: f32 = 0.0;
+    for (cpu_out, gpu_out_iacc) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs_iacc) max_abs_iacc = d;
+        if (@abs(c) > max_ref_iacc) max_ref_iacc = @abs(c);
+    }
+    const rel_iacc = max_abs_iacc / (max_ref_iacc + 1e-6);
+    std.debug.print("expert-id IQ4_NL×Q8_1.iacc fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs_iacc, rel_iacc });
+    try std.testing.expect(rel_iacc < 1e-3);
 }
 
 test "gpu matvec Q4_K fuzz" {

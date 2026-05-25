@@ -1623,6 +1623,17 @@ MoE dispatch follow-up:
   GPU, while production stayed on the default shader. Conclusion: 16 lanes per
   row is a clear negative result on this shape; keep it bench-only and do not
   route generation through it.
+- IQ4_NL expert-down integer-accumulation probe: added a bench-only
+  `expert_down_id_iq4_nl_q8_1_iacc` variant gated in the standalone
+  `bench-moe` shape check by `LLMTOY_EXPERT_DN_IQ4_IACC=1`. It keeps the
+  IQ4_NL lookup table as integers and converts to float once per 32-value
+  block. Correctness: `zig build test --summary all` reports 141/141 tests
+  passed, including default, b16, and iacc IQ4_NL expert-id fuzz checks
+  (`rel=1.933e-7`). Focused layer 10
+  `bench-moe --iters 64 --skip-readback` measured the default standalone shape
+  at `37.81 us` GPU, while the iacc standalone shape measured `48.98 us` GPU.
+  Conclusion: the integer inner loop is a clear negative result; keep it
+  bench-only and leave production on the default shader.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

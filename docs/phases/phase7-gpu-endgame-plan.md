@@ -679,6 +679,17 @@ IQ4_NL expert-down prep:
   about `69.67 us` GPU. Production `moe.down` remains on the default shader and
   measured about `38.76 us/iter` in the same run. Treat b16 as a measured
   negative result; do not route generation through it.
+- Added a bench-only integer-accumulation IQ4_NL down-id variant, selected in
+  the standalone `bench-moe` shape check by `LLMTOY_EXPERT_DN_IQ4_IACC=1`.
+  The shader is correctness-equivalent to the default path but accumulates the
+  integer IQ4_NL table products before converting each block sum to float.
+- Correctness: `zig build test --summary all` still passes 141/141 tests; the
+  default, b16, and iacc IQ4_NL down-id fuzz checks all report `rel=1.933e-7`.
+- Focused layer-10 `bench-moe --iters 64 --skip-readback` shows the default
+  standalone shape at about `37.81 us` GPU and the iacc standalone shape at
+  about `48.98 us` GPU. Production `moe.down` remains on the default shader and
+  measured about `38.73-38.76 us/iter` across the same runs. Treat iacc as a
+  measured negative result; do not route generation through it.
 
 Acceptance criteria:
 
