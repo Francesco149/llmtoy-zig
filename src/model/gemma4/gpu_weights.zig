@@ -1144,6 +1144,58 @@ pub const GpuWeights = struct {
         try out_buf.download(std.mem.sliceAsBytes(out));
     }
 
+    // Final decode head: rmsnorm(x, out_norm) -> Q8_1 -> lm_head in one submit.
+    // This removes the CPU out_norm pass and avoids routing the final head
+    // through the generic mv() helper's separate upload/submit shape.
+    pub fn runFinalLogitsQ8_1(
+        self: *const GpuWeights,
+        eps: f32,
+        head_type: GgmlType,
+        x: []const f32,
+        logits: []f32,
+    ) !void {
+        const sess = &(self.lm_head orelse return error.NotOnGpu);
+        const norm_buf = &(self.out_norm_buf orelse return error.NotOnGpu);
+        const pl = self.q8_1PipelineFor(head_type) orelse return error.NotOnGpu;
+        std.debug.assert(sess.cols == x.len);
+        std.debug.assert(sess.rows == logits.len);
+        std.debug.assert(sess.cols % 256 == 0);
+
+        const vec_buf = &self.shared_vec.?;
+        const xb_buf = &(self.xb_vram orelse return error.NotOnGpu);
+        const acts_buf = &self.shared_acts_q8_1.?;
+        const out_buf = &self.shared_out.?;
+
+        try vec_buf.upload(std.mem.sliceAsBytes(x));
+
+        const cmd = try self.ctx.beginBatch();
+        const p_norm = self.ctx.profileBegin(cmd, "final.out_norm");
+        const norm_dset = try self.pl_rmsnorm.record(cmd, vec_buf, norm_buf, xb_buf, @intCast(sess.cols), eps, false);
+        self.ctx.profileEnd(cmd, p_norm);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        const p_quant = self.ctx.profileBegin(cmd, "final.quantize_q8_1");
+        const quant_dset = try self.pl_quantize_q8_1.record(cmd, xb_buf, acts_buf, sess.cols);
+        self.ctx.profileEnd(cmd, p_quant);
+        GpuCtx.recordShaderBarrier(cmd);
+
+        var mv_label_buf: [72]u8 = undefined;
+        const mv_label = std.fmt.bufPrint(&mv_label_buf, "matvec_q8_1.single.{}x{}", .{ sess.rows, sess.cols }) catch "matvec_q8_1.single";
+        const p_mv = self.ctx.profileBegin(cmd, mv_label);
+        const mv_dset = try pl.record(cmd, &sess.mat_buf, acts_buf, out_buf, sess.rows, sess.cols);
+        self.ctx.profileEnd(cmd, p_mv);
+
+        var descriptor_frees: [gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree = undefined;
+        var descriptor_free_count: usize = 0;
+        try appendDeferredDescriptorFree(&descriptor_frees, &descriptor_free_count, self.pl_rmsnorm.desc_pool, norm_dset);
+        try appendDeferredDescriptorFree(&descriptor_frees, &descriptor_free_count, self.pl_quantize_q8_1.desc_pool, quant_dset);
+        try appendDeferredDescriptorFree(&descriptor_frees, &descriptor_free_count, pl.desc_pool, mv_dset);
+
+        try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
+
+        try out_buf.download(std.mem.sliceAsBytes(logits));
+    }
+
     // QKV variant of runQ8_1Mv: one upload, one quantize, then 2–3 matvecs all
     // reading the same Q8_1 acts buffer. Saves 2 PCIe uploads + 2 quantize
     // dispatches vs three independent runQ8_1Mv calls.

@@ -41,6 +41,34 @@ average about 103 us. There is no single outlier layer to chase, so the next
 production targets should remain `lm_head`, flattened MoE gate/up, attention
 QK, or a broader Q5_0 dense-down kernel improvement.
 
+## Phase 7 final logits GPU norm
+
+Added a final-head path that records `out_norm`, Q8_1 activation quantization,
+and the uploaded `lm_head` matvec in one command buffer. The fallback remains
+the previous CPU `out_norm` plus generic `mv()` route when `lm_head` or a Q8_1
+pipeline is unavailable.
+
+Focused validation:
+
+- `nix develop --command zig build`
+- `nix develop --command zig build test`
+- `llmtoy compare ... "explain MoE" --chat`: all layer argmaxes match, final
+  argmax `1852` matches
+- GPU deterministic smoke, `what is 1+1? --max-tokens 1`: completed
+
+Profiled short run with `LLMTOY_GPU_PROFILE=1`, same 33-token forward workload:
+
+- setup: 4.24 s after warm filesystem cache
+- prefill: 25 tokens in 0.85 s, 29.4 tok/s
+- generation: 8 tokens in 0.28 s, 28.8 tok/s
+- `matvec_q8_1.single.262144x2816`: 33 calls, 40.11 ms total, 1215.5 us avg
+- `final.out_norm`: 33 calls, 0.56 ms total, 16.9 us avg
+- `final.quantize_q8_1`: 33 calls, 0.04 ms total, 1.1 us avg
+
+This is not a replacement for a real `lm_head` kernel improvement, but it keeps
+the final normalization in the same GPU submit as the expensive head matvec and
+removes the CPU final-norm pass from the GPU generation path.
+
 ## Phase 7 attention fused-small probe
 
 Added a production-routed fused attention shader for `win_len <= 1024`, with
