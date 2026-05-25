@@ -1670,13 +1670,13 @@ pub const RmsnormPipeline = struct {
 
         const pool_size = vk.VkDescriptorPoolSize{
             .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = 3 * 128,
+            .descriptorCount = 3 * 256,
         };
         const pool_ci = vk.VkDescriptorPoolCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = null,
             .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = 128,
+            .maxSets = 256,
             .poolSizeCount = 1,
             .pPoolSizes = &pool_size,
         };
@@ -2591,6 +2591,16 @@ pub const GeluMulPipeline = struct {
         b_buf: *const GpuBuffer,
         n: u32,
     ) !vk.VkDescriptorSet {
+        const dset = try self.allocSet(a_buf, b_buf);
+        self.recordWithSet(cmd, dset, n);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const GeluMulPipeline,
+        a_buf: *const GpuBuffer,
+        b_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
         const dev = self.device;
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -2612,14 +2622,21 @@ pub const GeluMulPipeline = struct {
             mkWrite(dset, 1, &buf_infos[1]),
         };
         vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+        return dset;
+    }
 
+    pub fn recordWithSet(
+        self: *const GeluMulPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        n: u32,
+    ) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = ElemPushConst{ .n = n };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ElemPushConst), &pc);
         const groups = (n + 255) / 256;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
-        return dset;
     }
 
     pub fn deinit(self: *GeluMulPipeline) void {

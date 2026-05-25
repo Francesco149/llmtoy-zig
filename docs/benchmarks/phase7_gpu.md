@@ -97,6 +97,17 @@ token from the newest final-head path. Correctness:
 - `llmtoy compare ... "explain MoE" --chat`: all layer argmaxes match, final
   argmax `1852` matches
 
+Follow-up dense-chain descriptor cleanup: the full post-attention + dense FFN
+submit now reuses descriptor sets for the fixed-buffer quantize, RMSNorm,
+residual add, gelu, and optional down-quantize stages. The matvec descriptors
+remain transient because their pools are tied to quant-type-specific pipelines.
+Correctness:
+
+- `nix develop --command zig build`
+- `nix develop --command zig build test --summary all`: 142/142 tests passed
+- `llmtoy compare ... "explain MoE" --chat`: all layer argmaxes match, final
+  argmax `1852` matches
+
 ## Phase 7 attention fused-small probe
 
 Added a production-routed fused attention shader for `win_len <= 1024`, with

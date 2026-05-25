@@ -248,6 +248,14 @@ pub const GpuWeights = struct {
     attn_front_rope_table_k_dset: ?vk.VkDescriptorSet,
     attn_front_rope_theta_q_dset: ?vk.VkDescriptorSet,
     attn_front_rope_theta_k_dset: ?vk.VkDescriptorSet,
+    dense_full_wo_quant_dset: ?vk.VkDescriptorSet,
+    dense_full_post_attn_dsets: ?[]?vk.VkDescriptorSet,
+    dense_full_residual_add_dset: ?vk.VkDescriptorSet,
+    dense_full_ffn_norm_dsets: ?[]?vk.VkDescriptorSet,
+    dense_full_ffn_quant_dset: ?vk.VkDescriptorSet,
+    dense_full_gelu_dset: ?vk.VkDescriptorSet,
+    dense_full_down_quant_dset: ?vk.VkDescriptorSet,
+    dense_full_post_ffw_dsets: ?[]?vk.VkDescriptorSet,
     moe_tail_moe_norm_dsets: ?[]?vk.VkDescriptorSet,
     moe_tail_post_ffw_dsets: ?[]?vk.VkDescriptorSet,
     moe_tail_add_rmsnorm_dsets: ?[]?vk.VkDescriptorSet,
@@ -519,6 +527,14 @@ pub const GpuWeights = struct {
             .attn_front_rope_table_k_dset = null,
             .attn_front_rope_theta_q_dset = null,
             .attn_front_rope_theta_k_dset = null,
+            .dense_full_wo_quant_dset = null,
+            .dense_full_post_attn_dsets = null,
+            .dense_full_residual_add_dset = null,
+            .dense_full_ffn_norm_dsets = null,
+            .dense_full_ffn_quant_dset = null,
+            .dense_full_gelu_dset = null,
+            .dense_full_down_quant_dset = null,
+            .dense_full_post_ffw_dsets = null,
             .moe_tail_moe_norm_dsets = null,
             .moe_tail_post_ffw_dsets = null,
             .moe_tail_add_rmsnorm_dsets = null,
@@ -963,6 +979,47 @@ pub const GpuWeights = struct {
                 _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
             };
             self.allocator.free(sets);
+        }
+        if (self.dense_full_post_ffw_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
+        if (self.dense_full_down_quant_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, &tmp);
+        }
+        if (self.dense_full_gelu_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_gelu_mul.desc_pool, 1, &tmp);
+        }
+        if (self.dense_full_ffn_quant_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, &tmp);
+        }
+        if (self.dense_full_ffn_norm_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
+        if (self.dense_full_residual_add_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_elem_add.desc_pool, 1, &tmp);
+        }
+        if (self.dense_full_post_attn_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
+        if (self.dense_full_wo_quant_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, &tmp);
         }
         if (self.moe_tail_scale_dset) |set| {
             var tmp = set;
@@ -2022,7 +2079,7 @@ pub const GpuWeights = struct {
     //   - On return, ffn_out holds post_ffw_norm_1(...) and x (input slice)
     //     has been overwritten with the post-attention residual.
     pub fn runLayerAttnResidualDenseFfnQ8_1(
-        self: *const GpuWeights,
+        self: *GpuWeights,
         layer: usize,
         eps: f32,
         wo_pl: *const MatvecPipeline, // Q8_1 pipeline for wo
@@ -2075,7 +2132,9 @@ pub const GpuWeights = struct {
 
         // wo: quantize attn_concat, then Q8_1 matvec into attn_vram.
         const p_wo_quant = self.ctx.profileBegin(cmd, "post_attn.wo_quantize");
-        const wo_quant_dset = try self.pl_quantize_q8_1.record(cmd, attn_in_buf, acts_buf, @intCast(attn_concat.len));
+        if (self.dense_full_wo_quant_dset == null)
+            self.dense_full_wo_quant_dset = try self.pl_quantize_q8_1.allocSet(attn_in_buf, acts_buf);
+        self.pl_quantize_q8_1.recordWithSet(cmd, self.dense_full_wo_quant_dset.?, @intCast(attn_concat.len));
         self.ctx.profileEnd(cmd, p_wo_quant);
         GpuCtx.recordShaderBarrier(cmd);
         const p_wo = self.ctx.profileBegin(cmd, "post_attn.wo");
@@ -2085,26 +2144,32 @@ pub const GpuWeights = struct {
 
         // post_attention_norm in place on attn_vram.
         const p_post_attn = self.ctx.profileBegin(cmd, "post_attn.rmsnorm");
-        const post_attn_dset = try self.recordLayerRmsnorm(cmd, layer, attn_vram, post_attn_buf, attn_vram, @intCast(wo.rows), eps, false);
+        const post_attn_dset = try self.denseFullRmsnormSet(&self.dense_full_post_attn_dsets, layer, attn_vram, post_attn_buf, attn_vram);
+        self.recordLayerRmsnormWithSet(cmd, layer, post_attn_dset, @intCast(wo.rows), eps, false);
         self.ctx.profileEnd(cmd, p_post_attn);
         GpuCtx.recordShaderBarrier(cmd);
 
         // Residual: x_vram += attn_vram; copied back to CPU after this fused
         // dense block so CPU-side router work still sees the updated residual.
         const p_add = self.ctx.profileBegin(cmd, "post_attn.residual_add");
-        const add_dset = try self.pl_elem_add.record(cmd, x_buf, attn_vram, @intCast(wo.rows));
+        if (self.dense_full_residual_add_dset == null)
+            self.dense_full_residual_add_dset = try self.pl_elem_add.allocSet(x_buf, attn_vram);
+        self.pl_elem_add.recordWithSet(cmd, self.dense_full_residual_add_dset.?, @intCast(wo.rows));
         self.ctx.profileEnd(cmd, p_add);
         GpuCtx.recordShaderBarrier(cmd);
 
         // ffn_norm(x_buf) → xb_vram.
         const p_ffn_norm = self.ctx.profileBegin(cmd, "dense_ffn.rmsnorm");
-        const ffn_norm_dset = try self.recordLayerRmsnorm(cmd, layer, x_buf, ffn_norm_buf, xb_buf, @intCast(wo.rows), eps, false);
+        const ffn_norm_dset = try self.denseFullRmsnormSet(&self.dense_full_ffn_norm_dsets, layer, x_buf, ffn_norm_buf, xb_buf);
+        self.recordLayerRmsnormWithSet(cmd, layer, ffn_norm_dset, @intCast(wo.rows), eps, false);
         self.ctx.profileEnd(cmd, p_ffn_norm);
         GpuCtx.recordShaderBarrier(cmd);
 
         // Re-quantize xb for the FFN Q8_1 matvecs.
         const p_ffn_quant = self.ctx.profileBegin(cmd, "dense_ffn.quantize_q8_1");
-        const ffn_quant_dset = try self.pl_quantize_q8_1.record(cmd, xb_buf, acts_buf, w_gate.cols);
+        if (self.dense_full_ffn_quant_dset == null)
+            self.dense_full_ffn_quant_dset = try self.pl_quantize_q8_1.allocSet(xb_buf, acts_buf);
+        self.pl_quantize_q8_1.recordWithSet(cmd, self.dense_full_ffn_quant_dset.?, w_gate.cols);
         self.ctx.profileEnd(cmd, p_ffn_quant);
         GpuCtx.recordShaderBarrier(cmd);
 
@@ -2117,16 +2182,19 @@ pub const GpuWeights = struct {
         GpuCtx.recordShaderBarrier(cmd);
 
         const p_gelu = self.ctx.profileBegin(cmd, "dense_ffn.gelu_mul");
-        const gelu_dset = try self.pl_gelu_mul.record(cmd, gate_buf, up_buf, w_gate.rows);
+        if (self.dense_full_gelu_dset == null)
+            self.dense_full_gelu_dset = try self.pl_gelu_mul.allocSet(gate_buf, up_buf);
+        self.pl_gelu_mul.recordWithSet(cmd, self.dense_full_gelu_dset.?, w_gate.rows);
         self.ctx.profileEnd(cmd, p_gelu);
         GpuCtx.recordShaderBarrier(cmd);
 
         const use_down_q8 = envFlagDefaultTrue("LLMTOY_DENSE_DOWN_Q8_1") and down_q8_pl != null and w_down.cols % 32 == 0;
-        var down_quant_dset: ?vk.VkDescriptorSet = null;
         const p_down = self.ctx.profileBeginFmt(cmd, "dense_ffn.down.L{d:0>2}.{d}x{d}", .{ layer, w_down.rows, w_down.cols });
         const down_dset = blk: {
             if (use_down_q8) {
-                down_quant_dset = try self.pl_quantize_q8_1.record(cmd, gate_buf, acts_buf, w_down.cols);
+                if (self.dense_full_down_quant_dset == null)
+                    self.dense_full_down_quant_dset = try self.pl_quantize_q8_1.allocSet(gate_buf, acts_buf);
+                self.pl_quantize_q8_1.recordWithSet(cmd, self.dense_full_down_quant_dset.?, w_down.cols);
                 GpuCtx.recordShaderBarrier(cmd);
                 break :blk try down_q8_pl.?.record(cmd, &w_down.mat_buf, acts_buf, ffn_buf, w_down.rows, w_down.cols);
             }
@@ -2136,7 +2204,8 @@ pub const GpuWeights = struct {
         GpuCtx.recordShaderBarrier(cmd);
 
         const p_post_ffw = self.ctx.profileBegin(cmd, "dense_ffn.post_norm");
-        const post_ffw_dset = try self.recordLayerRmsnorm(cmd, layer, ffn_buf, post_ffw_norm_1_buf, out_buf, @intCast(w_down.rows), eps, false);
+        const post_ffw_dset = try self.denseFullRmsnormSet(&self.dense_full_post_ffw_dsets, layer, ffn_buf, post_ffw_norm_1_buf, out_buf);
+        self.recordLayerRmsnormWithSet(cmd, layer, post_ffw_dset, @intCast(w_down.rows), eps, false);
         self.ctx.profileEnd(cmd, p_post_ffw);
         GpuCtx.recordShaderToTransferBarrier(cmd);
         GpuCtx.recordCopy(cmd, x_buf.handle, stage_buf.handle, x.len * @sizeOf(f32));
@@ -2150,18 +2219,10 @@ pub const GpuWeights = struct {
             gate_pl,
             up_pl,
             if (use_down_q8) down_q8_pl.? else down_pl,
-            wo_quant_dset,
             wo_dset,
-            post_attn_dset,
-            add_dset,
-            ffn_norm_dset,
-            ffn_quant_dset,
             gate_dset,
             up_dset,
-            gelu_dset,
-            down_quant_dset,
             down_dset,
-            post_ffw_dset,
         );
 
         try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
@@ -2783,32 +2844,16 @@ pub const GpuWeights = struct {
         gate_pl: *const MatvecPipeline,
         up_pl: *const MatvecPipeline,
         down_pl: *const MatvecPipeline,
-        wo_quant_dset: vk.VkDescriptorSet,
         wo_dset: vk.VkDescriptorSet,
-        post_attn_dset: vk.VkDescriptorSet,
-        add_dset: vk.VkDescriptorSet,
-        ffn_norm_dset: vk.VkDescriptorSet,
-        ffn_quant_dset: vk.VkDescriptorSet,
         gate_dset: vk.VkDescriptorSet,
         up_dset: vk.VkDescriptorSet,
-        gelu_dset: vk.VkDescriptorSet,
-        down_quant_dset: ?vk.VkDescriptorSet,
         down_dset: vk.VkDescriptorSet,
-        post_ffw_dset: vk.VkDescriptorSet,
     ) !void {
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_quantize_q8_1.desc_pool, wo_quant_dset);
+        _ = self;
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, wo_pl.desc_pool, wo_dset);
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm.desc_pool, post_attn_dset);
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_elem_add.desc_pool, add_dset);
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm.desc_pool, ffn_norm_dset);
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_quantize_q8_1.desc_pool, ffn_quant_dset);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, gate_pl.desc_pool, gate_dset);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, up_pl.desc_pool, up_dset);
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_gelu_mul.desc_pool, gelu_dset);
-        if (down_quant_dset) |set|
-            try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_quantize_q8_1.desc_pool, set);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, down_pl.desc_pool, down_dset);
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm.desc_pool, post_ffw_dset);
     }
 
     fn collectRunLayerDenseFfnDescriptorFrees(
@@ -2983,6 +3028,24 @@ pub const GpuWeights = struct {
         const sets = sets_opt.*.?;
         if (sets[layer] == null)
             sets[layer] = try self.pl_rmsnorm_perhead.allocSet(x_buf, w_buf, y_buf);
+        return sets[layer].?;
+    }
+
+    fn denseFullRmsnormSet(
+        self: *GpuWeights,
+        sets_opt: *?[]?vk.VkDescriptorSet,
+        layer: usize,
+        x_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+        y_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        if (sets_opt.* == null) {
+            sets_opt.* = try self.allocator.alloc(?vk.VkDescriptorSet, self.layers.len);
+            @memset(sets_opt.*.?, null);
+        }
+        const sets = sets_opt.*.?;
+        if (sets[layer] == null)
+            sets[layer] = try self.pl_rmsnorm.allocSet(x_buf, w_buf, y_buf);
         return sets[layer].?;
     }
 
