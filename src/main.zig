@@ -1396,7 +1396,9 @@ fn benchExpertDownIdShape(
     if (down_type_id == 7) use_q5_1 = true;
     var pipeline: gpu_matvec.ExpertDownIdPipeline = undefined;
     if (use_iq4) {
-        if (envFlagEnabled("LLMTOY_EXPERT_DN_IQ4_B16", false)) {
+        if (envFlagEnabled("LLMTOY_EXPERT_DN_IQ4_R2", false)) {
+            pipeline = try gpu_matvec.ExpertDownIdPipeline.initIQ4NLQ8_1R2(&gpu_weights.ctx);
+        } else if (envFlagEnabled("LLMTOY_EXPERT_DN_IQ4_B16", false)) {
             pipeline = try gpu_matvec.ExpertDownIdPipeline.initIQ4NLQ8_1B16(&gpu_weights.ctx);
         } else if (envFlagEnabled("LLMTOY_EXPERT_DN_IQ4_IACC", false)) {
             pipeline = try gpu_matvec.ExpertDownIdPipeline.initIQ4NLQ8_1Iacc(&gpu_weights.ctx);

@@ -1634,6 +1634,18 @@ MoE dispatch follow-up:
   at `37.81 us` GPU, while the iacc standalone shape measured `48.98 us` GPU.
   Conclusion: the integer inner loop is a clear negative result; keep it
   bench-only and leave production on the default shader.
+- IQ4_NL expert-down two-row probe: added a bench-only
+  `expert_down_id_iq4_nl_q8_1_r2` variant gated in the standalone `bench-moe`
+  shape check by `LLMTOY_EXPERT_DN_IQ4_R2=1`. It mirrors the selected-expert
+  gate/up r2 shape by using one 64-lane workgroup as two independent 32-lane
+  row groups with clustered subgroup reductions. Correctness:
+  `zig build test --summary all` reports 141/141 tests passed, including the
+  default, r2, b16, and iacc IQ4_NL expert-id fuzz checks (`rel=1.933e-7`).
+  Focused layer 10 `bench-moe --iters 64 --skip-readback` measured the default
+  standalone IQ4_NL shape at `37.83 us` GPU and the r2 standalone shape at
+  `38.00 us` GPU. Conclusion: two-row packing is effectively flat to slightly
+  slower for IQ4_NL down; keep it bench-only and leave production on the
+  default one-row shader.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

@@ -72,6 +72,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(expert_down_id_q5_1_q8_1_spv, "expert_down_id_q5_1_q8_1.spv");
     const expert_down_id_iq4_nl_q8_1_spv = compileShader(b, "src/gpu/shaders/expert_down_id_iq4_nl_q8_1.glsl");
     _ = wf.addCopyFile(expert_down_id_iq4_nl_q8_1_spv, "expert_down_id_iq4_nl_q8_1.spv");
+    const expert_down_id_iq4_nl_q8_1_r2_spv = compileShader(b, "src/gpu/shaders/expert_down_id_iq4_nl_q8_1_r2.glsl");
+    _ = wf.addCopyFile(expert_down_id_iq4_nl_q8_1_r2_spv, "expert_down_id_iq4_nl_q8_1_r2.spv");
     const expert_down_id_iq4_nl_q8_1_b16_spv = compileShader(b, "src/gpu/shaders/expert_down_id_iq4_nl_q8_1_b16.glsl");
     _ = wf.addCopyFile(expert_down_id_iq4_nl_q8_1_b16_spv, "expert_down_id_iq4_nl_q8_1_b16.spv");
     const expert_down_id_iq4_nl_q8_1_iacc_spv = compileShader(b, "src/gpu/shaders/expert_down_id_iq4_nl_q8_1_iacc.glsl");
@@ -139,6 +141,7 @@ pub fn build(b: *std.Build) void {
         \\pub const expert_down_id_q5_0_q8_1 align(4) = @embedFile("expert_down_id_q5_0_q8_1.spv").*;
         \\pub const expert_down_id_q5_1_q8_1 align(4) = @embedFile("expert_down_id_q5_1_q8_1.spv").*;
         \\pub const expert_down_id_iq4_nl_q8_1 align(4) = @embedFile("expert_down_id_iq4_nl_q8_1.spv").*;
+        \\pub const expert_down_id_iq4_nl_q8_1_r2 align(4) = @embedFile("expert_down_id_iq4_nl_q8_1_r2.spv").*;
         \\pub const expert_down_id_iq4_nl_q8_1_b16 align(4) = @embedFile("expert_down_id_iq4_nl_q8_1_b16.spv").*;
         \\pub const expert_down_id_iq4_nl_q8_1_iacc align(4) = @embedFile("expert_down_id_iq4_nl_q8_1_iacc.spv").*;
         \\pub const rmsnorm             align(4) = @embedFile("rmsnorm.spv").*;
