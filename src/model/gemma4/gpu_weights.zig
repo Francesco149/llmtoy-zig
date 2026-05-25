@@ -1975,9 +1975,10 @@ pub const GpuWeights = struct {
         try stage_buf.download(std.mem.sliceAsBytes(x));
     }
 
-    pub fn downloadDenseFfnOut(self: *const GpuWeights, out: []f32) !void {
+    pub fn downloadDenseFfnOut(self: *GpuWeights, out: []f32) !void {
+        try self.finishPendingGpuBatch();
         const out_buf = &(self.dense_ffn_out_buf orelse return error.NotOnGpu);
-        try out_buf.download(std.mem.sliceAsBytes(out));
+        try self.downloadSmallDeviceBuffer(out_buf, std.mem.sliceAsBytes(out));
     }
 
     // Dispatch w_gate and w_up in one command buffer (both read the same FFN-norm xb).
@@ -2033,7 +2034,8 @@ pub const GpuWeights = struct {
     // Synchronous: writes staging → records copy → submits → waits. Used
     // once after embed lookup to seed the residual stream; subsequent
     // per-layer ops update x_vram in place via shader dispatches.
-    pub fn uploadX(self: *const GpuWeights, src: []const f32) !void {
+    pub fn uploadX(self: *GpuWeights, src: []const f32) !void {
+        try self.finishPendingGpuBatch();
         const stage = &(self.stage_buf orelse return error.NotOnGpu);
         const x = &(self.x_vram orelse return error.NotOnGpu);
         try stage.upload(std.mem.sliceAsBytes(src));
@@ -2041,7 +2043,8 @@ pub const GpuWeights = struct {
     }
 
     // Download x_vram → out (f32 slice). Submits a copy + waits.
-    pub fn downloadX(self: *const GpuWeights, out: []f32) !void {
+    pub fn downloadX(self: *GpuWeights, out: []f32) !void {
+        try self.finishPendingGpuBatch();
         const stage = &(self.stage_buf orelse return error.NotOnGpu);
         const x = &(self.x_vram orelse return error.NotOnGpu);
         try self.ctx.copyBuffer(x.handle, stage.handle, out.len * @sizeOf(f32));
