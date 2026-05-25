@@ -1981,9 +1981,10 @@ fn envFlagEnabled(name: [:0]const u8, default: bool) bool {
 }
 
 fn printGemma4GpuRuntimeOptions() void {
-    std.debug.print("  Gemma4 GPU options: attn_cpu_kv_shadow={} attention_async={}\n", .{
+    std.debug.print("  Gemma4 GPU options: attn_cpu_kv_shadow={} attention_async={} expert_reuse_cmd={}\n", .{
         envFlagEnabled("LLMTOY_ATTN_CPU_KV_SHADOW", false),
         envFlagEnabled("LLMTOY_ATTENTION_ASYNC", true),
+        envFlagEnabled("LLMTOY_EXPERT_REUSE_CMD", true),
     });
 }
 

@@ -716,7 +716,7 @@ pub const GpuWeights = struct {
         @memset(gw.expert_down_id_dsets.?, null);
         gw.expert_down_id_dset_type = try allocator.alloc(GgmlType, g4cfg.n_layers);
         @memset(gw.expert_down_id_dset_type.?, .f32);
-        if (std.c.getenv("LLMTOY_EXPERT_REUSE_CMD") != null) {
+        if (envFlagDefaultTrue("LLMTOY_EXPERT_REUSE_CMD")) {
             gw.expert_reuse_cmds = try allocator.alloc(?vk.VkCommandBuffer, g4cfg.n_layers);
             @memset(gw.expert_reuse_cmds.?, null);
         }
@@ -2397,7 +2397,12 @@ pub const GpuWeights = struct {
         const reuse_quant_mid_batched_dset = reuse_id_dsets and use_id_gu;
         const reuse_down_id_dset = reuse_id_dsets and use_id_dn;
         const reuse_accum_dset = reuse_id_dsets and (use_id_gu or use_id_dn);
-        const reuse_cmd = std.c.getenv("LLMTOY_EXPERT_REUSE_CMD") != null and use_id_gu and use_id_dn;
+        const reuse_cmd_env = std.c.getenv("LLMTOY_EXPERT_REUSE_CMD");
+        const reuse_cmd_requested = if (reuse_cmd_env) |raw|
+            !std.mem.eql(u8, std.mem.span(raw), "0")
+        else
+            tail != null;
+        const reuse_cmd = reuse_cmd_requested and self.expert_reuse_cmds != null and use_id_gu and use_id_dn;
         const async_moe_env = if (std.c.getenv("LLMTOY_EXPERT_ASYNC")) |raw|
             !std.mem.eql(u8, std.mem.span(raw), "0")
         else
