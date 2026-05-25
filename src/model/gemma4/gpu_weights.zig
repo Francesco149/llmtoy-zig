@@ -623,18 +623,15 @@ pub const GpuWeights = struct {
                 max_up_rows = s.rows;
             };
         }
-        // K and V outputs are vkCmdCopyBuffer sources during the 7l.1 GPU
-        // norms+RoPE+KV-append submit. Shared-V global layers also copy K into
-        // V before V normalization, so these buffers need both transfer bits.
-        const qkv_out_usage: vk.VkBufferUsageFlags = @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-            vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-            vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        gw.q_out_buf = try GpuBuffer.initHostCoherent(&gw.ctx, max_q_rows * @sizeOf(f32), qkv_out_usage);
-        gw.k_out_buf = try GpuBuffer.initHostCoherent(&gw.ctx, max_k_rows * @sizeOf(f32), qkv_out_usage);
-        gw.v_out_buf = try GpuBuffer.initHostCoherent(&gw.ctx, max_v_rows * @sizeOf(f32), qkv_out_usage);
+        // Q/K/V outputs stay device-local on the GPU attention path. Optional
+        // CPU shadow/readback paths copy through stage_buf instead of making
+        // every projection write land in host-coherent memory.
+        gw.q_out_buf = try GpuBuffer.initDeviceLocal(&gw.ctx, max_q_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.k_out_buf = try GpuBuffer.initDeviceLocal(&gw.ctx, max_k_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.v_out_buf = try GpuBuffer.initDeviceLocal(&gw.ctx, max_v_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         gw.gate_out_buf = try GpuBuffer.initHostCoherent(&gw.ctx, max_gate_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         gw.up_out_buf = try GpuBuffer.initHostCoherent(&gw.ctx, max_up_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        std.debug.print("  batch output bufs: q={} KiB k={} KiB v={} KiB gate={} KiB up={} KiB\n", .{
+        std.debug.print("  batch output bufs: q={} KiB k={} KiB v={} KiB (VRAM), gate={} KiB up={} KiB\n", .{
             max_q_rows * @sizeOf(f32) / 1024,  max_k_rows * @sizeOf(f32) / 1024,
             max_v_rows * @sizeOf(f32) / 1024,  max_gate_rows * @sizeOf(f32) / 1024,
             max_up_rows * @sizeOf(f32) / 1024,
@@ -1043,6 +1040,13 @@ pub const GpuWeights = struct {
         }
     }
 
+    fn downloadSmallDeviceBuffer(self: *const GpuWeights, src: *const GpuBuffer, dest: []u8) !void {
+        const stage = &(self.stage_buf orelse return error.NotOnGpu);
+        std.debug.assert(dest.len <= stage.size);
+        try self.ctx.copyBuffer(src.handle, stage.handle, dest.len);
+        try stage.download(dest);
+    }
+
     // Dispatch wq, wk, (optionally wv) in a single command buffer.
     // All three read the same xb → upload once, 2–3 parallel dispatches, 1 submit.
     // Pipelines are passed by the caller so gpu_weights.zig doesn't need raw types.
@@ -1088,9 +1092,9 @@ pub const GpuWeights = struct {
 
         try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
 
-        try q_buf.download(std.mem.sliceAsBytes(q_out));
-        try k_buf.download(std.mem.sliceAsBytes(k_out));
-        if (v_dset != null) try self.v_out_buf.?.download(std.mem.sliceAsBytes(v_out));
+        try self.downloadSmallDeviceBuffer(q_buf, std.mem.sliceAsBytes(q_out));
+        try self.downloadSmallDeviceBuffer(k_buf, std.mem.sliceAsBytes(k_out));
+        if (v_dset != null) try self.downloadSmallDeviceBuffer(&self.v_out_buf.?, std.mem.sliceAsBytes(v_out));
     }
 
     // Q8_1-activation matvec: one f32 → Q8_1 quantize pass, then one matvec.
@@ -1197,9 +1201,9 @@ pub const GpuWeights = struct {
 
         try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
 
-        try q_buf.download(std.mem.sliceAsBytes(q_out));
-        try k_buf.download(std.mem.sliceAsBytes(k_out));
-        if (v_out) |v| try self.v_out_buf.?.download(std.mem.sliceAsBytes(v));
+        try self.downloadSmallDeviceBuffer(q_buf, std.mem.sliceAsBytes(q_out));
+        try self.downloadSmallDeviceBuffer(k_buf, std.mem.sliceAsBytes(k_out));
+        if (v_out) |v| try self.downloadSmallDeviceBuffer(&self.v_out_buf.?, std.mem.sliceAsBytes(v));
     }
 
     // 7j-integrated attention path: same as runLayerQKVQ8_1 but with attn_norm
@@ -1271,9 +1275,9 @@ pub const GpuWeights = struct {
 
         try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
 
-        try q_buf.download(std.mem.sliceAsBytes(q_out));
-        try k_buf.download(std.mem.sliceAsBytes(k_out));
-        if (v_out) |v| try self.v_out_buf.?.download(std.mem.sliceAsBytes(v));
+        try self.downloadSmallDeviceBuffer(q_buf, std.mem.sliceAsBytes(q_out));
+        try self.downloadSmallDeviceBuffer(k_buf, std.mem.sliceAsBytes(k_out));
+        if (v_out) |v| try self.downloadSmallDeviceBuffer(&self.v_out_buf.?, std.mem.sliceAsBytes(v));
     }
 
     // 7l.1c — full attention front-end on the GPU in one submit.
@@ -1448,15 +1452,15 @@ pub const GpuWeights = struct {
 
         try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
 
-        if (q_out) |q| try q_buf.download(std.mem.sliceAsBytes(q));
-        if (k_out) |k| try k_buf.download(std.mem.sliceAsBytes(k));
-        if (v_out) |v| try v_buf.download(std.mem.sliceAsBytes(v));
+        if (q_out) |q| try self.downloadSmallDeviceBuffer(q_buf, std.mem.sliceAsBytes(q));
+        if (k_out) |k| try self.downloadSmallDeviceBuffer(k_buf, std.mem.sliceAsBytes(k));
+        if (v_out) |v| try self.downloadSmallDeviceBuffer(v_buf, std.mem.sliceAsBytes(v));
     }
 
     // 7l.2/3 — GPU attention compute. Replaces the per-head CPU sdpAttn loop.
     //
     // Reads:
-    //   - Q from q_out_buf (host-coherent — GPU still reads it; has the rope'd
+    //   - Q from q_out_buf (device-local; has the rope'd
     //     norm'd Q for this token, written by runLayerAttnQ8_1KvVram).
     //   - K from k_vram[layer] (per-layer VRAM cache, populated by 7l.1c).
     //   - V from v_vram[layer] (per-layer VRAM cache).

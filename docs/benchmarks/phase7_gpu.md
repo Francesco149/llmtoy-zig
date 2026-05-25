@@ -1646,6 +1646,17 @@ MoE dispatch follow-up:
   `38.00 us` GPU. Conclusion: two-row packing is effectively flat to slightly
   slower for IQ4_NL down; keep it bench-only and leave production on the
   default one-row shader.
+- Q/K/V projection output buffers now live in device-local VRAM. Optional
+  CPU-shadow/readback paths copy through the existing staging buffer, so the
+  normal GPU attention path no longer makes Q/K/V projection writes land in
+  host-coherent memory. Correctness: `zig build test --summary all` reports
+  141/141 tests passed, and `compare ... "explain MoE" --chat` keeps all layer
+  argmaxes and the final argmax matching CPU. Short profiled generation on the
+  standard 8-token prompt moved total GPU dispatch from `372.874 ms` to
+  `368.857 ms`; the clearest label-level wins were `attn_front.q_norm`
+  (`3.73 us` avg to `2.19 us`) and `attn_front.rope_q_theta` (`2.05 us` avg to
+  `0.89 us`). This is a small data-placement cleanup, not an end-to-end
+  throughput milestone.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
