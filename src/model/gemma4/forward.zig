@@ -522,12 +522,31 @@ fn embedLookup(out: []f32, mat: wt_.RawMatrix, row: u32, cols: usize, row_buf: [
     _ = row_buf;
 }
 
+const TopKSoftmaxStats = struct {
+    max: f32,
+    exp_sum: f32,
+};
+
 /// In-place top-k selection by descending score. O(n·k), k ≤ 16.
 fn topK(scores: []const f32, out: []usize) void {
+    _ = topKWithSoftmaxStats(scores, out);
+}
+
+/// Select top-k while also computing a stable softmax denominator.
+fn topKWithSoftmaxStats(scores: []const f32, out: []usize) TopKSoftmaxStats {
     std.debug.assert(out.len > 0 and out.len <= scores.len);
 
+    var max = scores[0];
+    var exp_sum: f32 = 0.0;
     var filled: usize = 0;
     for (scores, 0..) |s, j| {
+        if (s > max) {
+            exp_sum = exp_sum * @exp(max - s) + 1.0;
+            max = s;
+        } else {
+            exp_sum += @exp(s - max);
+        }
+
         if (filled < out.len) {
             var pos = filled;
             filled += 1;
@@ -543,6 +562,8 @@ fn topK(scores: []const f32, out: []usize) void {
             out[pos] = j;
         }
     }
+
+    return .{ .max = max, .exp_sum = exp_sum };
 }
 
 /// Select top-k from logits, then normalize only selected entries.
@@ -552,15 +573,10 @@ fn topK(scores: []const f32, out: []usize) void {
 /// router_out[eidx] for selected experts, so non-selected entries can remain
 /// as logits.
 fn softmaxTopK(scores: []f32, out: []usize) void {
-    topK(scores, out);
-
-    const max = scores[out[0]];
-
-    var sum: f32 = 0.0;
-    for (scores) |v| sum += @exp(v - max);
+    const stats = topKWithSoftmaxStats(scores, out);
 
     for (out) |idx| {
-        scores[idx] = @exp(scores[idx] - max) / sum;
+        scores[idx] = @exp(scores[idx] - stats.max) / stats.exp_sum;
     }
 }
 
@@ -570,6 +586,22 @@ test "topK: one pass selection preserves descending order and stable ties" {
     topK(&scores, &got);
 
     try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 2, 5, 4 }, &got);
+}
+
+test "topKWithSoftmaxStats: online denominator matches stable softmax sum" {
+    const scores = [_]f32{ -3.0, 0.5, 7.0, 2.0, 6.5, -1.0 };
+    var top: [3]usize = undefined;
+    const stats = topKWithSoftmaxStats(&scores, &top);
+
+    var max = scores[0];
+    for (scores[1..]) |v| if (v > max) {
+        max = v;
+    };
+    var exp_sum: f32 = 0.0;
+    for (scores) |v| exp_sum += @exp(v - max);
+
+    try std.testing.expectEqual(max, stats.max);
+    try std.testing.expectApproxEqRel(exp_sum, stats.exp_sum, 1e-6);
 }
 
 test "softmaxTopK: matches softmax then topK for selected experts" {

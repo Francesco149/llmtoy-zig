@@ -1579,6 +1579,11 @@ MoE dispatch follow-up:
   of rescanning all logits once per selected expert. `softmaxTopK` also reuses
   the first selected logit as the softmax max. Correctness:
   `zig build test --summary all` reports 136/136 tests passed.
+- Follow-up denominator cleanup: the same top-k scan now also computes the
+  stable softmax denominator with an online max/sum update, removing the
+  separate all-logit denominator pass before selected probabilities are
+  written. Correctness: `zig build test --summary all` reports 137/137 tests
+  passed.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
