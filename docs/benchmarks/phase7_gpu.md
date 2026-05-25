@@ -1612,6 +1612,17 @@ MoE dispatch follow-up:
   128`) measured production `L3.attn_v` at `18.48 us` GPU, versus MMVQ b64/r1
   `19.84 us`, b64/r2 `20.28 us`, and b64/r4 `24.00 us`. Conclusion: Q5_K
   MMVQ stays bench-only; production remains faster for this shape.
+- IQ4_NL expert-down lane-count probe: added a bench-only
+  `expert_down_id_iq4_nl_q8_1_b16` variant gated in the standalone
+  `bench-moe` shape check by `LLMTOY_EXPERT_DN_IQ4_B16=1`. Correctness:
+  `zig build test --summary all` reports 141/141 tests passed, including the
+  default and b16 IQ4_NL expert-id fuzz checks (`rel=1.933e-7`). Focused layer
+  10 `bench-moe --iters 64 --skip-readback` with default IQ4_NL measured
+  production `moe.down` at `38.76 us/iter` and standalone `expert-id down
+  shape` at `38.23 us` GPU. The b16 standalone variant measured `69.67 us`
+  GPU, while production stayed on the default shader. Conclusion: 16 lanes per
+  row is a clear negative result on this shape; keep it bench-only and do not
+  route generation through it.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

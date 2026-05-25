@@ -669,8 +669,16 @@ IQ4_NL expert-down prep:
   selected expert IDs, and fused per-slot scales.
 - Correctness: `zig build test --summary all` passes 141/141 tests; the new
   expert-id IQ4_NL fuzz case reports `rel=1.933e-7` on a 256-column shape.
-- This is a safety-net slice only. Use it before attempting IQ4_NL down-id
-  shader shape changes such as multi-row workgroups or alternate reductions.
+- Added a bench-only 16-lane IQ4_NL down-id variant, selected in the standalone
+  `bench-moe` shape check by `LLMTOY_EXPERT_DN_IQ4_B16=1`, and extended the
+  fuzz case to cover both variants.
+- Correctness: `zig build test --summary all` still passes 141/141 tests; the
+  default and b16 IQ4_NL down-id fuzz checks both report `rel=1.933e-7`.
+- Focused layer-10 `bench-moe --iters 64 --skip-readback` shows the default
+  standalone shape at about `38.23 us` GPU and the b16 standalone shape at
+  about `69.67 us` GPU. Production `moe.down` remains on the default shader and
+  measured about `38.76 us/iter` in the same run. Treat b16 as a measured
+  negative result; do not route generation through it.
 
 Acceptance criteria:
 

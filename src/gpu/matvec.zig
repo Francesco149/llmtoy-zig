@@ -1456,6 +1456,11 @@ pub const ExpertDownIdPipeline = struct {
         return initFromSpv(ctx, &shaders.expert_down_id_iq4_nl_q8_1);
     }
 
+    pub fn initIQ4NLQ8_1B16(ctx: *const GpuContext) !ExpertDownIdPipeline {
+        comptime std.debug.assert(shaders.expert_down_id_iq4_nl_q8_1_b16.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.expert_down_id_iq4_nl_q8_1_b16);
+    }
+
     fn initFromSpv(ctx: *const GpuContext, spv: anytype) !ExpertDownIdPipeline {
         const built = try buildSimplePipeline(ctx, spv, 5, @sizeOf(ExpertDownIdPushConst), 64);
         return .{
@@ -4208,6 +4213,30 @@ test "gpu expert-id down IQ4_NL x Q8_1 fuzz" {
     const rel = max_abs / (max_ref + 1e-6);
     std.debug.print("expert-id IQ4_NL×Q8_1 fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs, rel });
     try std.testing.expect(rel < 1e-3);
+
+    var pipeline_b16 = try ExpertDownIdPipeline.initIQ4NLQ8_1B16(&gpu);
+    defer pipeline_b16.deinit();
+
+    const cmd_b16 = try gpu.beginBatch();
+    const ds_b16 = try pipeline_b16.record(cmd_b16, &session.mat_buf, &acts_buf, &ids_buf, &scales_buf, &out_buf, @intCast(rows), @intCast(cols), @intCast(active));
+    try gpu.submitBatch(cmd_b16);
+    var ds_b16_mut = ds_b16;
+    _ = vk.vkFreeDescriptorSets(gpu.device, pipeline_b16.desc_pool, 1, &ds_b16_mut);
+
+    const gpu_out_b16 = try al.alloc(f32, active * rows);
+    defer al.free(gpu_out_b16);
+    try out_buf.download(std.mem.sliceAsBytes(gpu_out_b16));
+
+    var max_abs_b16: f32 = 0.0;
+    var max_ref_b16: f32 = 0.0;
+    for (cpu_out, gpu_out_b16) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs_b16) max_abs_b16 = d;
+        if (@abs(c) > max_ref_b16) max_ref_b16 = @abs(c);
+    }
+    const rel_b16 = max_abs_b16 / (max_ref_b16 + 1e-6);
+    std.debug.print("expert-id IQ4_NL×Q8_1.b16 fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs_b16, rel_b16 });
+    try std.testing.expect(rel_b16 < 1e-3);
 }
 
 test "gpu matvec Q4_K fuzz" {
