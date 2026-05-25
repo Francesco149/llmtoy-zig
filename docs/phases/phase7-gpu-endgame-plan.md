@@ -662,6 +662,16 @@ Q5_K MMVQ first slice:
   likely IQ4_NL expert down, global-layer CPU attention, or command/fence
   overhead if the next profile points there.
 
+IQ4_NL expert-down prep:
+
+- Added direct fuzz coverage for the selected-expert IQ4_NL down-id path,
+  matching the existing Q5_0/Q5_1 expert-id tests with Q8_1-rounded activations,
+  selected expert IDs, and fused per-slot scales.
+- Correctness: `zig build test --summary all` passes 141/141 tests; the new
+  expert-id IQ4_NL fuzz case reports `rel=1.933e-7` on a 256-column shape.
+- This is a safety-net slice only. Use it before attempting IQ4_NL down-id
+  shader shape changes such as multi-row workgroups or alternate reductions.
+
 Acceptance criteria:
 
 - Every new quant shader passes fuzz tests at the existing tolerances.
