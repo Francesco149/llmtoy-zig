@@ -388,8 +388,7 @@ pub fn forwardOne(
         );
 
         // Router logits → top-k indices plus selected softmax probabilities.
-        math.quantMatvec(router_out, lw.router_w.data, lw.router_w.type_, router_in, cfg.n_experts, d, scratch[0..d]);
-        softmaxTopK(router_out, top_idx);
+        routerTopKSoftmax(router_out, top_idx, lw.router_w, router_in, scratch[0..d]);
 
         // Run each selected expert. The default path keeps the accumulated MoE
         // vector device-resident and finishes the FFN/MoE residual tail on GPU
@@ -580,6 +579,75 @@ fn softmaxTopK(scores: []f32, out: []usize) void {
     }
 }
 
+/// Compute Gemma4's F32 router matvec while streaming logits directly into
+/// top-k selection and the softmax denominator. Only selected probabilities are
+/// written back to `scores`; downstream expert code only reads those entries.
+fn routerTopKSoftmax(scores: []f32, out: []usize, router_w: wt_.RawMatrix, router_in: []const f32, scratch: []f32) void {
+    std.debug.assert(scores.len == router_w.rows);
+    std.debug.assert(router_in.len == router_w.cols);
+    std.debug.assert(scratch.len >= router_w.cols);
+
+    if (router_w.type_ != .f32 or @intFromPtr(router_w.data.ptr) % @alignOf(f32) != 0) {
+        math.quantMatvec(scores, router_w.data, router_w.type_, router_in, router_w.rows, router_w.cols, scratch[0..router_w.cols]);
+        softmaxTopK(scores, out);
+        return;
+    }
+
+    const byte_len = router_w.rows * router_w.cols * @sizeOf(f32);
+    const aligned: []align(@alignOf(f32)) const u8 = @alignCast(router_w.data[0..byte_len]);
+    const weights = std.mem.bytesAsSlice(f32, aligned);
+    var selected_scores: [16]f32 = undefined;
+    const stats = topKMatvecF32(weights, router_in, router_w.rows, router_w.cols, out, selected_scores[0..out.len]);
+
+    for (out, selected_scores[0..out.len]) |idx, score| {
+        scores[idx] = @exp(score - stats.max) / stats.exp_sum;
+    }
+}
+
+/// F32 matrix-vector top-k with the same online softmax denominator update used
+/// by topKWithSoftmaxStats, avoiding a full logits buffer for router weights.
+fn topKMatvecF32(weights: []const f32, vec: []const f32, rows: usize, cols: usize, out: []usize, selected_scores: []f32) TopKSoftmaxStats {
+    std.debug.assert(weights.len >= rows * cols);
+    std.debug.assert(vec.len == cols);
+    std.debug.assert(out.len > 0 and out.len <= rows and out.len <= 16);
+    std.debug.assert(selected_scores.len == out.len);
+
+    var max: f32 = -std.math.inf(f32);
+    var exp_sum: f32 = 0.0;
+    var filled: usize = 0;
+
+    for (0..rows) |j| {
+        const score = math.dotf32(weights[j * cols ..][0..cols], vec);
+        if (score > max) {
+            exp_sum = exp_sum * @exp(max - score) + 1.0;
+            max = score;
+        } else {
+            exp_sum += @exp(score - max);
+        }
+
+        if (filled < out.len) {
+            var pos = filled;
+            filled += 1;
+            while (pos > 0 and score > selected_scores[pos - 1]) : (pos -= 1) {
+                selected_scores[pos] = selected_scores[pos - 1];
+                out[pos] = out[pos - 1];
+            }
+            selected_scores[pos] = score;
+            out[pos] = j;
+        } else if (score > selected_scores[out.len - 1]) {
+            var pos = out.len - 1;
+            while (pos > 0 and score > selected_scores[pos - 1]) : (pos -= 1) {
+                selected_scores[pos] = selected_scores[pos - 1];
+                out[pos] = out[pos - 1];
+            }
+            selected_scores[pos] = score;
+            out[pos] = j;
+        }
+    }
+
+    return .{ .max = max, .exp_sum = exp_sum };
+}
+
 test "topK: one pass selection preserves descending order and stable ties" {
     const scores = [_]f32{ 1.0, 4.0, 4.0, -2.0, 3.5, 4.0, 0.0 };
     var got: [4]usize = undefined;
@@ -617,5 +685,69 @@ test "softmaxTopK: matches softmax then topK for selected experts" {
     for (got_idx, ref_idx) |g, r| {
         try std.testing.expectEqual(r, g);
         try std.testing.expectApproxEqAbs(ref[r], got[g], 1e-6);
+    }
+}
+
+test "topKMatvecF32: matches materialized logits path" {
+    const rows = 6;
+    const cols = 5;
+    const weights = [_]f32{
+        1.0,  -2.0,  0.5,  4.0,  -1.0,
+        0.25, 3.0,   2.0,  -0.5, 1.5,
+        -1.0, 0.0,   0.0,  2.0,  3.0,
+        2.5,  -1.5,  0.25, 0.0,  1.0,
+        0.0,  0.5,   -2.0, 1.0,  2.0,
+        1.25, -0.25, 1.5,  -2.0, 0.75,
+    };
+    const vec = [_]f32{ 0.5, -1.0, 2.0, 0.25, -0.75 };
+    var logits: [rows]f32 = undefined;
+    math.matvec(&logits, &weights, &vec, rows, cols);
+
+    var ref = logits;
+    var ref_idx: [3]usize = undefined;
+    softmaxTopK(&ref, &ref_idx);
+
+    var got_idx: [3]usize = undefined;
+    var got_scores: [3]f32 = undefined;
+    const stats = topKMatvecF32(&weights, &vec, rows, cols, &got_idx, &got_scores);
+
+    for (got_idx, ref_idx, got_scores) |g, r, score| {
+        try std.testing.expectEqual(r, g);
+        try std.testing.expectApproxEqAbs(logits[r], score, 1e-6);
+        try std.testing.expectApproxEqAbs(ref[r], @exp(score - stats.max) / stats.exp_sum, 1e-6);
+    }
+}
+
+test "routerTopKSoftmax: streams aligned F32 router weights" {
+    const rows = 5;
+    const cols = 4;
+    const weights = [_]f32{
+        0.5,  -1.0,  1.5,  0.25,
+        2.0,  0.0,   -0.5, 1.0,
+        -1.0, 2.0,   0.5,  -0.25,
+        1.25, -0.75, 0.0,  2.0,
+        0.0,  0.25,  1.0,  -1.5,
+    };
+    const vec = [_]f32{ 1.0, -0.5, 0.75, 2.0 };
+
+    var ref_scores: [rows]f32 = undefined;
+    var scratch: [cols]f32 = undefined;
+    math.quantMatvec(&ref_scores, std.mem.sliceAsBytes(&weights), .f32, &vec, rows, cols, &scratch);
+    var ref_idx: [2]usize = undefined;
+    softmaxTopK(&ref_scores, &ref_idx);
+
+    const router_w: wt_.RawMatrix = .{
+        .data = std.mem.sliceAsBytes(&weights),
+        .type_ = .f32,
+        .rows = rows,
+        .cols = cols,
+    };
+    var got_scores = [_]f32{ -999.0, -999.0, -999.0, -999.0, -999.0 };
+    var got_idx: [2]usize = undefined;
+    routerTopKSoftmax(&got_scores, &got_idx, router_w, &vec, &scratch);
+
+    for (got_idx, ref_idx) |g, r| {
+        try std.testing.expectEqual(r, g);
+        try std.testing.expectApproxEqAbs(ref_scores[r], got_scores[g], 1e-6);
     }
 }

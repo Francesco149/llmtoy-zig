@@ -1584,6 +1584,18 @@ MoE dispatch follow-up:
   separate all-logit denominator pass before selected probabilities are
   written. Correctness: `zig build test --summary all` reports 137/137 tests
   passed.
+- Follow-up router matvec cleanup: the F32 router path now streams each router
+  row dot product directly into the top-k insertion buffer and online softmax
+  denominator, so the forward pass no longer materializes all 128 logits before
+  selecting experts. Only selected expert probabilities are written back to the
+  router score buffer. The generic `quantMatvec` + `softmaxTopK` fallback stays
+  in place for non-F32 or unaligned router weights. Correctness:
+  `zig build test --summary all` reports 139/139 tests passed, and
+  `llmtoy compare ... "explain MoE" --chat --gpu` keeps all layer argmaxes and
+  the final argmax matching CPU. Short unprofiled GPU stat on the usual
+  8-token command measured prefill `29.44 tok/s` and generation `26.31 tok/s`;
+  treat this as another CPU-side router cleanup sanity run rather than a
+  controlled end-to-end benchmark.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
