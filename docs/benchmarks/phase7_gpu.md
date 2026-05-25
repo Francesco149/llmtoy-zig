@@ -1604,6 +1604,14 @@ MoE dispatch follow-up:
   (`rel=1.023e-4`). Focused `bench-moe` on layer 1 (`Q3_K/Q5_0`, 16 iters,
   quiet preflight) measured production `moe.down` at `27.85 us/iter` and the
   standalone `expert-id down shape` at `26.51 us` GPU for 8 selected experts.
+- Q5_K MMVQ attention-V check: `bench-matvec --target` now accepts target
+  prefixes, so `--target L3.attn_v` captures production plus the b64 MMVQ
+  variants without running the whole harness. Correctness:
+  `zig build test --summary all` reports 140/140 tests passed. Focused profiled
+  sweep (`LLMTOY_GPU_PROFILE=1 ... bench-matvec ... --target L3.attn_v --iters
+  128`) measured production `L3.attn_v` at `18.48 us` GPU, versus MMVQ b64/r1
+  `19.84 us`, b64/r2 `20.28 us`, and b64/r4 `24.00 us`. Conclusion: Q5_K
+  MMVQ stays bench-only; production remains faster for this shape.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

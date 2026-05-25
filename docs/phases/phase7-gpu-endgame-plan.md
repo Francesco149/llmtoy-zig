@@ -584,7 +584,8 @@ Next implementation slice:
 1. Repeat the Q3_K b64/r1 measurement once more after the next shader change;
    keep it bench-only unless it stays ahead in stable runs.
 2. Move to the next non-Q4/Q6 bottleneck from the profile. Likely candidates:
-   Q5_0/Q5_1 down projections, Q5_K attention-V, or IQ4_NL expert down. Keep
+   IQ4_NL expert down, global-layer CPU attention, or command/fence overhead
+   if a fresh profile points there. Keep
    each as a bench-only MMVQ target until it beats the current shader.
 3. Keep current production routing on the existing kernels until a full
    generate profile shows a material token/s improvement, not just a narrow
@@ -644,9 +645,22 @@ Q5_0/Q5_1 MMVQ first slice:
   `L0.expert_down` about 4.27 us vs MMVQ best about 4.89 us.
 - Updated conclusion: Q5_0/Q5_1 MMVQ is correct but not a win. Keep these as
   bench-only reference targets. Do not route generation through them; the next
-  optimization should move to a different measured bottleneck, likely Q5_K or
-  IQ4_NL MMVQ, global-layer CPU attention, or command/fence overhead if the
-  next full profile points there.
+  optimization should move to a different measured bottleneck.
+
+Q5_K MMVQ first slice:
+
+- Reused the existing `matvec_q5_k_q8_1_mmvq.glsl` bench-only path and made
+  `bench-matvec --target` accept target prefixes, so focused sweeps like
+  `--target L3.attn_v` include the production target and its MMVQ variants.
+- Correctness: `zig build test --summary all` passes, including the Q5_K MMVQ
+  fuzz coverage at the existing `rel < 1e-3` tolerance on 2816-column cases.
+- Focused GPU timestamps with `LLMTOY_GPU_PROFILE=1 ... bench-matvec --target
+  L3.attn_v --iters 128`: production `L3.attn_v` about 18.48 us, MMVQ b64/r1
+  about 19.84 us, b64/r2 about 20.28 us, and b64/r4 about 24.00 us.
+- Updated conclusion: Q5_K MMVQ is correct but not a win on the attention-V
+  shape. Keep it bench-only and move on to a different measured bottleneck,
+  likely IQ4_NL expert down, global-layer CPU attention, or command/fence
+  overhead if the next profile points there.
 
 Acceptance criteria:
 

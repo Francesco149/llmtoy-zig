@@ -1535,7 +1535,7 @@ fn benchIfSelected(
     gpa: std.mem.Allocator,
     io: std.Io,
 ) !void {
-    if (opts.target) |t| if (!std.mem.eql(u8, t, name) and !std.mem.eql(u8, t, "all")) return;
+    if (!benchTargetSelected(opts.target, name)) return;
     try benchOneMatvec(out, ctx, pipes, name, mat, opts.iters, opts.reuse_descriptor, gpa, io);
     ran.* += 1;
 }
@@ -1554,7 +1554,7 @@ fn benchWithPipelineIfSelected(
     io: std.Io,
 ) !void {
     if (mat.type_ != expected_type) return;
-    if (opts.target) |t| if (!std.mem.eql(u8, t, name) and !std.mem.eql(u8, t, "all")) return;
+    if (!benchTargetSelected(opts.target, name)) return;
     try benchOneMatvecWithPipeline(out, ctx, pipeline, quant, name, mat, opts.iters, opts.reuse_descriptor, gpa, io);
     ran.* += 1;
 }
@@ -1573,7 +1573,7 @@ fn benchExpertDownIfSelected(
     gpa: std.mem.Allocator,
     io: std.Io,
 ) !void {
-    if (opts.target) |t| if (!std.mem.eql(u8, t, name) and !std.mem.eql(u8, t, "all")) return;
+    if (!benchTargetSelected(opts.target, name)) return;
     const row_bytes = math_mod.rowBytes(flat.type_, cols);
     const per_expert = rows * row_bytes;
     const mat = g4_weights.RawMatrix{
@@ -1603,7 +1603,7 @@ fn benchExpertDownWithPipelineIfSelected(
     io: std.Io,
 ) !void {
     if (flat.type_ != expected_type) return;
-    if (opts.target) |t| if (!std.mem.eql(u8, t, name) and !std.mem.eql(u8, t, "all")) return;
+    if (!benchTargetSelected(opts.target, name)) return;
     const row_bytes = math_mod.rowBytes(flat.type_, cols);
     const per_expert = rows * row_bytes;
     const mat = g4_weights.RawMatrix{
@@ -1614,6 +1614,13 @@ fn benchExpertDownWithPipelineIfSelected(
     };
     try benchOneMatvecWithPipeline(out, ctx, pipeline, quant, name, mat, opts.iters, opts.reuse_descriptor, gpa, io);
     ran.* += 1;
+}
+
+fn benchTargetSelected(target: ?[]const u8, name: []const u8) bool {
+    const t = target orelse return true;
+    return std.mem.eql(u8, t, "all") or
+        std.mem.eql(u8, t, name) or
+        std.mem.startsWith(u8, name, t);
 }
 
 fn benchOneMatvec(
