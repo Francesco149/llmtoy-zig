@@ -1441,6 +1441,11 @@ pub const ExpertDownIdPipeline = struct {
     desc_pool: vk.VkDescriptorPool,
     device: vk.VkDevice,
 
+    pub fn initQ5_0Q8_1(ctx: *const GpuContext) !ExpertDownIdPipeline {
+        comptime std.debug.assert(shaders.expert_down_id_q5_0_q8_1.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.expert_down_id_q5_0_q8_1);
+    }
+
     pub fn initQ5_1Q8_1(ctx: *const GpuContext) !ExpertDownIdPipeline {
         comptime std.debug.assert(shaders.expert_down_id_q5_1_q8_1.len % 4 == 0);
         return initFromSpv(ctx, &shaders.expert_down_id_q5_1_q8_1);
@@ -3988,6 +3993,113 @@ test "gpu expert-id down Q5_1 x Q8_1 fuzz" {
     }
     const rel = max_abs / (max_ref + 1e-6);
     std.debug.print("expert-id Q5_1×Q8_1 fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs, rel });
+    try std.testing.expect(rel < 1e-3);
+}
+
+test "gpu expert-id down Q5_0 x Q8_1 fuzz" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    const al = std.testing.allocator;
+    const n_experts: usize = 3;
+    const active: usize = 2;
+    const rows: usize = 8;
+    const cols: usize = 256;
+    const row_bytes = math_mod.rowBytes(.q5_0, cols);
+
+    var prng = std.Random.DefaultPrng.init(0xE1D5_0003);
+    const r = prng.random();
+
+    const mat = try al.alloc(u8, n_experts * rows * row_bytes);
+    defer al.free(mat);
+    for (mat) |*b| b.* = r.int(u8);
+
+    const small_d_le: [2]u8 = .{ 0xCD, 0x21 };
+    const blocks_per_row = cols / 32;
+    for (0..n_experts * rows) |i| for (0..blocks_per_row) |b| {
+        const off = (i * blocks_per_row + b) * 22;
+        mat[off + 0] = small_d_le[0];
+        mat[off + 1] = small_d_le[1];
+    };
+
+    const vec = try al.alloc(f32, cols);
+    defer al.free(vec);
+    for (vec) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+
+    const q8_1_basic = try al.alloc(u8, (cols / 32) * dq.Q8_1_BLOCK_BYTES);
+    defer al.free(q8_1_basic);
+    dq.quantizeQ8_1(vec, q8_1_basic);
+
+    const vec_q8_rounded = try al.alloc(f32, cols);
+    defer al.free(vec_q8_rounded);
+    dq.dequantQ8_1(q8_1_basic, vec_q8_rounded);
+
+    const q8_1_x4 = try al.alloc(u8, q8_1_basic.len);
+    defer al.free(q8_1_x4);
+    dq.packQ8_1_x4(q8_1_basic, q8_1_x4);
+    const q8_1_x4_all = try al.alloc(u8, active * q8_1_x4.len);
+    defer al.free(q8_1_x4_all);
+    for (0..active) |slot| {
+        @memcpy(q8_1_x4_all[slot * q8_1_x4.len ..][0..q8_1_x4.len], q8_1_x4);
+    }
+
+    const ids = [_]u32{ 2, 0 };
+    const scales = [_]f32{ 0.25, -0.75 };
+
+    const cpu_out = try al.alloc(f32, active * rows);
+    defer al.free(cpu_out);
+    const row_buf = try al.alloc(f32, cols);
+    defer al.free(row_buf);
+    for (ids, 0..) |expert_id, slot| {
+        const e: usize = @intCast(expert_id);
+        const expert_mat = mat[e * rows * row_bytes ..][0 .. rows * row_bytes];
+        math_mod.quantMatvec(cpu_out[slot * rows ..][0..rows], expert_mat, .q5_0, vec_q8_rounded, rows, cols, row_buf);
+        for (cpu_out[slot * rows ..][0..rows]) |*v| v.* *= scales[slot];
+    }
+
+    var pipeline = try ExpertDownIdPipeline.initQ5_0Q8_1(&gpu);
+    defer pipeline.deinit();
+    var session = try MatvecSession.initQ5_0(&gpu, mat, @intCast(n_experts * rows), @intCast(cols));
+    defer session.deinit();
+
+    var acts_buf = try GpuBuffer.initHostCoherent(&gpu, q8_1_x4_all.len, @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer acts_buf.deinit();
+    try acts_buf.upload(q8_1_x4_all);
+
+    var ids_buf = try GpuBuffer.initHostCoherent(&gpu, ids.len * @sizeOf(u32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer ids_buf.deinit();
+    try ids_buf.upload(std.mem.sliceAsBytes(&ids));
+
+    var scales_buf = try GpuBuffer.initHostCoherent(&gpu, scales.len * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer scales_buf.deinit();
+    try scales_buf.upload(std.mem.sliceAsBytes(&scales));
+
+    var out_buf = try GpuBuffer.initHostCoherent(&gpu, active * rows * @sizeOf(f32), @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+    defer out_buf.deinit();
+
+    const cmd = try gpu.beginBatch();
+    const ds = try pipeline.record(cmd, &session.mat_buf, &acts_buf, &ids_buf, &scales_buf, &out_buf, @intCast(rows), @intCast(cols), @intCast(active));
+    try gpu.submitBatch(cmd);
+    var ds_mut = ds;
+    _ = vk.vkFreeDescriptorSets(gpu.device, pipeline.desc_pool, 1, &ds_mut);
+
+    const gpu_out = try al.alloc(f32, active * rows);
+    defer al.free(gpu_out);
+    try out_buf.download(std.mem.sliceAsBytes(gpu_out));
+
+    var max_abs: f32 = 0.0;
+    var max_ref: f32 = 0.0;
+    for (cpu_out, gpu_out) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs) max_abs = d;
+        if (@abs(c) > max_ref) max_ref = @abs(c);
+    }
+    const rel = max_abs / (max_ref + 1e-6);
+    std.debug.print("expert-id Q5_0×Q8_1 fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs, rel });
     try std.testing.expect(rel < 1e-3);
 }
 

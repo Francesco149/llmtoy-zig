@@ -1596,6 +1596,14 @@ MoE dispatch follow-up:
   8-token command measured prefill `29.44 tok/s` and generation `26.31 tok/s`;
   treat this as another CPU-side router cleanup sanity run rather than a
   controlled end-to-end benchmark.
+- Added Q5_0 coverage to the selected-expert down-id path, matching the existing
+  Q5_1/IQ4_NL flat expert dispatch and fused per-expert scale multiply. The
+  persistent descriptor cleanup now tracks the actual down-id quant type instead
+  of treating every non-IQ4 descriptor set as Q5_1. Correctness:
+  `zig build test` passes, including the new Q5_0 expert-id down fuzz test
+  (`rel=1.023e-4`). Focused `bench-moe` on layer 1 (`Q3_K/Q5_0`, 16 iters,
+  quiet preflight) measured production `moe.down` at `27.85 us/iter` and the
+  standalone `expert-id down shape` at `26.51 us` GPU for 8 selected experts.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

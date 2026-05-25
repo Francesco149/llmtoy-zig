@@ -118,6 +118,7 @@ pub const GpuWeights = struct {
     pl_fused_gu: FusedGateUpPipeline,
     pl_fused_gu_q8_1: FusedGateUpPipeline,
     pl_expert_gate_up_id_q3_k: ExpertGateUpIdPipeline,
+    pl_expert_down_id_q5_0: ExpertDownIdPipeline,
     pl_expert_down_id_q5_1: ExpertDownIdPipeline,
     pl_expert_down_id_iq4_nl: ExpertDownIdPipeline,
     pl_accum: AccumPipeline,
@@ -216,7 +217,7 @@ pub const GpuWeights = struct {
     expert_accum_dset: ?vk.VkDescriptorSet,
     expert_gate_up_id_dsets: ?[]?vk.VkDescriptorSet,
     expert_down_id_dsets: ?[]?vk.VkDescriptorSet,
-    expert_down_id_dset_is_iq4: ?[]bool,
+    expert_down_id_dset_type: ?[]GgmlType,
     expert_reuse_cmds: ?[]?vk.VkCommandBuffer,
     // One in-flight async submit whose transient descriptor sets must stay
     // alive until its fence signals. Currently used by the MoE expert batch,
@@ -333,6 +334,9 @@ pub const GpuWeights = struct {
         var pl_expert_gate_up_id_q3_k = try ExpertGateUpIdPipeline.initQ3KQ8_1R2(&ctx);
         errdefer pl_expert_gate_up_id_q3_k.deinit();
         std.debug.print("  init: pl_expert_gate_up_id_q3_k.r2 ok\n", .{});
+        var pl_expert_down_id_q5_0 = try ExpertDownIdPipeline.initQ5_0Q8_1(&ctx);
+        errdefer pl_expert_down_id_q5_0.deinit();
+        std.debug.print("  init: pl_expert_down_id_q5_0 ok\n", .{});
         var pl_expert_down_id_q5_1 = try ExpertDownIdPipeline.initQ5_1Q8_1(&ctx);
         errdefer pl_expert_down_id_q5_1.deinit();
         std.debug.print("  init: pl_expert_down_id_q5_1 ok\n", .{});
@@ -411,6 +415,7 @@ pub const GpuWeights = struct {
             .pl_fused_gu = pl_fused_gu,
             .pl_fused_gu_q8_1 = pl_fused_gu_q8_1,
             .pl_expert_gate_up_id_q3_k = pl_expert_gate_up_id_q3_k,
+            .pl_expert_down_id_q5_0 = pl_expert_down_id_q5_0,
             .pl_expert_down_id_q5_1 = pl_expert_down_id_q5_1,
             .pl_expert_down_id_iq4_nl = pl_expert_down_id_iq4_nl,
             .pl_accum = pl_accum,
@@ -469,7 +474,7 @@ pub const GpuWeights = struct {
             .expert_accum_dset = null,
             .expert_gate_up_id_dsets = null,
             .expert_down_id_dsets = null,
-            .expert_down_id_dset_is_iq4 = null,
+            .expert_down_id_dset_type = null,
             .expert_reuse_cmds = null,
             .pending_gpu_batch = null,
             .moe_tail_moe_norm_dsets = null,
@@ -654,8 +659,8 @@ pub const GpuWeights = struct {
         @memset(gw.expert_gate_up_id_dsets.?, null);
         gw.expert_down_id_dsets = try allocator.alloc(?vk.VkDescriptorSet, g4cfg.n_layers);
         @memset(gw.expert_down_id_dsets.?, null);
-        gw.expert_down_id_dset_is_iq4 = try allocator.alloc(bool, g4cfg.n_layers);
-        @memset(gw.expert_down_id_dset_is_iq4.?, false);
+        gw.expert_down_id_dset_type = try allocator.alloc(GgmlType, g4cfg.n_layers);
+        @memset(gw.expert_down_id_dset_type.?, .f32);
         if (std.c.getenv("LLMTOY_EXPERT_REUSE_CMD") != null) {
             gw.expert_reuse_cmds = try allocator.alloc(?vk.VkCommandBuffer, g4cfg.n_layers);
             @memset(gw.expert_reuse_cmds.?, null);
@@ -894,13 +899,13 @@ pub const GpuWeights = struct {
         if (self.expert_down_id_dsets) |sets| {
             for (sets, 0..) |*ds, i| if (ds.*) |set| {
                 var tmp = set;
-                const is_iq4 = if (self.expert_down_id_dset_is_iq4) |flags| flags[i] else false;
-                const pool = if (is_iq4) self.pl_expert_down_id_iq4_nl.desc_pool else self.pl_expert_down_id_q5_1.desc_pool;
+                const dset_type = if (self.expert_down_id_dset_type) |types| types[i] else .q5_1;
+                const pool = (self.expertDownIdPipelineFor(dset_type) orelse &self.pl_expert_down_id_q5_1).desc_pool;
                 _ = vk.vkFreeDescriptorSets(self.ctx.device, pool, 1, &tmp);
             };
             self.allocator.free(sets);
         }
-        if (self.expert_down_id_dset_is_iq4) |flags| self.allocator.free(flags);
+        if (self.expert_down_id_dset_type) |types| self.allocator.free(types);
         if (self.expert_gate_up_id_dsets) |sets| {
             for (sets) |*ds| if (ds.*) |set| {
                 var tmp = set;
@@ -996,6 +1001,7 @@ pub const GpuWeights = struct {
         self.pl_accum.deinit();
         self.pl_expert_down_id_iq4_nl.deinit();
         self.pl_expert_down_id_q5_1.deinit();
+        self.pl_expert_down_id_q5_0.deinit();
         self.pl_expert_gate_up_id_q3_k.deinit();
         self.pl_fused_gu_q8_1.deinit();
         self.pl_fused_gu.deinit();
@@ -1552,6 +1558,7 @@ pub const GpuWeights = struct {
 
     fn expertDownIdPipelineFor(self: *const GpuWeights, t: GgmlType) ?*const ExpertDownIdPipeline {
         return switch (t) {
+            .q5_0 => &self.pl_expert_down_id_q5_0,
             .q5_1 => &self.pl_expert_down_id_q5_1,
             .iq4_nl => &self.pl_expert_down_id_iq4_nl,
             else => null,
@@ -2284,7 +2291,7 @@ pub const GpuWeights = struct {
                 const sets = self.expert_down_id_dsets orelse return error.ExpertNotOnGpu;
                 if (sets[layer] == null) {
                     sets[layer] = try pl_dn_id.?.allocSet(&down_flat.?.mat_buf, mid_q8_1_flat_buf, ids_buf, scales_buf, all_out_buf);
-                    if (self.expert_down_id_dset_is_iq4) |flags| flags[layer] = down_type == .iq4_nl;
+                    if (self.expert_down_id_dset_type) |types| types[layer] = down_type;
                 }
                 pl_dn_id.?.recordWithSet(cmd, sets[layer].?, @intCast(d_model), @intCast(down_flat.?.cols), @intCast(n));
             } else {
@@ -2820,7 +2827,7 @@ fn isGpuSupported(t: GgmlType) bool {
 
 fn isExpertDownIdSupported(t: GgmlType) bool {
     return switch (t) {
-        .q5_1, .iq4_nl => true,
+        .q5_0, .q5_1, .iq4_nl => true,
         else => false,
     };
 }

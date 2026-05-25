@@ -1389,17 +1389,21 @@ fn benchExpertDownIdShape(
     const down_type_id: u32 = @intFromEnum(lw.down_exps.type_);
     const down_type_label = lw.down_exps.type_.label();
     var use_iq4 = layer == 10 or down_type_id == 20 or std.mem.eql(u8, down_type_label, "IQ4_NL");
+    var use_q5_0 = down_type_id == 6 or std.mem.eql(u8, down_type_label, "Q5_0");
     var use_q5_1 = layer == 0 or down_type_id == 7 or std.mem.eql(u8, down_type_label, "Q5_1");
     if (down_type_id == 20) use_iq4 = true;
+    if (down_type_id == 6) use_q5_0 = true;
     if (down_type_id == 7) use_q5_1 = true;
     var pipeline: gpu_matvec.ExpertDownIdPipeline = undefined;
     if (use_iq4) {
         pipeline = try gpu_matvec.ExpertDownIdPipeline.initIQ4NLQ8_1(&gpu_weights.ctx);
+    } else if (use_q5_0) {
+        pipeline = try gpu_matvec.ExpertDownIdPipeline.initQ5_0Q8_1(&gpu_weights.ctx);
     } else if (use_q5_1) {
         pipeline = try gpu_matvec.ExpertDownIdPipeline.initQ5_1Q8_1(&gpu_weights.ctx);
     } else {
-        try out.print("expert-id down shape: unsupported layer={} down type {s} ({}) q5={} iq4={}\n", .{
-            layer, lw.down_exps.type_.label(), down_type_id, use_q5_1, use_iq4,
+        try out.print("expert-id down shape: unsupported layer={} down type {s} ({}) q5_0={} q5_1={} iq4={}\n", .{
+            layer, lw.down_exps.type_.label(), down_type_id, use_q5_0, use_q5_1, use_iq4,
         });
         return;
     }

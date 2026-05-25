@@ -923,9 +923,10 @@ systemd-run --user --scope -p MemoryMax=40G --quiet -- \
   - the ~0.53 ms gap is host/descriptor/recording overhead from the current
     many-dispatch path; see `docs/benchmarks/phase7_gpu.md`
 - Expert-ID prototype status:
-  - `expert_down_id_q5_1_q8_1` and `expert_down_id_iq4_nl_q8_1` pass focused
-    shader tests and benchmark at about 26 us (Q5_1 layer 0) and 38 us
-    (IQ4_NL layer 10) for 8 selected experts.
+  - `expert_down_id_q5_0_q8_1`, `expert_down_id_q5_1_q8_1`, and
+    `expert_down_id_iq4_nl_q8_1` pass focused shader tests. Current focused
+    shape timings are about 26.5 us for Q5_0 layer 1, 26 us for Q5_1 layer 0,
+    and 38 us for IQ4_NL layer 10, each for 8 selected experts.
   - `expert_gate_up_id_q3_k_q8_1` passes focused shader tests. The current
     one-pass gate/up variant is about 52 us for 8 selected experts versus
     about 50 us for the current eight per-expert fused dispatches. Do not wire
