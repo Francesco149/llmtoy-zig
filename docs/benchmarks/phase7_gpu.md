@@ -1574,6 +1574,11 @@ MoE dispatch follow-up:
   Correctness: `zig build test` passes, and
   `compare ... "explain MoE" --chat` keeps all layer argmaxes and the final
   argmax matching CPU.
+- Follow-up router cleanup: top-k selection now keeps the selected experts in
+  a sorted insertion buffer during one pass over the 128 router logits instead
+  of rescanning all logits once per selected expert. `softmaxTopK` also reuses
+  the first selected logit as the softmax max. Correctness:
+  `zig build test --summary all` reports 136/136 tests passed.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

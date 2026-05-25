@@ -524,21 +524,24 @@ fn embedLookup(out: []f32, mat: wt_.RawMatrix, row: u32, cols: usize, row_buf: [
 
 /// In-place top-k selection by descending score. O(n·k), k ≤ 16.
 fn topK(scores: []const f32, out: []usize) void {
-    for (0..out.len) |i| {
-        var best: usize = 0;
-        var best_val: f32 = -std.math.inf(f32);
-        for (scores, 0..) |s, j| {
-            var dup = false;
-            for (out[0..i]) |p| if (p == j) {
-                dup = true;
-                break;
-            };
-            if (!dup and s > best_val) {
-                best_val = s;
-                best = j;
+    std.debug.assert(out.len > 0 and out.len <= scores.len);
+
+    var filled: usize = 0;
+    for (scores, 0..) |s, j| {
+        if (filled < out.len) {
+            var pos = filled;
+            filled += 1;
+            while (pos > 0 and s > scores[out[pos - 1]]) : (pos -= 1) {
+                out[pos] = out[pos - 1];
             }
+            out[pos] = j;
+        } else if (s > scores[out[out.len - 1]]) {
+            var pos = out.len - 1;
+            while (pos > 0 and s > scores[out[pos - 1]]) : (pos -= 1) {
+                out[pos] = out[pos - 1];
+            }
+            out[pos] = j;
         }
-        out[i] = best;
     }
 }
 
@@ -551,10 +554,7 @@ fn topK(scores: []const f32, out: []usize) void {
 fn softmaxTopK(scores: []f32, out: []usize) void {
     topK(scores, out);
 
-    var max = scores[0];
-    for (scores[1..]) |v| if (v > max) {
-        max = v;
-    };
+    const max = scores[out[0]];
 
     var sum: f32 = 0.0;
     for (scores) |v| sum += @exp(v - max);
@@ -562,6 +562,14 @@ fn softmaxTopK(scores: []f32, out: []usize) void {
     for (out) |idx| {
         scores[idx] = @exp(scores[idx] - max) / sum;
     }
+}
+
+test "topK: one pass selection preserves descending order and stable ties" {
+    const scores = [_]f32{ 1.0, 4.0, 4.0, -2.0, 3.5, 4.0, 0.0 };
+    var got: [4]usize = undefined;
+    topK(&scores, &got);
+
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 2, 5, 4 }, &got);
 }
 
 test "softmaxTopK: matches softmax then topK for selected experts" {
