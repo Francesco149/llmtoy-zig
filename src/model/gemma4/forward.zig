@@ -187,9 +187,9 @@ pub fn forwardOne(
         // ── Attention ─────────────────────────────────────────────────────────
         //
         // QKV dispatch paths, in priority order:
-        //   0. 7l.1 KV-VRAM path: Q8_1 QKV + GPU per-head Q/K/V norms + GPU
-        //      RoPE + GPU KV cache append in ONE submit. Requires wv present
-        //      (global SWA layers without wv fall through to path 1).
+        //   0. 7l.1 KV-VRAM path: Q8_1 Q/K/(V) + GPU per-head Q/K/V norms +
+        //      GPU RoPE + GPU KV cache append in ONE submit. Layers without
+        //      explicit wv use K as V inside the same GPU batch.
         //   1. Q8_1 path:  wq+wk+(wv) all on GPU with Q8_1 pipelines →
         //      runLayerAttnQ8_1 fuses rmsnorm + quantize + matvecs.
         //   2. f32 batch:  some session lacks a Q8_1 pipeline (e.g. Q5_K wv) →

@@ -748,7 +748,9 @@ Known remaining CPU/GPU synchronization points:
 - `runExpertBatch` writes MoE input/scales from CPU and reads accumulated MoE
   output back to CPU.
 - MoE top-k routing is still CPU-side.
-- Global layers without explicit V still use CPU attention.
+- Global layers without explicit V now stay on GPU attention: the KV-VRAM
+  attention front copies raw K into the V buffer before the separate K/V
+  per-head norms and cache appends.
 - Command submission still blocks after most batches, now via a context-owned
   fence rather than `vkQueueWaitIdle`.
 
@@ -760,7 +762,8 @@ High-value cleanup once matvec is faster:
 
 - Keep `x`, dense FFN output, and MoE output in VRAM until final logits.
 - Move router top-k to GPU or at least avoid readback of intermediate vectors.
-- Add a V-from-K shader/path for the 6 global layers so they use GPU attention.
+- Keep the V-from-K global-layer path covered while attention is reworked
+  toward llama.cpp-style flash attention and q8_0 KV cache compatibility.
 - Expand the first-pass submit fences into a real fence ring once profiling
   shows queue wait as a bottleneck.
 
