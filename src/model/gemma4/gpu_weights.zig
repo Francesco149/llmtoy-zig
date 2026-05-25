@@ -239,6 +239,15 @@ pub const GpuWeights = struct {
     final_lm_head_dset: ?vk.VkDescriptorSet,
     final_lm_head_dset_type: GgmlType,
     final_softcap_dset: ?vk.VkDescriptorSet,
+    attn_front_norm_dsets: ?[]?vk.VkDescriptorSet,
+    attn_front_quant_dset: ?vk.VkDescriptorSet,
+    attn_front_q_norm_dsets: ?[]?vk.VkDescriptorSet,
+    attn_front_k_norm_dsets: ?[]?vk.VkDescriptorSet,
+    attn_front_v_norm_dset: ?vk.VkDescriptorSet,
+    attn_front_rope_table_q_dset: ?vk.VkDescriptorSet,
+    attn_front_rope_table_k_dset: ?vk.VkDescriptorSet,
+    attn_front_rope_theta_q_dset: ?vk.VkDescriptorSet,
+    attn_front_rope_theta_k_dset: ?vk.VkDescriptorSet,
     moe_tail_moe_norm_dsets: ?[]?vk.VkDescriptorSet,
     moe_tail_post_ffw_dsets: ?[]?vk.VkDescriptorSet,
     moe_tail_add_rmsnorm_dsets: ?[]?vk.VkDescriptorSet,
@@ -501,6 +510,15 @@ pub const GpuWeights = struct {
             .final_lm_head_dset = null,
             .final_lm_head_dset_type = .f32,
             .final_softcap_dset = null,
+            .attn_front_norm_dsets = null,
+            .attn_front_quant_dset = null,
+            .attn_front_q_norm_dsets = null,
+            .attn_front_k_norm_dsets = null,
+            .attn_front_v_norm_dset = null,
+            .attn_front_rope_table_q_dset = null,
+            .attn_front_rope_table_k_dset = null,
+            .attn_front_rope_theta_q_dset = null,
+            .attn_front_rope_theta_k_dset = null,
             .moe_tail_moe_norm_dsets = null,
             .moe_tail_post_ffw_dsets = null,
             .moe_tail_add_rmsnorm_dsets = null,
@@ -900,6 +918,51 @@ pub const GpuWeights = struct {
         if (self.final_out_norm_x_vram_dset) |set| {
             var tmp = set;
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
+        }
+        if (self.attn_front_rope_theta_k_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rope_theta.desc_pool, 1, &tmp);
+        }
+        if (self.attn_front_rope_theta_q_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rope_theta.desc_pool, 1, &tmp);
+        }
+        if (self.attn_front_rope_table_k_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rope_table.desc_pool, 1, &tmp);
+        }
+        if (self.attn_front_rope_table_q_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rope_table.desc_pool, 1, &tmp);
+        }
+        if (self.attn_front_v_norm_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm_perhead.desc_pool, 1, &tmp);
+        }
+        if (self.attn_front_k_norm_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm_perhead.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
+        if (self.attn_front_q_norm_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm_perhead.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
+        if (self.attn_front_quant_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, &tmp);
+        }
+        if (self.attn_front_norm_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
         }
         if (self.moe_tail_scale_dset) |set| {
             var tmp = set;
@@ -1437,7 +1500,7 @@ pub const GpuWeights = struct {
     // If wv_pl is null, V is shared from the raw K projection. This covers
     // Gemma4 global layers without falling back to CPU attention.
     pub fn runLayerAttnQ8_1KvVram(
-        self: *const GpuWeights,
+        self: *GpuWeights,
         layer: usize,
         eps: f32,
         wq_pl: *const MatvecPipeline,
@@ -1486,13 +1549,16 @@ pub const GpuWeights = struct {
 
         // ── 1. attn_norm(x) → xb_vram
         const p_norm = self.ctx.profileBegin(cmd, "attn_front.rmsnorm");
-        const norm_dset = try self.recordLayerRmsnorm(cmd, layer, vec_buf, attn_norm_buf, xb_buf, @intCast(x.len), eps, false);
+        const norm_dset = try self.attnFrontRmsnormSet(layer, vec_buf, attn_norm_buf, xb_buf);
+        self.recordLayerRmsnormWithSet(cmd, layer, norm_dset, @intCast(x.len), eps, false);
         self.ctx.profileEnd(cmd, p_norm);
         GpuCtx.recordShaderBarrier(cmd);
 
         // ── 2. quantize(xb_vram) → acts
         const p_quant = self.ctx.profileBegin(cmd, "attn_front.quantize_q8_1");
-        const quant_dset = try self.pl_quantize_q8_1.record(cmd, xb_buf, acts_buf, wq.cols);
+        if (self.attn_front_quant_dset == null)
+            self.attn_front_quant_dset = try self.pl_quantize_q8_1.allocSet(xb_buf, acts_buf);
+        self.pl_quantize_q8_1.recordWithSet(cmd, self.attn_front_quant_dset.?, wq.cols);
         self.ctx.profileEnd(cmd, p_quant);
         GpuCtx.recordShaderBarrier(cmd);
 
@@ -1527,36 +1593,43 @@ pub const GpuWeights = struct {
         //      the shader doesn't read it when use_weight==0, so any valid
         //      buffer works.
         const p_qn = self.ctx.profileBegin(cmd, "attn_front.q_norm");
-        const qn_dset = try self.pl_rmsnorm_perhead.record(cmd, q_buf, q_norm_buf, q_buf, n_heads, head_dim, eps, true, true);
+        const qn_dset = try self.attnFrontPerHeadSet(&self.attn_front_q_norm_dsets, layer, q_buf, q_norm_buf, q_buf);
+        self.pl_rmsnorm_perhead.recordWithSet(cmd, qn_dset, n_heads, head_dim, eps, true, true);
         self.ctx.profileEnd(cmd, p_qn);
         const p_kn = self.ctx.profileBegin(cmd, "attn_front.k_norm");
-        const kn_dset = try self.pl_rmsnorm_perhead.record(cmd, k_buf, k_norm_buf, k_buf, n_kv_heads, head_dim, eps, true, true);
+        const kn_dset = try self.attnFrontPerHeadSet(&self.attn_front_k_norm_dsets, layer, k_buf, k_norm_buf, k_buf);
+        self.pl_rmsnorm_perhead.recordWithSet(cmd, kn_dset, n_kv_heads, head_dim, eps, true, true);
         self.ctx.profileEnd(cmd, p_kn);
         const p_vn = self.ctx.profileBegin(cmd, "attn_front.v_norm");
-        const vn_dset = try self.pl_rmsnorm_perhead.record(cmd, v_buf, v_buf, v_buf, n_kv_heads, head_dim, eps, false, false);
+        if (self.attn_front_v_norm_dset == null)
+            self.attn_front_v_norm_dset = try self.pl_rmsnorm_perhead.allocSet(v_buf, v_buf, v_buf);
+        self.pl_rmsnorm_perhead.recordWithSet(cmd, self.attn_front_v_norm_dset.?, n_kv_heads, head_dim, eps, false, false);
         self.ctx.profileEnd(cmd, p_vn);
         GpuCtx.recordShaderBarrier(cmd);
 
         // ── 5. RoPE on Q and K (V isn't rotated)
-        var qr_dset: vk.VkDescriptorSet = null;
-        var kr_dset: vk.VkDescriptorSet = null;
-        var rope_pool: vk.VkDescriptorPool = undefined;
         if (is_swa) {
             const p_rope_q = self.ctx.profileBegin(cmd, "attn_front.rope_q_theta");
-            qr_dset = try self.pl_rope_theta.record(cmd, q_buf, pos, head_dim, rope_theta_swa, n_heads);
+            if (self.attn_front_rope_theta_q_dset == null)
+                self.attn_front_rope_theta_q_dset = try self.pl_rope_theta.allocSet(q_buf);
+            self.pl_rope_theta.recordWithSet(cmd, self.attn_front_rope_theta_q_dset.?, pos, head_dim, rope_theta_swa, n_heads);
             self.ctx.profileEnd(cmd, p_rope_q);
             const p_rope_k = self.ctx.profileBegin(cmd, "attn_front.rope_k_theta");
-            kr_dset = try self.pl_rope_theta.record(cmd, k_buf, pos, head_dim, rope_theta_swa, n_kv_heads);
+            if (self.attn_front_rope_theta_k_dset == null)
+                self.attn_front_rope_theta_k_dset = try self.pl_rope_theta.allocSet(k_buf);
+            self.pl_rope_theta.recordWithSet(cmd, self.attn_front_rope_theta_k_dset.?, pos, head_dim, rope_theta_swa, n_kv_heads);
             self.ctx.profileEnd(cmd, p_rope_k);
-            rope_pool = self.pl_rope_theta.desc_pool;
         } else {
             const p_rope_q = self.ctx.profileBegin(cmd, "attn_front.rope_q_table");
-            qr_dset = try self.pl_rope_table.record(cmd, q_buf, rope_freqs_buf, pos, head_dim, n_heads);
+            if (self.attn_front_rope_table_q_dset == null)
+                self.attn_front_rope_table_q_dset = try self.pl_rope_table.allocSet(q_buf, rope_freqs_buf);
+            self.pl_rope_table.recordWithSet(cmd, self.attn_front_rope_table_q_dset.?, pos, head_dim, n_heads);
             self.ctx.profileEnd(cmd, p_rope_q);
             const p_rope_k = self.ctx.profileBegin(cmd, "attn_front.rope_k_table");
-            kr_dset = try self.pl_rope_table.record(cmd, k_buf, rope_freqs_buf, pos, head_dim, n_kv_heads);
+            if (self.attn_front_rope_table_k_dset == null)
+                self.attn_front_rope_table_k_dset = try self.pl_rope_table.allocSet(k_buf, rope_freqs_buf);
+            self.pl_rope_table.recordWithSet(cmd, self.attn_front_rope_table_k_dset.?, pos, head_dim, n_kv_heads);
             self.ctx.profileEnd(cmd, p_rope_k);
-            rope_pool = self.pl_rope_table.desc_pool;
         }
         GpuCtx.recordShaderToTransferBarrier(cmd);
 
@@ -1576,17 +1649,9 @@ pub const GpuWeights = struct {
             wq_pl,
             wk_pl,
             wv_pl,
-            norm_dset,
-            quant_dset,
             q_mv_dset,
             k_mv_dset,
             v_mv_dset,
-            qn_dset,
-            kn_dset,
-            vn_dset,
-            rope_pool,
-            qr_dset,
-            kr_dset,
         );
 
         try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
@@ -2643,29 +2708,15 @@ pub const GpuWeights = struct {
         wq_pl: *const MatvecPipeline,
         wk_pl: *const MatvecPipeline,
         wv_pl: ?*const MatvecPipeline,
-        norm_dset: vk.VkDescriptorSet,
-        quant_dset: vk.VkDescriptorSet,
         q_mv_dset: vk.VkDescriptorSet,
         k_mv_dset: vk.VkDescriptorSet,
         v_mv_dset: ?vk.VkDescriptorSet,
-        qn_dset: vk.VkDescriptorSet,
-        kn_dset: vk.VkDescriptorSet,
-        vn_dset: vk.VkDescriptorSet,
-        rope_pool: vk.VkDescriptorPool,
-        qr_dset: vk.VkDescriptorSet,
-        kr_dset: vk.VkDescriptorSet,
     ) !void {
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm.desc_pool, norm_dset);
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_quantize_q8_1.desc_pool, quant_dset);
+        _ = self;
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, wq_pl.desc_pool, q_mv_dset);
         try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, wk_pl.desc_pool, k_mv_dset);
         if (v_mv_dset) |set|
             try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, wv_pl.?.desc_pool, set);
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm_perhead.desc_pool, qn_dset);
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm_perhead.desc_pool, kn_dset);
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_rmsnorm_perhead.desc_pool, vn_dset);
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, rope_pool, qr_dset);
-        try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, rope_pool, kr_dset);
     }
 
     fn collectRunLayerQ8_1QkvDescriptorFrees(
@@ -2898,6 +2949,41 @@ pub const GpuWeights = struct {
             self.pl_elem_add.recordWithSet(cmd, dset, n);
             self.ctx.profileEnd(cmd, p_residual);
         }
+    }
+
+    fn attnFrontRmsnormSet(
+        self: *GpuWeights,
+        layer: usize,
+        x_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+        y_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        if (self.attn_front_norm_dsets == null) {
+            self.attn_front_norm_dsets = try self.allocator.alloc(?vk.VkDescriptorSet, self.layers.len);
+            @memset(self.attn_front_norm_dsets.?, null);
+        }
+        const sets = self.attn_front_norm_dsets.?;
+        if (sets[layer] == null)
+            sets[layer] = try self.pl_rmsnorm.allocSet(x_buf, w_buf, y_buf);
+        return sets[layer].?;
+    }
+
+    fn attnFrontPerHeadSet(
+        self: *GpuWeights,
+        sets_opt: *?[]?vk.VkDescriptorSet,
+        layer: usize,
+        x_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+        y_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        if (sets_opt.* == null) {
+            sets_opt.* = try self.allocator.alloc(?vk.VkDescriptorSet, self.layers.len);
+            @memset(sets_opt.*.?, null);
+        }
+        const sets = sets_opt.*.?;
+        if (sets[layer] == null)
+            sets[layer] = try self.pl_rmsnorm_perhead.allocSet(x_buf, w_buf, y_buf);
+        return sets[layer].?;
     }
 
     fn moeTailRmsnormSet(

@@ -2021,13 +2021,13 @@ pub const RmsnormPerHeadPipeline = struct {
 
         const pool_size = vk.VkDescriptorPoolSize{
             .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = 3 * 32,
+            .descriptorCount = 3 * 128,
         };
         const pool_ci = vk.VkDescriptorPoolCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = null,
             .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = 32,
+            .maxSets = 128,
             .poolSizeCount = 1,
             .pPoolSizes = &pool_size,
         };
@@ -2057,7 +2057,17 @@ pub const RmsnormPerHeadPipeline = struct {
         use_weight: bool,
     ) !vk.VkDescriptorSet {
         std.debug.assert(head_dim % 256 == 0);
-        const dev = self.device;
+        const dset = try self.allocSet(x_buf, w_buf, y_buf);
+        self.recordWithSet(cmd, dset, n_heads, head_dim, eps, weight_offset, use_weight);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const RmsnormPerHeadPipeline,
+        x_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+        y_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .pNext = null,
@@ -2066,7 +2076,7 @@ pub const RmsnormPerHeadPipeline = struct {
             .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
-        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
 
         const buf_infos = [3]vk.VkDescriptorBufferInfo{
@@ -2079,8 +2089,21 @@ pub const RmsnormPerHeadPipeline = struct {
             mkWrite(dset, 1, &buf_infos[1]),
             mkWrite(dset, 2, &buf_infos[2]),
         };
-        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+        vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+        return dset;
+    }
 
+    pub fn recordWithSet(
+        self: *const RmsnormPerHeadPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        n_heads: u32,
+        head_dim: u32,
+        eps: f32,
+        weight_offset: bool,
+        use_weight: bool,
+    ) void {
+        std.debug.assert(head_dim % 256 == 0);
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
 
@@ -2092,8 +2115,6 @@ pub const RmsnormPerHeadPipeline = struct {
         };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(RmsnormPerHeadPushConst), &pc);
         vk.vkCmdDispatch(cmd, n_heads, 1, 1);
-
-        return dset;
     }
 
     pub fn deinit(self: *RmsnormPerHeadPipeline) void {
@@ -2649,7 +2670,16 @@ pub const RopeNeoxTablePipeline = struct {
         n_heads: u32,
     ) !vk.VkDescriptorSet {
         std.debug.assert(head_dim <= 512); // local_size_x is 256, half ≤ 256
-        const dev = self.device;
+        const dset = try self.allocSet(vec_buf, freqs_buf);
+        self.recordWithSet(cmd, dset, pos, head_dim, n_heads);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const RopeNeoxTablePipeline,
+        vec_buf: *const GpuBuffer,
+        freqs_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .pNext = null,
@@ -2658,7 +2688,7 @@ pub const RopeNeoxTablePipeline = struct {
             .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
-        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
         const buf_infos = [2]vk.VkDescriptorBufferInfo{
             .{ .buffer = vec_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -2668,14 +2698,24 @@ pub const RopeNeoxTablePipeline = struct {
             mkWrite(dset, 0, &buf_infos[0]),
             mkWrite(dset, 1, &buf_infos[1]),
         };
-        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+        vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+        return dset;
+    }
 
+    pub fn recordWithSet(
+        self: *const RopeNeoxTablePipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        pos: u32,
+        head_dim: u32,
+        n_heads: u32,
+    ) void {
+        std.debug.assert(head_dim <= 512);
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = RopeTablePushConst{ .pos = pos, .head_dim = head_dim };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(RopeTablePushConst), &pc);
         vk.vkCmdDispatch(cmd, n_heads, 1, 1);
-        return dset;
     }
 
     pub fn deinit(self: *RopeNeoxTablePipeline) void {
@@ -2715,7 +2755,15 @@ pub const RopeNeoxThetaPipeline = struct {
         n_heads: u32,
     ) !vk.VkDescriptorSet {
         std.debug.assert(head_dim <= 512);
-        const dev = self.device;
+        const dset = try self.allocSet(vec_buf);
+        self.recordWithSet(cmd, dset, pos, head_dim, theta, n_heads);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const RopeNeoxThetaPipeline,
+        vec_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .pNext = null,
@@ -2724,7 +2772,7 @@ pub const RopeNeoxThetaPipeline = struct {
             .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
-        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
         const buf_info = vk.VkDescriptorBufferInfo{
             .buffer = vec_buf.handle,
@@ -2732,14 +2780,25 @@ pub const RopeNeoxThetaPipeline = struct {
             .range = vk.VK_WHOLE_SIZE,
         };
         const write = mkWrite(dset, 0, &buf_info);
-        vk.vkUpdateDescriptorSets(dev, 1, &write, 0, null);
+        vk.vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
+        return dset;
+    }
 
+    pub fn recordWithSet(
+        self: *const RopeNeoxThetaPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        pos: u32,
+        head_dim: u32,
+        theta: f32,
+        n_heads: u32,
+    ) void {
+        std.debug.assert(head_dim <= 512);
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = RopeThetaPushConst{ .pos = pos, .head_dim = head_dim, .theta = theta };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(RopeThetaPushConst), &pc);
         vk.vkCmdDispatch(cmd, n_heads, 1, 1);
-        return dset;
     }
 
     pub fn deinit(self: *RopeNeoxThetaPipeline) void {

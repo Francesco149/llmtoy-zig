@@ -1729,6 +1729,11 @@ MoE dispatch follow-up:
   reports 142/142 tests passed; `compare ... "explain MoE" --chat` keeps all
   layer argmaxes and the final argmax matching CPU; GPU deterministic smoke
   `what is 1+1? --max-tokens 1` completed and produced token `1`.
+- The attention-front path now reuses stable descriptors for the per-layer
+  attention RMSNorm, Q/K per-head norms, shared V norm, RoPE Q/K bindings, and
+  the shared Q8_1 quantizer. The Q/K/V matvec descriptors remain transient
+  until the matvec pools/type ownership are expanded deliberately. Correctness:
+  `zig build test --summary all` reports 142/142 tests passed.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
