@@ -1657,6 +1657,14 @@ MoE dispatch follow-up:
   (`3.73 us` avg to `2.19 us`) and `attn_front.rope_q_theta` (`2.05 us` avg to
   `0.89 us`). This is a small data-placement cleanup, not an end-to-end
   throughput milestone.
+- The dense FFN post-norm output buffer now also lives in device-local VRAM.
+  The default MoE tail consumes that vector on GPU, while fallback/debug paths
+  use the same staging-buffer readback/upload helper. Correctness:
+  `zig build test --summary all` reports 141/141 tests passed, and
+  `compare ... "explain MoE" --chat` keeps all layer argmaxes and the final
+  argmax matching CPU. Short profiled generation after the Q/K/V VRAM change
+  moved total GPU dispatch from `368.857 ms` to `360.069 ms`; the main win was
+  `ffn_moe.add_post_norm` dropping from `26.83 us` avg to `17.69 us`.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

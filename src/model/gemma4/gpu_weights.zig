@@ -576,12 +576,12 @@ pub const GpuWeights = struct {
         // outputs (d_ffn floats); the fused gelu_mul rewrites gate_vram in place
         // as gelu(gate)*up before w_down reads it.  ffn_vram holds the w_down
         // output (d_model floats) before the in-place post_ffw_norm_1 rmsnorm
-        // copies into dense_ffn_out_buf for download.
+        // copies into dense_ffn_out_buf for GPU-side MoE tail consumption.
         const dffn_bytes = g4cfg.d_ffn * @sizeOf(f32);
         gw.gate_vram = try GpuBuffer.initDeviceLocal(&gw.ctx, dffn_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         gw.up_vram = try GpuBuffer.initDeviceLocal(&gw.ctx, dffn_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         gw.ffn_vram = try GpuBuffer.initDeviceLocal(&gw.ctx, g4cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        gw.dense_ffn_out_buf = try GpuBuffer.initHostCoherent(&gw.ctx, g4cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.dense_ffn_out_buf = try GpuBuffer.initDeviceLocal(&gw.ctx, g4cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         std.debug.print("  dense FFN VRAM: gate={} KiB up={} KiB ffn={} KiB out={} KiB\n", .{ dffn_bytes / 1024, dffn_bytes / 1024, g4cfg.d_model * @sizeOf(f32) / 1024, g4cfg.d_model * @sizeOf(f32) / 1024 });
 
         // wo input/output buffers for the combined attn-residual + dense FFN
@@ -1045,6 +1045,13 @@ pub const GpuWeights = struct {
         std.debug.assert(dest.len <= stage.size);
         try self.ctx.copyBuffer(src.handle, stage.handle, dest.len);
         try stage.download(dest);
+    }
+
+    fn uploadSmallDeviceBuffer(self: *const GpuWeights, dst: *const GpuBuffer, src: []const u8) !void {
+        const stage = &(self.stage_buf orelse return error.NotOnGpu);
+        std.debug.assert(src.len <= stage.size);
+        try stage.upload(src);
+        try self.ctx.copyBuffer(stage.handle, dst.handle, src.len);
     }
 
     // Dispatch wq, wk, (optionally wv) in a single command buffer.
@@ -1784,7 +1791,7 @@ pub const GpuWeights = struct {
 
         try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
 
-        try out_buf.download(std.mem.sliceAsBytes(ffn_out));
+        try self.downloadSmallDeviceBuffer(out_buf, std.mem.sliceAsBytes(ffn_out));
     }
 
     // 7j integrated wo + post-attention residual + dense FFN — collapses
@@ -1963,7 +1970,7 @@ pub const GpuWeights = struct {
         try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
 
         if (ffn_out) |out| {
-            try out_buf.download(std.mem.sliceAsBytes(out));
+            try self.downloadSmallDeviceBuffer(out_buf, std.mem.sliceAsBytes(out));
         }
         try stage_buf.download(std.mem.sliceAsBytes(x));
     }
@@ -2176,7 +2183,7 @@ pub const GpuWeights = struct {
                 try self.shared_vec.?.upload(std.mem.sliceAsBytes(tp.x));
             }
             if (!tp.dense_buf_current) {
-                try (self.dense_ffn_out_buf orelse return error.ExpertNotOnGpu).upload(std.mem.sliceAsBytes(tp.dense_ffn));
+                try self.uploadSmallDeviceBuffer(&(self.dense_ffn_out_buf orelse return error.ExpertNotOnGpu), std.mem.sliceAsBytes(tp.dense_ffn));
             }
         }
         for (0..n) |k| {
