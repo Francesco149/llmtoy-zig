@@ -1721,6 +1721,14 @@ MoE dispatch follow-up:
   argmax matching CPU. Short profiled generation after the Q/K/V VRAM change
   moved total GPU dispatch from `368.857 ms` to `360.069 ms`; the main win was
   `ffn_moe.add_post_norm` dropping from `26.83 us` avg to `17.69 us`.
+- Final logits now consume the last-layer residual directly from GPU storage
+  when the MoE tail already has the final `x` in `shared_vec` or `x_vram`.
+  This skips the final residual readback followed by the immediate final-head
+  upload on normal generation, while compare/layer-tap and CPU fallback paths
+  still force the readback. Correctness: `zig build test --summary all`
+  reports 142/142 tests passed; `compare ... "explain MoE" --chat` keeps all
+  layer argmaxes and the final argmax matching CPU; GPU deterministic smoke
+  `what is 1+1? --max-tokens 1` completed and produced token `1`.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

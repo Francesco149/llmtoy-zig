@@ -136,6 +136,8 @@ pub fn forwardOne(
         !std.mem.eql(u8, std.mem.span(raw), "0")
     else
         false;
+    const final_logits_gpu_possible = if (gpu) |g| g.canRunFinalLogitsQ8_1(w.lm_head.type_) else false;
+    var final_logits_input: gpu_w_.FinalLogitsInput = .cpu;
 
     for (0..cfg.n_layers) |l| {
         const lw = &w.layers[l];
@@ -395,6 +397,11 @@ pub fn forwardOne(
         // for all non-skipped layers.
         @memset(moe_buf, 0.0);
         var moe_residual_done_on_gpu = false;
+        const leave_final_x_on_gpu = final_logits_gpu_possible and
+            layer_taps == null and
+            l + 1 == cfg.n_layers and
+            use_moe_vram_tail and
+            (x_current_in_gpu_shared_vec or x_current_in_gpu_vram);
 
         // Batched GPU path: expert batch submit, optionally followed by the
         // GPU residual-tail submit. Falls back to per-expert CPU path if
@@ -408,6 +415,7 @@ pub fn forwardOne(
                 .x_buf_current = x_current_in_gpu_shared_vec,
                 .x_vram_current = x_current_in_gpu_vram,
                 .dense_buf_current = dense_current_in_gpu_out_buf,
+                .download_x = !leave_final_x_on_gpu,
             } else null)
         else
             error.ExpertNotOnGpu;
@@ -415,6 +423,9 @@ pub fn forwardOne(
         if (expert_gpu_ok) |_| {
             if (use_moe_vram_tail) {
                 moe_residual_done_on_gpu = true;
+                if (leave_final_x_on_gpu) {
+                    final_logits_input = if (x_current_in_gpu_vram) .x_vram else .shared_vec;
+                }
             }
         } else |_| {
             if (dense_current_in_gpu_out_buf) {
@@ -462,8 +473,8 @@ pub fn forwardOne(
 
     const logits = try allocator.alloc(f32, cfg.vocab_size);
     const final_logits_on_gpu = if (gpu) |g| blk: {
-        g.runFinalLogitsQ8_1(cfg.eps, cfg.logit_softcap, w.lm_head.type_, x, logits) catch |err| switch (err) {
-            error.NotOnGpu => break :blk false,
+        g.runFinalLogitsQ8_1(cfg.eps, cfg.logit_softcap, w.lm_head.type_, x, final_logits_input, logits) catch |err| switch (err) {
+            error.NotOnGpu => if (final_logits_input == .cpu) break :blk false else return err,
             else => return err,
         };
         break :blk true;

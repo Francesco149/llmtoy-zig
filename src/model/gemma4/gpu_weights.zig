@@ -95,6 +95,13 @@ pub const MoeTailParams = struct {
     x_buf_current: bool,
     x_vram_current: bool,
     dense_buf_current: bool,
+    download_x: bool = true,
+};
+
+pub const FinalLogitsInput = enum {
+    cpu,
+    shared_vec,
+    x_vram,
 };
 
 pub const GpuWeights = struct {
@@ -227,6 +234,7 @@ pub const GpuWeights = struct {
     // share the same lifetime path.
     pending_gpu_batch: ?GpuCtx.PendingBatch,
     final_out_norm_dset: ?vk.VkDescriptorSet,
+    final_out_norm_x_vram_dset: ?vk.VkDescriptorSet,
     final_quant_dset: ?vk.VkDescriptorSet,
     final_lm_head_dset: ?vk.VkDescriptorSet,
     final_lm_head_dset_type: GgmlType,
@@ -488,6 +496,7 @@ pub const GpuWeights = struct {
             .expert_reuse_cmds = null,
             .pending_gpu_batch = null,
             .final_out_norm_dset = null,
+            .final_out_norm_x_vram_dset = null,
             .final_quant_dset = null,
             .final_lm_head_dset = null,
             .final_lm_head_dset_type = .f32,
@@ -888,6 +897,10 @@ pub const GpuWeights = struct {
             var tmp = set;
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
         }
+        if (self.final_out_norm_x_vram_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
+        }
         if (self.moe_tail_scale_dset) |set| {
             var tmp = set;
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_elem_scale.desc_pool, 1, &tmp);
@@ -1180,12 +1193,17 @@ pub const GpuWeights = struct {
     // Final decode head: rmsnorm(x, out_norm) -> Q8_1 -> lm_head in one submit.
     // This removes the CPU out_norm pass and avoids routing the final head
     // through the generic mv() helper's separate upload/submit shape.
+    pub fn canRunFinalLogitsQ8_1(self: *const GpuWeights, head_type: GgmlType) bool {
+        return self.lm_head != null and self.out_norm_buf != null and self.q8_1PipelineFor(head_type) != null;
+    }
+
     pub fn runFinalLogitsQ8_1(
         self: *GpuWeights,
         eps: f32,
         logit_softcap: f32,
         head_type: GgmlType,
         x: []const f32,
+        input: FinalLogitsInput,
         logits: []f32,
     ) !void {
         const sess = &(self.lm_head orelse return error.NotOnGpu);
@@ -1195,18 +1213,33 @@ pub const GpuWeights = struct {
         std.debug.assert(sess.rows == logits.len);
         std.debug.assert(sess.cols % 256 == 0);
 
-        const vec_buf = &self.shared_vec.?;
+        const vec_buf = switch (input) {
+            .cpu, .shared_vec => &self.shared_vec.?,
+            .x_vram => &(self.x_vram orelse return error.NotOnGpu),
+        };
         const xb_buf = &(self.xb_vram orelse return error.NotOnGpu);
         const acts_buf = &self.shared_acts_q8_1.?;
         const out_buf = &self.shared_out.?;
 
-        try vec_buf.upload(std.mem.sliceAsBytes(x));
+        if (input == .cpu) {
+            try vec_buf.upload(std.mem.sliceAsBytes(x));
+        }
 
         const cmd = try self.ctx.beginBatch();
         const p_norm = self.ctx.profileBegin(cmd, "final.out_norm");
-        if (self.final_out_norm_dset == null)
-            self.final_out_norm_dset = try self.pl_rmsnorm.allocSet(vec_buf, norm_buf, xb_buf);
-        self.pl_rmsnorm.recordWithSet(cmd, self.final_out_norm_dset.?, @intCast(sess.cols), eps, false);
+        const norm_dset = switch (input) {
+            .cpu, .shared_vec => blk: {
+                if (self.final_out_norm_dset == null)
+                    self.final_out_norm_dset = try self.pl_rmsnorm.allocSet(vec_buf, norm_buf, xb_buf);
+                break :blk self.final_out_norm_dset.?;
+            },
+            .x_vram => blk: {
+                if (self.final_out_norm_x_vram_dset == null)
+                    self.final_out_norm_x_vram_dset = try self.pl_rmsnorm.allocSet(vec_buf, norm_buf, xb_buf);
+                break :blk self.final_out_norm_x_vram_dset.?;
+            },
+        };
+        self.pl_rmsnorm.recordWithSet(cmd, norm_dset, @intCast(sess.cols), eps, false);
         self.ctx.profileEnd(cmd, p_norm);
         GpuCtx.recordShaderBarrier(cmd);
 
@@ -2445,7 +2478,7 @@ pub const GpuWeights = struct {
         if (tail) |tp| {
             GpuCtx.recordShaderBarrier(cmd);
             try self.recordMoeResidualTail(cmd, layer, tp.eps, tp.x.len, tp.layer_output_scale, tp.x_vram_current);
-            if (tp.x_vram_current) {
+            if (tp.download_x and tp.x_vram_current) {
                 const stage = &(self.stage_buf orelse return error.ExpertNotOnGpu);
                 const x_vram = &(self.x_vram orelse return error.ExpertNotOnGpu);
                 GpuCtx.recordShaderToTransferBarrier(cmd);
@@ -2519,7 +2552,10 @@ pub const GpuWeights = struct {
             }
         }
         if (tail) |tp| {
-            if (tp.x_vram_current) {
+            if (!tp.download_x) {
+                // Final-layer fast path leaves x in the selected GPU buffer for
+                // runFinalLogitsQ8_1().
+            } else if (tp.x_vram_current) {
                 const stage = &(self.stage_buf orelse return error.ExpertNotOnGpu);
                 try stage.download(std.mem.sliceAsBytes(tp.x));
             } else {
