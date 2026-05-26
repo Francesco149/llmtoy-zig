@@ -212,7 +212,7 @@ pub fn forwardOne(
                 null;
             const k_readback: ?[]f32 = if (attn_cpu_kv_shadow) k_cur else null;
             const v_readback: ?[]f32 = if (attn_cpu_kv_shadow) v_cur else null;
-            try g.runLayerAttnQ8_1KvVram(l, cfg.eps, wq_q8_pl, wk_q8_pl, wv_q8_pl, @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd), @intCast(pos), is_swa, cfg.rope_theta_swa, @intCast(kv_slot_l), x, null, k_readback, v_readback);
+            try g.runLayerAttnQ8_1KvVram(l, cfg.eps, lw.wq.type_, wq_q8_pl, lw.wk.type_, wk_q8_pl, if (lw.wv) |wv| wv.type_ else null, wv_q8_pl, @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd), @intCast(pos), is_swa, cfg.rope_theta_swa, @intCast(kv_slot_l), x, null, k_readback, v_readback);
             gpu_did_norms_and_rope = true;
         } else if (can_q8_1_qkv) {
             const g = gpu.?;

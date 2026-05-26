@@ -249,17 +249,19 @@ pub const MatvecPipeline = struct {
         try ctx.createComputePipeline(&pipeline_ci, &pipeline);
         errdefer vk.vkDestroyPipeline(dev, pipeline, null);
 
-        // 64 sets: enough for one-shot run() (1 set) and batched record() (up to 16
-        // gate+up or 8 down dispatches per layer, with room for concurrent calls).
+        // Persistent per-layer graph-shaped paths reuse descriptor sets across
+        // tokens, so each quant pipeline needs room for attention, dense, final,
+        // and occasional transient fallback bindings.
+        const max_sets = 256;
         const pool_size = vk.VkDescriptorPoolSize{
             .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = 3 * 64,
+            .descriptorCount = 3 * max_sets,
         };
         const pool_ci = vk.VkDescriptorPoolCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .pNext = null,
             .flags = vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = 64,
+            .maxSets = max_sets,
             .poolSizeCount = 1,
             .pPoolSizes = &pool_size,
         };

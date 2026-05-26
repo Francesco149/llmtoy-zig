@@ -250,6 +250,12 @@ pub const GpuWeights = struct {
     attn_front_rope_table_k_dset: ?vk.VkDescriptorSet,
     attn_front_rope_theta_q_dset: ?vk.VkDescriptorSet,
     attn_front_rope_theta_k_dset: ?vk.VkDescriptorSet,
+    attn_front_wq_dsets: ?[]?vk.VkDescriptorSet,
+    attn_front_wq_dset_type: ?[]GgmlType,
+    attn_front_wk_dsets: ?[]?vk.VkDescriptorSet,
+    attn_front_wk_dset_type: ?[]GgmlType,
+    attn_front_wv_dsets: ?[]?vk.VkDescriptorSet,
+    attn_front_wv_dset_type: ?[]GgmlType,
     attention_fused_small_dsets: ?[]?vk.VkDescriptorSet,
     attention_qk_dsets: ?[]?vk.VkDescriptorSet,
     attention_av_dsets: ?[]?vk.VkDescriptorSet,
@@ -546,6 +552,12 @@ pub const GpuWeights = struct {
             .attn_front_rope_table_k_dset = null,
             .attn_front_rope_theta_q_dset = null,
             .attn_front_rope_theta_k_dset = null,
+            .attn_front_wq_dsets = null,
+            .attn_front_wq_dset_type = null,
+            .attn_front_wk_dsets = null,
+            .attn_front_wk_dset_type = null,
+            .attn_front_wv_dsets = null,
+            .attn_front_wv_dset_type = null,
             .attention_fused_small_dsets = null,
             .attention_qk_dsets = null,
             .attention_av_dsets = null,
@@ -1026,6 +1038,15 @@ pub const GpuWeights = struct {
             };
             self.allocator.free(sets);
         }
+        self.freeMatvecDsetArray(self.attn_front_wv_dsets, self.attn_front_wv_dset_type, null);
+        if (self.attn_front_wv_dsets) |sets| self.allocator.free(sets);
+        if (self.attn_front_wv_dset_type) |types| self.allocator.free(types);
+        self.freeMatvecDsetArray(self.attn_front_wk_dsets, self.attn_front_wk_dset_type, null);
+        if (self.attn_front_wk_dsets) |sets| self.allocator.free(sets);
+        if (self.attn_front_wk_dset_type) |types| self.allocator.free(types);
+        self.freeMatvecDsetArray(self.attn_front_wq_dsets, self.attn_front_wq_dset_type, null);
+        if (self.attn_front_wq_dsets) |sets| self.allocator.free(sets);
+        if (self.attn_front_wq_dset_type) |types| self.allocator.free(types);
         if (self.attention_av_dsets) |sets| {
             for (sets) |*ds| if (ds.*) |set| {
                 var tmp = set;
@@ -1648,8 +1669,11 @@ pub const GpuWeights = struct {
         self: *GpuWeights,
         layer: usize,
         eps: f32,
+        wq_type: GgmlType,
         wq_pl: *const MatvecPipeline,
+        wk_type: GgmlType,
         wk_pl: *const MatvecPipeline,
+        wv_type: ?GgmlType,
         wv_pl: ?*const MatvecPipeline,
         n_heads: u32,
         n_kv_heads: u32,
@@ -1709,17 +1733,21 @@ pub const GpuWeights = struct {
 
         // ── 3. QKV matvecs (parallel; share acts read)
         const p_q = self.ctx.profileBegin(cmd, "attn_front.wq");
-        const q_mv_dset = try wq_pl.record(cmd, &wq.mat_buf, acts_buf, q_buf, wq.rows, wq.cols);
+        const q_mv_dset = try self.denseFullMatvecSet(&self.attn_front_wq_dsets, &self.attn_front_wq_dset_type, null, layer, wq_type, true, wq_pl, &wq.mat_buf, acts_buf, q_buf);
+        wq_pl.recordWithSet(cmd, q_mv_dset, wq.rows, wq.cols);
         self.ctx.profileEnd(cmd, p_q);
         const p_k = self.ctx.profileBegin(cmd, "attn_front.wk");
-        const k_mv_dset = try wk_pl.record(cmd, &wk.mat_buf, acts_buf, k_buf, wk.rows, wk.cols);
+        const k_mv_dset = try self.denseFullMatvecSet(&self.attn_front_wk_dsets, &self.attn_front_wk_dset_type, null, layer, wk_type, true, wk_pl, &wk.mat_buf, acts_buf, k_buf);
+        wk_pl.recordWithSet(cmd, k_mv_dset, wk.rows, wk.cols);
         self.ctx.profileEnd(cmd, p_k);
         var v_mv_dset: ?vk.VkDescriptorSet = null;
         if (wv_pl) |vpl| {
             const wv = lw.wv orelse return error.NotOnGpu;
             std.debug.assert(wq.cols == wv.cols);
             const p_v = self.ctx.profileBegin(cmd, "attn_front.wv");
-            v_mv_dset = try vpl.record(cmd, &wv.mat_buf, acts_buf, v_buf, wv.rows, wv.cols);
+            const v_type = wv_type orelse return error.NoQ8_1Pipeline;
+            v_mv_dset = try self.denseFullMatvecSet(&self.attn_front_wv_dsets, &self.attn_front_wv_dset_type, null, layer, v_type, true, vpl, &wv.mat_buf, acts_buf, v_buf);
+            vpl.recordWithSet(cmd, v_mv_dset.?, wv.rows, wv.cols);
             self.ctx.profileEnd(cmd, p_v);
             GpuCtx.recordShaderBarrier(cmd);
         } else {
@@ -1786,20 +1814,7 @@ pub const GpuWeights = struct {
         GpuCtx.recordCopyRegion(cmd, v_buf.handle, v_cache.handle, 0, slot_offset, slot_bytes);
         self.ctx.profileEnd(cmd, p_v_copy);
 
-        var descriptor_frees: [gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree = undefined;
-        var descriptor_free_count: usize = 0;
-        try self.collectRunLayerAttnFrontDescriptorFrees(
-            &descriptor_frees,
-            &descriptor_free_count,
-            wq_pl,
-            wk_pl,
-            wv_pl,
-            q_mv_dset,
-            k_mv_dset,
-            v_mv_dset,
-        );
-
-        try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
+        try self.ctx.submitBatch(cmd);
 
         if (q_out) |q| try self.downloadSmallDeviceBuffer(q_buf, std.mem.sliceAsBytes(q));
         if (k_out) |k| try self.downloadSmallDeviceBuffer(k_buf, std.mem.sliceAsBytes(k));
