@@ -330,6 +330,17 @@ pub const MatvecPipeline = struct {
         vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
     }
 
+    pub fn allocSet(
+        self: *const MatvecPipeline,
+        mat_buf: *const GpuBuffer,
+        vec_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        const dset = try self.allocDescriptorSet();
+        self.updateDescriptorSet(dset, mat_buf, vec_buf, out_buf);
+        return dset;
+    }
+
     pub fn recordDescriptor(
         self: *const MatvecPipeline,
         cmd: vk.VkCommandBuffer,
@@ -345,6 +356,16 @@ pub const MatvecPipeline = struct {
 
         const groups = (rows + self.rows_per_workgroup - 1) / self.rows_per_workgroup;
         vk.vkCmdDispatch(cmd, groups, 1, 1);
+    }
+
+    pub fn recordWithSet(
+        self: *const MatvecPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        rows: u32,
+        cols: u32,
+    ) void {
+        self.recordDescriptor(cmd, dset, rows, cols);
     }
 
     pub fn freeDescriptorSet(self: *const MatvecPipeline, dset: *vk.VkDescriptorSet) void {

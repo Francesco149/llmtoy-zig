@@ -254,12 +254,21 @@ pub const GpuWeights = struct {
     attention_qk_dsets: ?[]?vk.VkDescriptorSet,
     attention_av_dsets: ?[]?vk.VkDescriptorSet,
     dense_full_wo_quant_dset: ?vk.VkDescriptorSet,
+    dense_full_wo_dsets: ?[]?vk.VkDescriptorSet,
+    dense_full_wo_dset_type: ?[]GgmlType,
     dense_full_post_attn_dsets: ?[]?vk.VkDescriptorSet,
     dense_full_residual_add_dset: ?vk.VkDescriptorSet,
     dense_full_ffn_norm_dsets: ?[]?vk.VkDescriptorSet,
     dense_full_ffn_quant_dset: ?vk.VkDescriptorSet,
+    dense_full_gate_dsets: ?[]?vk.VkDescriptorSet,
+    dense_full_gate_dset_type: ?[]GgmlType,
+    dense_full_up_dsets: ?[]?vk.VkDescriptorSet,
+    dense_full_up_dset_type: ?[]GgmlType,
     dense_full_gelu_dset: ?vk.VkDescriptorSet,
     dense_full_down_quant_dset: ?vk.VkDescriptorSet,
+    dense_full_down_dsets: ?[]?vk.VkDescriptorSet,
+    dense_full_down_dset_type: ?[]GgmlType,
+    dense_full_down_dset_q8_1: ?[]bool,
     dense_full_post_ffw_dsets: ?[]?vk.VkDescriptorSet,
     moe_tail_moe_norm_dsets: ?[]?vk.VkDescriptorSet,
     moe_tail_post_ffw_dsets: ?[]?vk.VkDescriptorSet,
@@ -541,12 +550,21 @@ pub const GpuWeights = struct {
             .attention_qk_dsets = null,
             .attention_av_dsets = null,
             .dense_full_wo_quant_dset = null,
+            .dense_full_wo_dsets = null,
+            .dense_full_wo_dset_type = null,
             .dense_full_post_attn_dsets = null,
             .dense_full_residual_add_dset = null,
             .dense_full_ffn_norm_dsets = null,
             .dense_full_ffn_quant_dset = null,
+            .dense_full_gate_dsets = null,
+            .dense_full_gate_dset_type = null,
+            .dense_full_up_dsets = null,
+            .dense_full_up_dset_type = null,
             .dense_full_gelu_dset = null,
             .dense_full_down_quant_dset = null,
+            .dense_full_down_dsets = null,
+            .dense_full_down_dset_type = null,
+            .dense_full_down_dset_q8_1 = null,
             .dense_full_post_ffw_dsets = null,
             .moe_tail_moe_norm_dsets = null,
             .moe_tail_post_ffw_dsets = null,
@@ -1070,6 +1088,19 @@ pub const GpuWeights = struct {
             var tmp = set;
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, &tmp);
         }
+        self.freeMatvecDsetArray(self.dense_full_down_dsets, self.dense_full_down_dset_type, self.dense_full_down_dset_q8_1);
+        if (self.dense_full_down_dsets) |sets| self.allocator.free(sets);
+        if (self.dense_full_down_dset_type) |types| self.allocator.free(types);
+        if (self.dense_full_down_dset_q8_1) |flags| self.allocator.free(flags);
+        self.freeMatvecDsetArray(self.dense_full_up_dsets, self.dense_full_up_dset_type, null);
+        if (self.dense_full_up_dsets) |sets| self.allocator.free(sets);
+        if (self.dense_full_up_dset_type) |types| self.allocator.free(types);
+        self.freeMatvecDsetArray(self.dense_full_gate_dsets, self.dense_full_gate_dset_type, null);
+        if (self.dense_full_gate_dsets) |sets| self.allocator.free(sets);
+        if (self.dense_full_gate_dset_type) |types| self.allocator.free(types);
+        self.freeMatvecDsetArray(self.dense_full_wo_dsets, self.dense_full_wo_dset_type, null);
+        if (self.dense_full_wo_dsets) |sets| self.allocator.free(sets);
+        if (self.dense_full_wo_dset_type) |types| self.allocator.free(types);
         if (self.moe_tail_scale_dset) |set| {
             var tmp = set;
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_elem_scale.desc_pool, 1, &tmp);
@@ -2166,9 +2197,13 @@ pub const GpuWeights = struct {
         self: *GpuWeights,
         layer: usize,
         eps: f32,
+        wo_type: GgmlType,
         wo_pl: *const MatvecPipeline, // Q8_1 pipeline for wo
+        gate_type: GgmlType,
         gate_pl: *const MatvecPipeline, // Q8_1 pipeline for w_gate
+        up_type: GgmlType,
         up_pl: *const MatvecPipeline, // Q8_1 pipeline for w_up
+        down_type: GgmlType,
         down_pl: *const MatvecPipeline, // f32-acts pipeline for w_down
         down_q8_pl: ?*const MatvecPipeline, // Q8_1 pipeline for w_down when available
         x: []f32, // in: unnormalized residual; out: x + post_attn_norm(wo(attn_concat))
@@ -2222,7 +2257,8 @@ pub const GpuWeights = struct {
         self.ctx.profileEnd(cmd, p_wo_quant);
         GpuCtx.recordShaderBarrier(cmd);
         const p_wo = self.ctx.profileBegin(cmd, "post_attn.wo");
-        const wo_dset = try wo_pl.record(cmd, &wo.mat_buf, acts_buf, attn_vram, wo.rows, wo.cols);
+        const wo_dset = try self.denseFullMatvecSet(&self.dense_full_wo_dsets, &self.dense_full_wo_dset_type, null, layer, wo_type, true, wo_pl, &wo.mat_buf, acts_buf, attn_vram);
+        wo_pl.recordWithSet(cmd, wo_dset, wo.rows, wo.cols);
         self.ctx.profileEnd(cmd, p_wo);
         GpuCtx.recordShaderBarrier(cmd);
 
@@ -2258,10 +2294,12 @@ pub const GpuWeights = struct {
         GpuCtx.recordShaderBarrier(cmd);
 
         const p_gate = self.ctx.profileBegin(cmd, "dense_ffn.gate");
-        const gate_dset = try gate_pl.record(cmd, &w_gate.mat_buf, acts_buf, gate_buf, w_gate.rows, w_gate.cols);
+        const gate_dset = try self.denseFullMatvecSet(&self.dense_full_gate_dsets, &self.dense_full_gate_dset_type, null, layer, gate_type, true, gate_pl, &w_gate.mat_buf, acts_buf, gate_buf);
+        gate_pl.recordWithSet(cmd, gate_dset, w_gate.rows, w_gate.cols);
         self.ctx.profileEnd(cmd, p_gate);
         const p_up = self.ctx.profileBegin(cmd, "dense_ffn.up");
-        const up_dset = try up_pl.record(cmd, &w_up.mat_buf, acts_buf, up_buf, w_up.rows, w_up.cols);
+        const up_dset = try self.denseFullMatvecSet(&self.dense_full_up_dsets, &self.dense_full_up_dset_type, null, layer, up_type, true, up_pl, &w_up.mat_buf, acts_buf, up_buf);
+        up_pl.recordWithSet(cmd, up_dset, w_up.rows, w_up.cols);
         self.ctx.profileEnd(cmd, p_up);
         GpuCtx.recordShaderBarrier(cmd);
 
@@ -2280,9 +2318,13 @@ pub const GpuWeights = struct {
                     self.dense_full_down_quant_dset = try self.pl_quantize_q8_1.allocSet(gate_buf, acts_buf);
                 self.pl_quantize_q8_1.recordWithSet(cmd, self.dense_full_down_quant_dset.?, w_down.cols);
                 GpuCtx.recordShaderBarrier(cmd);
-                break :blk try down_q8_pl.?.record(cmd, &w_down.mat_buf, acts_buf, ffn_buf, w_down.rows, w_down.cols);
+                const dset = try self.denseFullMatvecSet(&self.dense_full_down_dsets, &self.dense_full_down_dset_type, &self.dense_full_down_dset_q8_1, layer, down_type, true, down_q8_pl.?, &w_down.mat_buf, acts_buf, ffn_buf);
+                down_q8_pl.?.recordWithSet(cmd, dset, w_down.rows, w_down.cols);
+                break :blk dset;
             }
-            break :blk try down_pl.record(cmd, &w_down.mat_buf, gate_buf, ffn_buf, w_down.rows, w_down.cols);
+            const dset = try self.denseFullMatvecSet(&self.dense_full_down_dsets, &self.dense_full_down_dset_type, &self.dense_full_down_dset_q8_1, layer, down_type, false, down_pl, &w_down.mat_buf, gate_buf, ffn_buf);
+            down_pl.recordWithSet(cmd, dset, w_down.rows, w_down.cols);
+            break :blk dset;
         };
         self.ctx.profileEnd(cmd, p_down);
         GpuCtx.recordShaderBarrier(cmd);
@@ -2294,22 +2336,8 @@ pub const GpuWeights = struct {
         GpuCtx.recordShaderToTransferBarrier(cmd);
         GpuCtx.recordCopy(cmd, x_buf.handle, stage_buf.handle, x.len * @sizeOf(f32));
 
-        var descriptor_frees: [gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree = undefined;
-        var descriptor_free_count: usize = 0;
-        try self.collectRunLayerAttnResidualDenseFfnDescriptorFrees(
-            &descriptor_frees,
-            &descriptor_free_count,
-            wo_pl,
-            gate_pl,
-            up_pl,
-            if (use_down_q8) down_q8_pl.? else down_pl,
-            wo_dset,
-            gate_dset,
-            up_dset,
-            down_dset,
-        );
-
-        try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
+        _ = down_dset;
+        try self.ctx.submitBatch(cmd);
 
         if (ffn_out) |out| {
             try self.downloadSmallDeviceBuffer(out_buf, std.mem.sliceAsBytes(out));
@@ -3170,6 +3198,66 @@ pub const GpuWeights = struct {
         if (sets[layer] == null)
             sets[layer] = try self.pl_rmsnorm.allocSet(x_buf, w_buf, y_buf);
         return sets[layer].?;
+    }
+
+    fn denseFullMatvecSet(
+        self: *GpuWeights,
+        sets_opt: *?[]?vk.VkDescriptorSet,
+        types_opt: *?[]GgmlType,
+        q8_flags_opt: ?*?[]bool,
+        layer: usize,
+        matrix_type: GgmlType,
+        use_q8_1: bool,
+        pipeline: *const MatvecPipeline,
+        mat_buf: *const GpuBuffer,
+        vec_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        if (sets_opt.* == null) {
+            sets_opt.* = try self.allocator.alloc(?vk.VkDescriptorSet, self.layers.len);
+            @memset(sets_opt.*.?, null);
+        }
+        if (types_opt.* == null)
+            types_opt.* = try self.allocator.alloc(GgmlType, self.layers.len);
+        if (q8_flags_opt) |flags_opt| {
+            if (flags_opt.* == null)
+                flags_opt.* = try self.allocator.alloc(bool, self.layers.len);
+        }
+
+        const sets = sets_opt.*.?;
+        const types = types_opt.*.?;
+        const q8_flags = if (q8_flags_opt) |flags_opt| flags_opt.*.? else null;
+        if (sets[layer] == null) {
+            sets[layer] = try pipeline.allocSet(mat_buf, vec_buf, out_buf);
+            types[layer] = matrix_type;
+            if (q8_flags) |flags| flags[layer] = use_q8_1;
+        } else {
+            std.debug.assert(types[layer] == matrix_type);
+            if (q8_flags) |flags| std.debug.assert(flags[layer] == use_q8_1);
+        }
+        return sets[layer].?;
+    }
+
+    fn freeMatvecDsetArray(
+        self: *GpuWeights,
+        sets_opt: ?[]?vk.VkDescriptorSet,
+        types_opt: ?[]GgmlType,
+        q8_flags_opt: ?[]bool,
+    ) void {
+        const sets = sets_opt orelse return;
+        const types = types_opt orelse return;
+        for (sets, 0..) |set_opt, i| {
+            const set = set_opt orelse continue;
+            const pl = if (q8_flags_opt) |flags|
+                if (flags[i])
+                    self.q8_1PipelineFor(types[i]) orelse continue
+                else
+                    self.pipelineFor(types[i])
+            else
+                self.q8_1PipelineFor(types[i]) orelse continue;
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, pl.desc_pool, 1, &tmp);
+        }
     }
 
     fn moeTailRmsnormSet(
