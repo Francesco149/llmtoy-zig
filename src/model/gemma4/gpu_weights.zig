@@ -250,6 +250,9 @@ pub const GpuWeights = struct {
     attn_front_rope_table_k_dset: ?vk.VkDescriptorSet,
     attn_front_rope_theta_q_dset: ?vk.VkDescriptorSet,
     attn_front_rope_theta_k_dset: ?vk.VkDescriptorSet,
+    attention_fused_small_dsets: ?[]?vk.VkDescriptorSet,
+    attention_qk_dsets: ?[]?vk.VkDescriptorSet,
+    attention_av_dsets: ?[]?vk.VkDescriptorSet,
     dense_full_wo_quant_dset: ?vk.VkDescriptorSet,
     dense_full_post_attn_dsets: ?[]?vk.VkDescriptorSet,
     dense_full_residual_add_dset: ?vk.VkDescriptorSet,
@@ -534,6 +537,9 @@ pub const GpuWeights = struct {
             .attn_front_rope_table_k_dset = null,
             .attn_front_rope_theta_q_dset = null,
             .attn_front_rope_theta_k_dset = null,
+            .attention_fused_small_dsets = null,
+            .attention_qk_dsets = null,
+            .attention_av_dsets = null,
             .dense_full_wo_quant_dset = null,
             .dense_full_post_attn_dsets = null,
             .dense_full_residual_add_dset = null,
@@ -860,12 +866,25 @@ pub const GpuWeights = struct {
         const scores_bytes = cfg.n_heads * max_cap * @sizeOf(f32);
         const scores = try GpuBuffer.initDeviceLocal(&self.ctx, scores_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
+        const fused_sets = try self.allocator.alloc(?vk.VkDescriptorSet, n_layers);
+        errdefer self.allocator.free(fused_sets);
+        @memset(fused_sets, null);
+        const qk_sets = try self.allocator.alloc(?vk.VkDescriptorSet, n_layers);
+        errdefer self.allocator.free(qk_sets);
+        @memset(qk_sets, null);
+        const av_sets = try self.allocator.alloc(?vk.VkDescriptorSet, n_layers);
+        errdefer self.allocator.free(av_sets);
+        @memset(av_sets, null);
+
         self.k_vram = k;
         self.v_vram = v;
         self.kv_cap = cap;
         self.kv_stage = stage;
         self.scores_vram = scores;
         self.attn_max_win = max_cap;
+        self.attention_fused_small_dsets = fused_sets;
+        self.attention_qk_dsets = qk_sets;
+        self.attention_av_dsets = av_sets;
 
         std.debug.print("  KV VRAM: total={} MiB, stage={} KiB, scores={} KiB\n", .{ total_bytes / (1024 * 1024), (max_nkv * @sizeOf(f32)) / 1024, scores_bytes / 1024 });
     }
@@ -986,6 +1005,27 @@ pub const GpuWeights = struct {
             for (sets) |*ds| if (ds.*) |set| {
                 var tmp = set;
                 _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
+        if (self.attention_av_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_attn_av.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
+        if (self.attention_qk_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_attn_qk.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
+        if (self.attention_fused_small_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_attn_fused_small.desc_pool, 1, &tmp);
             };
             self.allocator.free(sets);
         }
@@ -1781,45 +1821,72 @@ pub const GpuWeights = struct {
             true;
 
         const cmd = try self.ctx.beginBatch();
-        var qk_dset: ?vk.VkDescriptorSet = null;
-        var av_dset: ?vk.VkDescriptorSet = null;
-        var fused_dset: ?vk.VkDescriptorSet = null;
         if (use_fused_small) {
             const p_fused = self.ctx.profileBegin(cmd, "attention.fused_small");
-            fused_dset = try self.pl_attn_fused_small.record(cmd, q_buf, k_cache, v_cache, attn_buf, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
+            const fused_dset = try self.attentionFusedSmallSet(layer, q_buf, k_cache, v_cache, attn_buf);
+            self.pl_attn_fused_small.recordWithSet(cmd, fused_dset, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
             self.ctx.profileEnd(cmd, p_fused);
         } else {
             const p_qk = self.ctx.profileBegin(cmd, "attention.qk_softmax");
-            qk_dset = try self.pl_attn_qk.record(cmd, q_buf, k_cache, scores_buf, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
+            const qk_dset = try self.attentionQkSet(layer, q_buf, k_cache, scores_buf);
+            self.pl_attn_qk.recordWithSet(cmd, qk_dset, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
             self.ctx.profileEnd(cmd, p_qk);
             GpuCtx.recordShaderBarrier(cmd);
             const p_av = self.ctx.profileBegin(cmd, "attention.av");
-            av_dset = try self.pl_attn_av.record(cmd, scores_buf, v_cache, attn_buf, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap);
+            const av_dset = try self.attentionAvSet(layer, scores_buf, v_cache, attn_buf);
+            self.pl_attn_av.recordWithSet(cmd, av_dset, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap);
             self.ctx.profileEnd(cmd, p_av);
         }
-        var descriptor_frees: [gpu_context_mod.max_deferred_descriptor_frees]GpuCtx.DeferredDescriptorFree = undefined;
-        var descriptor_free_count: usize = 0;
-        try self.collectRunLayerAttentionDescriptorFrees(
-            &descriptor_frees,
-            &descriptor_free_count,
-            fused_dset,
-            qk_dset,
-            av_dset,
-        );
 
         const async_attention = async_attention_enabled and attn_out == null and self.ctx.profiler == null and self.pending_gpu_batch == null;
         if (async_attention) {
-            var async_submit_succeeded = false;
-            errdefer if (!async_submit_succeeded)
-                self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
-            self.pending_gpu_batch = try self.ctx.submitBatchAsyncWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
-            async_submit_succeeded = true;
+            self.pending_gpu_batch = try self.ctx.submitBatchAsync(cmd);
         } else {
-            try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
+            try self.ctx.submitBatch(cmd);
             if (attn_out) |o| {
                 try attn_buf.download(std.mem.sliceAsBytes(o));
             }
         }
+    }
+
+    fn attentionFusedSmallSet(
+        self: *GpuWeights,
+        layer: usize,
+        q_buf: *const GpuBuffer,
+        k_cache: *const GpuBuffer,
+        v_cache: *const GpuBuffer,
+        attn_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        const sets = self.attention_fused_small_dsets orelse return error.NotOnGpu;
+        if (sets[layer] == null)
+            sets[layer] = try self.pl_attn_fused_small.allocSet(q_buf, k_cache, v_cache, attn_buf);
+        return sets[layer].?;
+    }
+
+    fn attentionQkSet(
+        self: *GpuWeights,
+        layer: usize,
+        q_buf: *const GpuBuffer,
+        k_cache: *const GpuBuffer,
+        scores_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        const sets = self.attention_qk_dsets orelse return error.NotOnGpu;
+        if (sets[layer] == null)
+            sets[layer] = try self.pl_attn_qk.allocSet(q_buf, k_cache, scores_buf);
+        return sets[layer].?;
+    }
+
+    fn attentionAvSet(
+        self: *GpuWeights,
+        layer: usize,
+        scores_buf: *const GpuBuffer,
+        v_cache: *const GpuBuffer,
+        attn_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        const sets = self.attention_av_dsets orelse return error.NotOnGpu;
+        if (sets[layer] == null)
+            sets[layer] = try self.pl_attn_av.allocSet(scores_buf, v_cache, attn_buf);
+        return sets[layer].?;
     }
 
     // Pipeline for the Q8_1-activation integer-dot path. Returns null when

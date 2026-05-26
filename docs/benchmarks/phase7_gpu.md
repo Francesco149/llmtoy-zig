@@ -9,6 +9,30 @@ describe the code as it existed at that point and can be stale as architecture
 documentation. Use `docs/phases/phase7-gpu-vulkan.md` as the current GPU
 architecture and endgame plan.
 
+## Phase 7 descriptor cleanup - attention path
+
+The production attention submit now reuses persistent per-layer descriptor sets
+for `attention.fused_small` and for the fallback two-pass
+`attention.qk_softmax`/`attention.av` path. The bound buffers are stable after
+KV VRAM initialization, so only push constants need to vary per token. This
+removes attention descriptor allocate/update/free churn and lets the async
+attention path submit without a deferred descriptor-free list.
+
+Validation:
+
+- `nix develop --command zig build`
+- `nix develop --command zig build test --summary all`: 142/142 tests passed
+- `llmtoy compare ... "explain MoE" --chat`: all layer argmaxes match, final
+  argmax `1852` matches
+
+Profiled short run with `LLMTOY_GPU_PROFILE=1`, same 33-token forward workload:
+
+- setup: 4.21 s
+- prefill: 25 tokens in 0.764 s, 32.70 tok/s
+- generation: 8 tokens in 0.244 s, 32.76 tok/s
+- `attention.fused_small`: 990 calls, 21.67 ms total, 21.89 us avg
+- `GPU batches=3993`, dispatch 361.26 ms, gap 32.88 ms
+
 ## Phase 7m profile snapshot - sorted timestamp table
 
 Command:

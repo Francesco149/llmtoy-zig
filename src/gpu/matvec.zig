@@ -2900,7 +2900,17 @@ pub const AttnQkSoftmaxPipeline = struct {
         cap: u32,
         scale: f32,
     ) !vk.VkDescriptorSet {
-        const dev = self.device;
+        const dset = try self.allocSet(q_buf, k_buf, scores_buf);
+        self.recordWithSet(cmd, dset, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const AttnQkSoftmaxPipeline,
+        q_buf: *const GpuBuffer,
+        k_buf: *const GpuBuffer,
+        scores_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .pNext = null,
@@ -2909,7 +2919,7 @@ pub const AttnQkSoftmaxPipeline = struct {
             .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
-        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
 
         const buf_infos = [3]vk.VkDescriptorBufferInfo{
@@ -2922,8 +2932,23 @@ pub const AttnQkSoftmaxPipeline = struct {
             mkWrite(dset, 1, &buf_infos[1]),
             mkWrite(dset, 2, &buf_infos[2]),
         };
-        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+        vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+        return dset;
+    }
 
+    pub fn recordWithSet(
+        self: *const AttnQkSoftmaxPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        n_heads: u32,
+        seq: u32,
+        win_len: u32,
+        head_dim: u32,
+        n_kv_heads: u32,
+        n_q_per_kv: u32,
+        cap: u32,
+        scale: f32,
+    ) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = AttnQkSoftmaxPushConst{
@@ -2937,7 +2962,6 @@ pub const AttnQkSoftmaxPipeline = struct {
         };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(AttnQkSoftmaxPushConst), &pc);
         vk.vkCmdDispatch(cmd, n_heads, 1, 1);
-        return dset;
     }
 
     pub fn deinit(self: *AttnQkSoftmaxPipeline) void {
@@ -2981,7 +3005,17 @@ pub const AttnAvPipeline = struct {
         n_q_per_kv: u32,
         cap: u32,
     ) !vk.VkDescriptorSet {
-        const dev = self.device;
+        const dset = try self.allocSet(scores_buf, v_buf, out_buf);
+        self.recordWithSet(cmd, dset, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const AttnAvPipeline,
+        scores_buf: *const GpuBuffer,
+        v_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .pNext = null,
@@ -2990,7 +3024,7 @@ pub const AttnAvPipeline = struct {
             .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
-        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
 
         const buf_infos = [3]vk.VkDescriptorBufferInfo{
@@ -3003,8 +3037,22 @@ pub const AttnAvPipeline = struct {
             mkWrite(dset, 1, &buf_infos[1]),
             mkWrite(dset, 2, &buf_infos[2]),
         };
-        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+        vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+        return dset;
+    }
 
+    pub fn recordWithSet(
+        self: *const AttnAvPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        n_heads: u32,
+        seq: u32,
+        win_len: u32,
+        head_dim: u32,
+        n_kv_heads: u32,
+        n_q_per_kv: u32,
+        cap: u32,
+    ) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = AttnAvPushConst{
@@ -3017,7 +3065,6 @@ pub const AttnAvPipeline = struct {
         };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(AttnAvPushConst), &pc);
         vk.vkCmdDispatch(cmd, n_heads, 1, 1);
-        return dset;
     }
 
     pub fn deinit(self: *AttnAvPipeline) void {
@@ -3063,7 +3110,18 @@ pub const AttnFusedSmallPipeline = struct {
         cap: u32,
         scale: f32,
     ) !vk.VkDescriptorSet {
-        const dev = self.device;
+        const dset = try self.allocSet(q_buf, k_buf, v_buf, out_buf);
+        self.recordWithSet(cmd, dset, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
+        return dset;
+    }
+
+    pub fn allocSet(
+        self: *const AttnFusedSmallPipeline,
+        q_buf: *const GpuBuffer,
+        k_buf: *const GpuBuffer,
+        v_buf: *const GpuBuffer,
+        out_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .pNext = null,
@@ -3072,7 +3130,7 @@ pub const AttnFusedSmallPipeline = struct {
             .pSetLayouts = &self.dset_layout,
         };
         var dset: vk.VkDescriptorSet = null;
-        if (vk.vkAllocateDescriptorSets(dev, &alloc_ci, &dset) != vk.VK_SUCCESS)
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
 
         const buf_infos = [4]vk.VkDescriptorBufferInfo{
@@ -3087,8 +3145,23 @@ pub const AttnFusedSmallPipeline = struct {
             mkWrite(dset, 2, &buf_infos[2]),
             mkWrite(dset, 3, &buf_infos[3]),
         };
-        vk.vkUpdateDescriptorSets(dev, writes.len, &writes, 0, null);
+        vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+        return dset;
+    }
 
+    pub fn recordWithSet(
+        self: *const AttnFusedSmallPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        n_heads: u32,
+        seq: u32,
+        win_len: u32,
+        head_dim: u32,
+        n_kv_heads: u32,
+        n_q_per_kv: u32,
+        cap: u32,
+        scale: f32,
+    ) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
         const pc = AttnQkSoftmaxPushConst{
@@ -3102,7 +3175,6 @@ pub const AttnFusedSmallPipeline = struct {
         };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(AttnQkSoftmaxPushConst), &pc);
         vk.vkCmdDispatch(cmd, n_heads, 1, 1);
-        return dset;
     }
 
     pub fn deinit(self: *AttnFusedSmallPipeline) void {
