@@ -4,6 +4,11 @@ Model: Gemma 4 26B A4B (APEX-I-Mini, GGUF)
 Hardware: Ryzen 5900x, 64 GB RAM, AMD RX 7800 XT (16 GB VRAM)
 Prompt: "What is 2+2?" (chat template, --seed 42)
 
+This file is a chronological benchmark log. Older sections intentionally
+describe the code as it existed at that point and can be stale as architecture
+documentation. Use `docs/phases/phase7-gpu-vulkan.md` as the current GPU
+architecture and endgame plan.
+
 ## Phase 7m profile snapshot - sorted timestamp table
 
 Command:
@@ -426,7 +431,7 @@ either, because our CPU reference uses f32 dot product (not Q8_1), so the
 bit-determinism property that lets llama.cpp Vulkan match its CPU reference
 is structurally absent here. Generation output remains coherent.
 
-Verification protocol (all from docs/phases/phase7-gpu-endgame-plan.md):
+Verification protocol (now consolidated in docs/phases/phase7-gpu-vulkan.md):
 - Per-shader fuzz test rel < 1e-3 (Q4_K: 2.9e-5, Q3_K: 1.5e-7 model-sized)
 - `llmtoy compare` argmax matches L0–L27 (same as baseline)
 - End-to-end `generate --gpu --temperature 0` produces correct output

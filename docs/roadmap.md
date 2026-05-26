@@ -64,10 +64,9 @@ Completed steps (Qwen2.5-0.5B Q4_K_M, Ryzen 3600):
 - [x] Q3_K / Q4_K / Q5_0 / Q5_1 / Q8_0 matvec shaders for Gemma4 APEX
 - [x] Gemma4 GPU path with batched MoE expert dispatch (Phase 7a–7f)
 - [x] Benchmark GPU vs CPU on Gemma4 APEX I Mini (`docs/benchmarks/phase7_gpu.md`)
-- [ ] **Endgame plan: `docs/phases/phase7-gpu-endgame-plan.md`** (match/beat llama.cpp)
-  - Phase 7h–7l: correctness harness, Q8_1 activations, GPU norms/RoPE/KV/attention (done; ~4 tok/s)
-  - Phase 7m–7n: GPU timestamp profiler + matvec microbenchmark harness (blocks further serious tuning)
-  - Phase 7o+: faithful llama.cpp MMVQ/MMQ-style matmul kernels, then proven CPU round-trip and submit cleanup
+- [ ] **Vulkan parity plan: `docs/phases/phase7-gpu-vulkan.md`** (match/beat llama.cpp)
+  - Phase 7h–7n: correctness harness, Q8_1 activations, GPU norms/RoPE/KV/attention, timestamp profiler, and matvec/MoE microbenchmarks (done)
+  - Phase 7o+: llama.cpp-shaped MoE/attention/MMVQ/MMQ work, then proven submission/resource-lifetime cleanup
 
 ## Phase 8 — Multimodal (stretch)
 - SigLIP vision encoder (Gemma4 integration)
