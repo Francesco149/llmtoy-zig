@@ -1180,6 +1180,7 @@ fn cmdBenchMoe(
         "moe.fused_gate_up",
         "moe.quantize_mid",
         "moe.down",
+        "moe.down_sum",
         "moe.accum",
         "moe.post_norm",
         "ffn_moe.add_post_norm",

@@ -1441,38 +1441,44 @@ pub const ExpertDownIdPipeline = struct {
     desc_pool: vk.VkDescriptorPool,
     device: vk.VkDevice,
     rows_per_workgroup: u32,
+    dispatch_active_groups: bool,
 
     pub fn initQ5_0Q8_1(ctx: *const GpuContext) !ExpertDownIdPipeline {
         comptime std.debug.assert(shaders.expert_down_id_q5_0_q8_1.len % 4 == 0);
-        return initFromSpv(ctx, &shaders.expert_down_id_q5_0_q8_1, 1);
+        return initFromSpv(ctx, &shaders.expert_down_id_q5_0_q8_1, 1, true);
     }
 
     pub fn initQ5_1Q8_1(ctx: *const GpuContext) !ExpertDownIdPipeline {
         comptime std.debug.assert(shaders.expert_down_id_q5_1_q8_1.len % 4 == 0);
-        return initFromSpv(ctx, &shaders.expert_down_id_q5_1_q8_1, 1);
+        return initFromSpv(ctx, &shaders.expert_down_id_q5_1_q8_1, 1, true);
     }
 
     pub fn initIQ4NLQ8_1(ctx: *const GpuContext) !ExpertDownIdPipeline {
         comptime std.debug.assert(shaders.expert_down_id_iq4_nl_q8_1.len % 4 == 0);
-        return initFromSpv(ctx, &shaders.expert_down_id_iq4_nl_q8_1, 1);
+        return initFromSpv(ctx, &shaders.expert_down_id_iq4_nl_q8_1, 1, true);
     }
 
     pub fn initIQ4NLQ8_1R2(ctx: *const GpuContext) !ExpertDownIdPipeline {
         comptime std.debug.assert(shaders.expert_down_id_iq4_nl_q8_1_r2.len % 4 == 0);
-        return initFromSpv(ctx, &shaders.expert_down_id_iq4_nl_q8_1_r2, 2);
+        return initFromSpv(ctx, &shaders.expert_down_id_iq4_nl_q8_1_r2, 2, true);
     }
 
     pub fn initIQ4NLQ8_1B16(ctx: *const GpuContext) !ExpertDownIdPipeline {
         comptime std.debug.assert(shaders.expert_down_id_iq4_nl_q8_1_b16.len % 4 == 0);
-        return initFromSpv(ctx, &shaders.expert_down_id_iq4_nl_q8_1_b16, 1);
+        return initFromSpv(ctx, &shaders.expert_down_id_iq4_nl_q8_1_b16, 1, true);
     }
 
     pub fn initIQ4NLQ8_1Iacc(ctx: *const GpuContext) !ExpertDownIdPipeline {
         comptime std.debug.assert(shaders.expert_down_id_iq4_nl_q8_1_iacc.len % 4 == 0);
-        return initFromSpv(ctx, &shaders.expert_down_id_iq4_nl_q8_1_iacc, 1);
+        return initFromSpv(ctx, &shaders.expert_down_id_iq4_nl_q8_1_iacc, 1, true);
     }
 
-    fn initFromSpv(ctx: *const GpuContext, spv: anytype, rows_per_workgroup: u32) !ExpertDownIdPipeline {
+    pub fn initIQ4NLQ8_1Sum(ctx: *const GpuContext) !ExpertDownIdPipeline {
+        comptime std.debug.assert(shaders.expert_down_sum_id_iq4_nl_q8_1.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.expert_down_sum_id_iq4_nl_q8_1, 1, false);
+    }
+
+    fn initFromSpv(ctx: *const GpuContext, spv: anytype, rows_per_workgroup: u32, dispatch_active_groups: bool) !ExpertDownIdPipeline {
         const built = try buildSimplePipeline(ctx, spv, 5, @sizeOf(ExpertDownIdPushConst), 64);
         return .{
             .pipeline = built.pipeline,
@@ -1481,6 +1487,7 @@ pub const ExpertDownIdPipeline = struct {
             .desc_pool = built.desc_pool,
             .device = ctx.device,
             .rows_per_workgroup = rows_per_workgroup,
+            .dispatch_active_groups = dispatch_active_groups,
         };
     }
 
@@ -1553,7 +1560,8 @@ pub const ExpertDownIdPipeline = struct {
         const pc = ExpertDownIdPushConst{ .rows = rows, .cols = cols, .n_active = active };
         vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ExpertDownIdPushConst), &pc);
         const groups_x = (rows + self.rows_per_workgroup - 1) / self.rows_per_workgroup;
-        vk.vkCmdDispatch(cmd, groups_x, active, 1);
+        const groups_y = if (self.dispatch_active_groups) active else 1;
+        vk.vkCmdDispatch(cmd, groups_x, groups_y, 1);
     }
 
     pub fn deinit(self: *ExpertDownIdPipeline) void {
@@ -4450,6 +4458,37 @@ test "gpu expert-id down IQ4_NL x Q8_1 fuzz" {
     const rel_iacc = max_abs_iacc / (max_ref_iacc + 1e-6);
     std.debug.print("expert-id IQ4_NL×Q8_1.iacc fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs_iacc, rel_iacc });
     try std.testing.expect(rel_iacc < 1e-3);
+
+    const cpu_sum = try al.alloc(f32, rows);
+    defer al.free(cpu_sum);
+    @memset(cpu_sum, 0.0);
+    for (0..active) |slot| {
+        for (0..rows) |row| cpu_sum[row] += cpu_out[slot * rows + row];
+    }
+
+    var pipeline_sum = try ExpertDownIdPipeline.initIQ4NLQ8_1Sum(&gpu);
+    defer pipeline_sum.deinit();
+
+    const cmd_sum = try gpu.beginBatch();
+    const ds_sum = try pipeline_sum.record(cmd_sum, &session.mat_buf, &acts_buf, &ids_buf, &scales_buf, &out_buf, @intCast(rows), @intCast(cols), @intCast(active));
+    try gpu.submitBatch(cmd_sum);
+    var ds_sum_mut = ds_sum;
+    _ = vk.vkFreeDescriptorSets(gpu.device, pipeline_sum.desc_pool, 1, &ds_sum_mut);
+
+    const gpu_sum = try al.alloc(f32, rows);
+    defer al.free(gpu_sum);
+    try out_buf.download(std.mem.sliceAsBytes(gpu_sum));
+
+    var max_abs_sum: f32 = 0.0;
+    var max_ref_sum: f32 = 0.0;
+    for (cpu_sum, gpu_sum) |c, g| {
+        const d = @abs(c - g);
+        if (d > max_abs_sum) max_abs_sum = d;
+        if (@abs(c) > max_ref_sum) max_ref_sum = @abs(c);
+    }
+    const rel_sum = max_abs_sum / (max_ref_sum + 1e-6);
+    std.debug.print("expert-id IQ4_NL×Q8_1.sum fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs_sum, rel_sum });
+    try std.testing.expect(rel_sum < 1e-3);
 }
 
 test "gpu matvec Q4_K fuzz" {

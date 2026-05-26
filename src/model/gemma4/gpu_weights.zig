@@ -129,6 +129,7 @@ pub const GpuWeights = struct {
     pl_expert_down_id_q5_0: ExpertDownIdPipeline,
     pl_expert_down_id_q5_1: ExpertDownIdPipeline,
     pl_expert_down_id_iq4_nl: ExpertDownIdPipeline,
+    pl_expert_down_sum_id_iq4_nl: ExpertDownIdPipeline,
     pl_accum: AccumPipeline,
     // 7j primitives — per-token f32 ops on VRAM residual stream.
     pl_rmsnorm: RmsnormPipeline,
@@ -227,6 +228,7 @@ pub const GpuWeights = struct {
     expert_gate_up_id_dsets: ?[]?vk.VkDescriptorSet,
     expert_down_id_dsets: ?[]?vk.VkDescriptorSet,
     expert_down_id_dset_type: ?[]GgmlType,
+    expert_down_sum_id_dsets: ?[]?vk.VkDescriptorSet,
     expert_reuse_cmds: ?[]?vk.VkCommandBuffer,
     // One in-flight async submit whose transient descriptor sets must stay
     // alive until its fence signals. Currently used by the MoE expert batch,
@@ -375,6 +377,9 @@ pub const GpuWeights = struct {
         var pl_expert_down_id_iq4_nl = try ExpertDownIdPipeline.initIQ4NLQ8_1(&ctx);
         errdefer pl_expert_down_id_iq4_nl.deinit();
         std.debug.print("  init: pl_expert_down_id_iq4_nl ok\n", .{});
+        var pl_expert_down_sum_id_iq4_nl = try ExpertDownIdPipeline.initIQ4NLQ8_1Sum(&ctx);
+        errdefer pl_expert_down_sum_id_iq4_nl.deinit();
+        std.debug.print("  init: pl_expert_down_sum_id_iq4_nl ok\n", .{});
         var pl_accum = try AccumPipeline.init(&ctx);
         errdefer pl_accum.deinit();
         std.debug.print("  init: pl_accum ok\n", .{});
@@ -452,6 +457,7 @@ pub const GpuWeights = struct {
             .pl_expert_down_id_q5_0 = pl_expert_down_id_q5_0,
             .pl_expert_down_id_q5_1 = pl_expert_down_id_q5_1,
             .pl_expert_down_id_iq4_nl = pl_expert_down_id_iq4_nl,
+            .pl_expert_down_sum_id_iq4_nl = pl_expert_down_sum_id_iq4_nl,
             .pl_accum = pl_accum,
             .pl_rmsnorm = pl_rmsnorm,
             .pl_add_rmsnorm = pl_add_rmsnorm,
@@ -510,6 +516,7 @@ pub const GpuWeights = struct {
             .expert_gate_up_id_dsets = null,
             .expert_down_id_dsets = null,
             .expert_down_id_dset_type = null,
+            .expert_down_sum_id_dsets = null,
             .expert_reuse_cmds = null,
             .pending_gpu_batch = null,
             .final_out_norm_dset = null,
@@ -716,6 +723,8 @@ pub const GpuWeights = struct {
         @memset(gw.expert_down_id_dsets.?, null);
         gw.expert_down_id_dset_type = try allocator.alloc(GgmlType, g4cfg.n_layers);
         @memset(gw.expert_down_id_dset_type.?, .f32);
+        gw.expert_down_sum_id_dsets = try allocator.alloc(?vk.VkDescriptorSet, g4cfg.n_layers);
+        @memset(gw.expert_down_sum_id_dsets.?, null);
         if (envFlagDefaultTrue("LLMTOY_EXPERT_REUSE_CMD")) {
             gw.expert_reuse_cmds = try allocator.alloc(?vk.VkCommandBuffer, g4cfg.n_layers);
             @memset(gw.expert_reuse_cmds.?, null);
@@ -1068,6 +1077,13 @@ pub const GpuWeights = struct {
             self.allocator.free(sets);
         }
         if (self.expert_down_id_dset_type) |types| self.allocator.free(types);
+        if (self.expert_down_sum_id_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_expert_down_sum_id_iq4_nl.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
         if (self.expert_gate_up_id_dsets) |sets| {
             for (sets) |*ds| if (ds.*) |set| {
                 var tmp = set;
@@ -1161,6 +1177,7 @@ pub const GpuWeights = struct {
         for (self.layers) |*l| l.deinitAll();
         self.allocator.free(self.layers);
         self.pl_accum.deinit();
+        self.pl_expert_down_sum_id_iq4_nl.deinit();
         self.pl_expert_down_id_iq4_nl.deinit();
         self.pl_expert_down_id_q5_1.deinit();
         self.pl_expert_down_id_q5_0.deinit();
@@ -2389,6 +2406,7 @@ pub const GpuWeights = struct {
         const pl_dn_id = self.expertDownIdPipelineFor(down_type);
         const down_flat = if (self.expert_down_flat) |dfs| dfs[layer] else null;
         const use_id_dn = use_q8_1_dn and pl_dn_id != null and down_flat != null;
+        const use_down_sum_id = envFlagDefaultFalse("LLMTOY_EXPERT_DOWN_SUM_ID") and use_id_dn and down_type == .iq4_nl;
         const gate_up_flat = if (self.expert_gate_up_flat) |gufs| gufs[layer] else null;
         const use_id_gu = gate_up_type == .q3_k and use_q8_1_dn and gate_up_flat != null;
         const reuse_id_dsets = envFlagDefaultTrue("LLMTOY_EXPERT_REUSE_DSETS");
@@ -2396,6 +2414,7 @@ pub const GpuWeights = struct {
         const reuse_gate_up_id_dset = reuse_id_dsets and use_id_gu;
         const reuse_quant_mid_batched_dset = reuse_id_dsets and use_id_gu;
         const reuse_down_id_dset = reuse_id_dsets and use_id_dn;
+        const reuse_down_sum_id_dset = reuse_id_dsets and use_down_sum_id;
         const reuse_accum_dset = reuse_id_dsets and (use_id_gu or use_id_dn);
         const reuse_cmd_env = std.c.getenv("LLMTOY_EXPERT_REUSE_CMD");
         const reuse_cmd_requested = if (reuse_cmd_env) |raw|
@@ -2562,7 +2581,19 @@ pub const GpuWeights = struct {
             break :blk sd0.rows;
         };
         var down_id_dset: ?vk.VkDescriptorSet = null;
-        if (use_id_dn) {
+        var down_sum_id_dset: ?vk.VkDescriptorSet = null;
+        if (use_down_sum_id) {
+            const p_down = self.ctx.profileBegin(cmd, "moe.down_sum");
+            if (reuse_down_sum_id_dset) {
+                const sets = self.expert_down_sum_id_dsets orelse return error.ExpertNotOnGpu;
+                if (sets[layer] == null)
+                    sets[layer] = try self.pl_expert_down_sum_id_iq4_nl.allocSet(&down_flat.?.mat_buf, mid_q8_1_flat_buf, ids_buf, scales_buf, moe_out_buf);
+                self.pl_expert_down_sum_id_iq4_nl.recordWithSet(cmd, sets[layer].?, @intCast(d_model), @intCast(down_flat.?.cols), @intCast(n));
+            } else {
+                down_sum_id_dset = try self.pl_expert_down_sum_id_iq4_nl.record(cmd, &down_flat.?.mat_buf, mid_q8_1_flat_buf, ids_buf, scales_buf, moe_out_buf, @intCast(d_model), @intCast(down_flat.?.cols), @intCast(n));
+            }
+            self.ctx.profileEnd(cmd, p_down);
+        } else if (use_id_dn) {
             const p_down = self.ctx.profileBegin(cmd, "moe.down");
             if (reuse_down_id_dset) {
                 const sets = self.expert_down_id_dsets orelse return error.ExpertNotOnGpu;
@@ -2594,17 +2625,19 @@ pub const GpuWeights = struct {
         // Barrier: down writes all_out, accum reads all_out
         GpuCtx.recordShaderBarrier(cmd);
 
-        // Phase 3: weighted accumulation on GPU
-        const p_accum = self.ctx.profileBegin(cmd, "moe.accum");
         var accum_dset: ?vk.VkDescriptorSet = null;
-        if (reuse_accum_dset) {
-            if (self.expert_accum_dset == null)
-                self.expert_accum_dset = try self.pl_accum.allocSet(all_out_buf, accum_scales_buf, moe_out_buf);
-            self.pl_accum.recordWithSet(cmd, self.expert_accum_dset.?, @intCast(d_model), @intCast(n));
-        } else {
-            accum_dset = try self.pl_accum.record(cmd, all_out_buf, accum_scales_buf, moe_out_buf, @intCast(d_model), @intCast(n));
+        if (!use_down_sum_id) {
+            // Phase 3: weighted accumulation on GPU
+            const p_accum = self.ctx.profileBegin(cmd, "moe.accum");
+            if (reuse_accum_dset) {
+                if (self.expert_accum_dset == null)
+                    self.expert_accum_dset = try self.pl_accum.allocSet(all_out_buf, accum_scales_buf, moe_out_buf);
+                self.pl_accum.recordWithSet(cmd, self.expert_accum_dset.?, @intCast(d_model), @intCast(n));
+            } else {
+                accum_dset = try self.pl_accum.record(cmd, all_out_buf, accum_scales_buf, moe_out_buf, @intCast(d_model), @intCast(n));
+            }
+            self.ctx.profileEnd(cmd, p_accum);
         }
-        self.ctx.profileEnd(cmd, p_accum);
 
         if (tail) |tp| {
             GpuCtx.recordShaderBarrier(cmd);
@@ -2631,8 +2664,11 @@ pub const GpuWeights = struct {
                 n,
                 pl_gu.desc_pool,
                 reuse_down_id_dset,
+                reuse_down_sum_id_dset,
+                use_down_sum_id,
                 use_id_dn,
                 down_id_dset,
+                down_sum_id_dset,
                 pl_dn_id,
                 &down_dsets,
                 pl_dn_used.desc_pool,
@@ -2661,8 +2697,11 @@ pub const GpuWeights = struct {
                 n,
                 pl_gu.desc_pool,
                 reuse_down_id_dset,
+                reuse_down_sum_id_dset,
+                use_down_sum_id,
                 use_id_dn,
                 down_id_dset,
+                down_sum_id_dset,
                 pl_dn_id,
                 &down_dsets,
                 pl_dn_used.desc_pool,
@@ -2714,8 +2753,11 @@ pub const GpuWeights = struct {
         n: usize,
         pl_gu_pool: vk.VkDescriptorPool,
         reuse_down_id_dset: bool,
+        reuse_down_sum_id_dset: bool,
+        use_down_sum_id: bool,
         use_id_dn: bool,
         down_id_dset: ?vk.VkDescriptorSet,
+        down_sum_id_dset: ?vk.VkDescriptorSet,
         pl_dn_id: ?*const ExpertDownIdPipeline,
         down_dsets: *const [16]vk.VkDescriptorSet,
         pl_dn_pool: vk.VkDescriptorPool,
@@ -2737,7 +2779,11 @@ pub const GpuWeights = struct {
                 try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, pl_gu_pool, set);
         }
 
-        if (reuse_down_id_dset and use_id_dn) {
+        if (reuse_down_sum_id_dset and use_down_sum_id) {
+            // Persistent descriptor set is owned by GpuWeights.
+        } else if (use_down_sum_id) {
+            try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, self.pl_expert_down_sum_id_iq4_nl.desc_pool, down_sum_id_dset.?);
+        } else if (reuse_down_id_dset and use_id_dn) {
             // Persistent descriptor set is owned by GpuWeights.
         } else if (use_id_dn) {
             try appendDeferredDescriptorFree(descriptor_frees, descriptor_free_count, pl_dn_id.?.desc_pool, down_id_dset.?);
@@ -2902,6 +2948,11 @@ pub const GpuWeights = struct {
 
     fn envFlagDefaultTrue(name: [:0]const u8) bool {
         const raw = std.c.getenv(name) orelse return true;
+        return !std.mem.eql(u8, std.mem.span(raw), "0");
+    }
+
+    fn envFlagDefaultFalse(name: [:0]const u8) bool {
+        const raw = std.c.getenv(name) orelse return false;
         return !std.mem.eql(u8, std.mem.span(raw), "0");
     }
 
