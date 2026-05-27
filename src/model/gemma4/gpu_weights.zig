@@ -230,6 +230,10 @@ pub const GpuWeights = struct {
     expert_down_id_dset_type: ?[]GgmlType,
     expert_down_sum_id_dsets: ?[]?vk.VkDescriptorSet,
     expert_reuse_cmds: ?[]?vk.VkCommandBuffer,
+    attn_front_reuse_cmds: ?[]?vk.VkCommandBuffer,
+    attention_reuse_cmds: ?[]?vk.VkCommandBuffer,
+    dense_full_reuse_cmds: ?[]?vk.VkCommandBuffer,
+    final_logits_cmd: ?vk.VkCommandBuffer,
     // One in-flight async submit whose transient descriptor sets must stay
     // alive until its fence signals. Currently used by the MoE expert batch,
     // but intentionally not named after MoE so attention/dense graph work can
@@ -536,6 +540,10 @@ pub const GpuWeights = struct {
             .expert_down_id_dset_type = null,
             .expert_down_sum_id_dsets = null,
             .expert_reuse_cmds = null,
+            .attn_front_reuse_cmds = null,
+            .attention_reuse_cmds = null,
+            .dense_full_reuse_cmds = null,
+            .final_logits_cmd = null,
             .pending_gpu_batch = null,
             .final_out_norm_dset = null,
             .final_out_norm_x_vram_dset = null,
@@ -972,6 +980,19 @@ pub const GpuWeights = struct {
             for (cmds) |cmd| if (cmd) |c| self.ctx.freeReusableCommandBuffer(c);
             self.allocator.free(cmds);
         }
+        if (self.attn_front_reuse_cmds) |cmds| {
+            for (cmds) |cmd| if (cmd) |c| self.ctx.freeReusableCommandBuffer(c);
+            self.allocator.free(cmds);
+        }
+        if (self.attention_reuse_cmds) |cmds| {
+            for (cmds) |cmd| if (cmd) |c| self.ctx.freeReusableCommandBuffer(c);
+            self.allocator.free(cmds);
+        }
+        if (self.dense_full_reuse_cmds) |cmds| {
+            for (cmds) |cmd| if (cmd) |c| self.ctx.freeReusableCommandBuffer(c);
+            self.allocator.free(cmds);
+        }
+        if (self.final_logits_cmd) |cmd| self.ctx.freeReusableCommandBuffer(cmd);
         if (self.final_softcap_dset) |set| {
             var tmp = set;
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_logit_softcap.desc_pool, 1, &tmp);
@@ -1315,6 +1336,27 @@ pub const GpuWeights = struct {
         }
     }
 
+    fn beginLayerReusableBatch(
+        self: *GpuWeights,
+        cmds_opt: *?[]?vk.VkCommandBuffer,
+        layer: usize,
+    ) !vk.VkCommandBuffer {
+        if (cmds_opt.* == null) {
+            cmds_opt.* = try self.allocator.alloc(?vk.VkCommandBuffer, self.layers.len);
+            @memset(cmds_opt.*.?, null);
+        }
+        const cmds = cmds_opt.*.?;
+        if (cmds[layer] == null)
+            cmds[layer] = try self.ctx.allocReusableCommandBuffer();
+        return self.ctx.beginReusableBatch(cmds[layer].?);
+    }
+
+    fn beginFinalReusableBatch(self: *GpuWeights) !vk.VkCommandBuffer {
+        if (self.final_logits_cmd == null)
+            self.final_logits_cmd = try self.ctx.allocReusableCommandBuffer();
+        return self.ctx.beginReusableBatch(self.final_logits_cmd.?);
+    }
+
     fn downloadSmallDeviceBuffer(self: *const GpuWeights, src: *const GpuBuffer, dest: []u8) !void {
         const stage = &(self.stage_buf orelse return error.NotOnGpu);
         std.debug.assert(dest.len <= stage.size);
@@ -1454,7 +1496,7 @@ pub const GpuWeights = struct {
             try vec_buf.upload(std.mem.sliceAsBytes(x));
         }
 
-        const cmd = try self.ctx.beginBatch();
+        const cmd = try self.beginFinalReusableBatch();
         const p_norm = self.ctx.profileBegin(cmd, "final.out_norm");
         const norm_dset = switch (input) {
             .cpu, .shared_vec => blk: {
@@ -1500,7 +1542,7 @@ pub const GpuWeights = struct {
             self.ctx.profileEnd(cmd, p_softcap);
         }
 
-        try self.ctx.submitBatch(cmd);
+        try self.ctx.submitReusableBatch(cmd);
 
         try out_buf.download(std.mem.sliceAsBytes(logits));
     }
@@ -1714,7 +1756,7 @@ pub const GpuWeights = struct {
 
         try vec_buf.upload(std.mem.sliceAsBytes(x));
 
-        const cmd = try self.ctx.beginBatch();
+        const cmd = try self.beginLayerReusableBatch(&self.attn_front_reuse_cmds, layer);
 
         // ── 1. attn_norm(x) → xb_vram
         const p_norm = self.ctx.profileBegin(cmd, "attn_front.rmsnorm");
@@ -1814,7 +1856,7 @@ pub const GpuWeights = struct {
         GpuCtx.recordCopyRegion(cmd, v_buf.handle, v_cache.handle, 0, slot_offset, slot_bytes);
         self.ctx.profileEnd(cmd, p_v_copy);
 
-        try self.ctx.submitBatch(cmd);
+        try self.ctx.submitReusableBatch(cmd);
 
         if (q_out) |q| try self.downloadSmallDeviceBuffer(q_buf, std.mem.sliceAsBytes(q));
         if (k_out) |k| try self.downloadSmallDeviceBuffer(k_buf, std.mem.sliceAsBytes(k));
@@ -1866,7 +1908,11 @@ pub const GpuWeights = struct {
         else
             true;
 
-        const cmd = try self.ctx.beginBatch();
+        const async_attention = async_attention_enabled and attn_out == null and self.ctx.profiler == null and self.pending_gpu_batch == null;
+        const cmd = if (async_attention)
+            try self.ctx.beginBatch()
+        else
+            try self.beginLayerReusableBatch(&self.attention_reuse_cmds, layer);
         if (use_fused_small) {
             const p_fused = self.ctx.profileBegin(cmd, "attention.fused_small");
             const fused_dset = try self.attentionFusedSmallSet(layer, q_buf, k_cache, v_cache, attn_buf);
@@ -1884,11 +1930,10 @@ pub const GpuWeights = struct {
             self.ctx.profileEnd(cmd, p_av);
         }
 
-        const async_attention = async_attention_enabled and attn_out == null and self.ctx.profiler == null and self.pending_gpu_batch == null;
         if (async_attention) {
             self.pending_gpu_batch = try self.ctx.submitBatchAsync(cmd);
         } else {
-            try self.ctx.submitBatch(cmd);
+            try self.ctx.submitReusableBatch(cmd);
             if (attn_out) |o| {
                 try attn_buf.download(std.mem.sliceAsBytes(o));
             }
@@ -2260,7 +2305,7 @@ pub const GpuWeights = struct {
             try attn_in_buf.upload(std.mem.sliceAsBytes(attn_concat));
         }
 
-        const cmd = try self.ctx.beginBatch();
+        const cmd = try self.beginLayerReusableBatch(&self.dense_full_reuse_cmds, layer);
         GpuCtx.recordCopy(cmd, stage_buf.handle, x_buf.handle, x.len * @sizeOf(f32));
         GpuCtx.recordTransferToShaderBarrier(cmd);
 
@@ -2352,7 +2397,7 @@ pub const GpuWeights = struct {
         GpuCtx.recordCopy(cmd, x_buf.handle, stage_buf.handle, x.len * @sizeOf(f32));
 
         _ = down_dset;
-        try self.ctx.submitBatch(cmd);
+        try self.ctx.submitReusableBatch(cmd);
 
         if (ffn_out) |out| {
             try self.downloadSmallDeviceBuffer(out_buf, std.mem.sliceAsBytes(out));

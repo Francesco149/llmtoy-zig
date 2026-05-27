@@ -1774,6 +1774,15 @@ MoE dispatch follow-up:
   the shared Q8_1 quantizer. The Q/K/V matvec descriptors remain transient
   until the matvec pools/type ownership are expanded deliberately. Correctness:
   `zig build test --summary all` reports 142/142 tests passed.
+- The production decode path now reuses command buffers for the per-layer
+  attention-front submit, synchronous attention submit, fused post-attention
+  dense-FFN submit, and final logits submit. This follows llama.cpp's Vulkan
+  command-buffer pooling shape while leaving async MoE/attention ownership
+  unchanged. Correctness: `nix develop --command zig build -Doptimize=ReleaseFast`
+  and `nix develop --command zig build test` pass. Short profiled generation on
+  the standard 8-token prompt measured `32.00 tok/s` decode, `361.167 ms`
+  timestamped dispatch, and `32.416 ms` inter-dispatch gap across 3993 profiled
+  batches.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
