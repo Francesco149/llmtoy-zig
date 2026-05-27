@@ -1783,6 +1783,12 @@ MoE dispatch follow-up:
   the standard 8-token prompt measured `32.00 tok/s` decode, `361.167 ms`
   timestamped dispatch, and `32.416 ms` inter-dispatch gap across 3993 profiled
   batches.
+- Async attention now uses the same per-layer reusable command buffers as the
+  synchronous attention path instead of allocating one-shot command buffers for
+  the overlapped submit. This follows llama.cpp's pooled command-buffer shape
+  while preserving the existing single pending-batch lifetime rule. Correctness:
+  `nix develop --command zig build -Doptimize=ReleaseFast` and
+  `nix develop --command zig build test` pass.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

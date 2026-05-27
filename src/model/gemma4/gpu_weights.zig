@@ -1909,10 +1909,7 @@ pub const GpuWeights = struct {
             true;
 
         const async_attention = async_attention_enabled and attn_out == null and self.ctx.profiler == null and self.pending_gpu_batch == null;
-        const cmd = if (async_attention)
-            try self.ctx.beginBatch()
-        else
-            try self.beginLayerReusableBatch(&self.attention_reuse_cmds, layer);
+        const cmd = try self.beginLayerReusableBatch(&self.attention_reuse_cmds, layer);
         if (use_fused_small) {
             const p_fused = self.ctx.profileBegin(cmd, "attention.fused_small");
             const fused_dset = try self.attentionFusedSmallSet(layer, q_buf, k_cache, v_cache, attn_buf);
@@ -1931,7 +1928,7 @@ pub const GpuWeights = struct {
         }
 
         if (async_attention) {
-            self.pending_gpu_batch = try self.ctx.submitBatchAsync(cmd);
+            self.pending_gpu_batch = try self.ctx.submitReusableBatchAsync(cmd);
         } else {
             try self.ctx.submitReusableBatch(cmd);
             if (attn_out) |o| {

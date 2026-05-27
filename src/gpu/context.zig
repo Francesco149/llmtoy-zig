@@ -287,6 +287,7 @@ pub const GpuContext = struct {
     pub const PendingBatch = struct {
         cmd: vk.VkCommandBuffer,
         fence: vk.VkFence,
+        reusable_cmd: bool = false,
         descriptor_frees: [max_deferred_descriptor_frees]DeferredDescriptorFree = undefined,
         descriptor_free_count: u32 = 0,
     };
@@ -589,6 +590,27 @@ pub const GpuContext = struct {
         cmd: vk.VkCommandBuffer,
         descriptor_frees: []const DeferredDescriptorFree,
     ) !PendingBatch {
+        return self.submitAsyncWithDescriptorFrees(cmd, false, descriptor_frees);
+    }
+
+    pub fn submitReusableBatchAsync(self: *GpuContext, cmd: vk.VkCommandBuffer) !PendingBatch {
+        return self.submitReusableBatchAsyncWithDescriptorFrees(cmd, &.{});
+    }
+
+    pub fn submitReusableBatchAsyncWithDescriptorFrees(
+        self: *GpuContext,
+        cmd: vk.VkCommandBuffer,
+        descriptor_frees: []const DeferredDescriptorFree,
+    ) !PendingBatch {
+        return self.submitAsyncWithDescriptorFrees(cmd, true, descriptor_frees);
+    }
+
+    fn submitAsyncWithDescriptorFrees(
+        self: *GpuContext,
+        cmd: vk.VkCommandBuffer,
+        reusable_cmd: bool,
+        descriptor_frees: []const DeferredDescriptorFree,
+    ) !PendingBatch {
         // The profiler owns one query pool and resets it at beginBatch(), so keep
         // async submits out of profiled runs until the profiler can snapshot
         // per-submit event ranges.
@@ -596,7 +618,7 @@ pub const GpuContext = struct {
         if (descriptor_frees.len > max_deferred_descriptor_frees)
             return error.TooManyDeferredDescriptorFrees;
         _ = vk.vkEndCommandBuffer(cmd);
-        errdefer vk.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, &cmd);
+        errdefer if (!reusable_cmd) vk.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, &cmd);
 
         const fence = try self.acquireAsyncFence();
         errdefer self.recycleAsyncFence(fence);
@@ -617,6 +639,7 @@ pub const GpuContext = struct {
         var pending = PendingBatch{
             .cmd = cmd,
             .fence = fence,
+            .reusable_cmd = reusable_cmd,
             .descriptor_free_count = @intCast(descriptor_frees.len),
         };
         @memcpy(pending.descriptor_frees[0..descriptor_frees.len], descriptor_frees);
@@ -626,7 +649,7 @@ pub const GpuContext = struct {
     pub fn waitPendingBatch(self: *GpuContext, pending: PendingBatch) !void {
         const rc = vk.vkWaitForFences(self.device, 1, &pending.fence, vk.VK_TRUE, std.math.maxInt(u64));
         defer if (rc == vk.VK_SUCCESS) self.recycleAsyncFence(pending.fence) else vk.vkDestroyFence(self.device, pending.fence, null);
-        defer vk.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, &pending.cmd);
+        defer if (!pending.reusable_cmd) vk.vkFreeCommandBuffers(self.device, self.cmd_pool, 1, &pending.cmd);
         if (rc != vk.VK_SUCCESS)
             return error.VkFenceWaitFailed;
         self.freeDeferredDescriptorSets(pending.descriptor_frees[0..pending.descriptor_free_count]);
