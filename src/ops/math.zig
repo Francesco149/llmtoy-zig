@@ -61,11 +61,23 @@ pub fn rmsnormWeightedAndRawScaled(
     std.debug.assert(raw_scale.len == x.len and raw_scaled_out.len == x.len);
     var ss: f32 = 0.0;
     for (x) |v| ss += v * v;
+
     const rms_inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(x.len)) + eps);
     const raw_base = rms_inv * raw_global_scale;
-    for (weighted_out, raw_scaled_out, x, weight, raw_scale) |*wo, *ro, v, w, s| {
-        wo.* = v * rms_inv * w;
-        ro.* = v * raw_base * s;
+    const rms_v: @Vector(8, f32) = @splat(rms_inv);
+    const raw_v: @Vector(8, f32) = @splat(raw_base);
+    const n = x.len;
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const xv = @as(@Vector(8, f32), x[i..][0..8].*);
+        const wv = @as(@Vector(8, f32), weight[i..][0..8].*);
+        const sv = @as(@Vector(8, f32), raw_scale[i..][0..8].*);
+        weighted_out[i..][0..8].* = xv * rms_v * wv;
+        raw_scaled_out[i..][0..8].* = xv * raw_v * sv;
+    }
+    while (i < n) : (i += 1) {
+        weighted_out[i] = x[i] * rms_inv * weight[i];
+        raw_scaled_out[i] = x[i] * raw_base * raw_scale[i];
     }
 }
 
