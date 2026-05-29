@@ -405,7 +405,7 @@ pub fn forwardOne(
         );
 
         // Router logits → top-k indices plus selected softmax probabilities.
-        routerTopKSoftmax(router_out, top_idx, lw.router_w, router_in, scratch[0..d]);
+        routerTopKSoftmax(router_out, top_idx, lw.router_w, router_in, scratch, pool);
 
         // Run each selected expert. The default path keeps the accumulated MoE
         // vector device-resident and finishes the FFN/MoE residual tail on GPU
@@ -620,13 +620,13 @@ fn softmaxTopK(scores: []f32, out: []usize) void {
 /// Compute Gemma4's F32 router matvec while streaming logits directly into
 /// top-k selection and the softmax denominator. Only selected probabilities are
 /// written back to `scores`; downstream expert code only reads those entries.
-fn routerTopKSoftmax(scores: []f32, out: []usize, router_w: wt_.RawMatrix, router_in: []const f32, scratch: []f32) void {
+fn routerTopKSoftmax(scores: []f32, out: []usize, router_w: wt_.RawMatrix, router_in: []const f32, scratch: []f32, pool: *math.ThreadPool) void {
     std.debug.assert(scores.len == router_w.rows);
     std.debug.assert(router_in.len == router_w.cols);
     std.debug.assert(scratch.len >= router_w.cols);
 
     if (router_w.type_ != .f32 or @intFromPtr(router_w.data.ptr) % @alignOf(f32) != 0) {
-        math.quantMatvec(scores, router_w.data, router_w.type_, router_in, router_w.rows, router_w.cols, scratch[0..router_w.cols]);
+        math.quantMatvecPar(scores, router_w.data, router_w.type_, router_in, router_w.rows, router_w.cols, scratch, pool);
         softmaxTopK(scores, out);
         return;
     }
@@ -635,7 +635,7 @@ fn routerTopKSoftmax(scores: []f32, out: []usize, router_w: wt_.RawMatrix, route
     const aligned: []align(@alignOf(f32)) const u8 = @alignCast(router_w.data[0..byte_len]);
     const weights = std.mem.bytesAsSlice(f32, aligned);
     var selected_scores: [16]f32 = undefined;
-    const stats = topKMatvecF32(weights, router_in, router_w.rows, router_w.cols, out, selected_scores[0..out.len]);
+    const stats = topKMatvecF32Par(weights, router_in, router_w.rows, router_w.cols, out, selected_scores[0..out.len], pool);
 
     for (out, selected_scores[0..out.len]) |idx, score| {
         scores[idx] = @exp(score - stats.max) / stats.exp_sum;
@@ -680,6 +680,115 @@ fn topKMatvecF32(weights: []const f32, vec: []const f32, rows: usize, cols: usiz
             }
             selected_scores[pos] = score;
             out[pos] = j;
+        }
+    }
+
+    return .{ .max = max, .exp_sum = exp_sum };
+}
+
+const RouterTopKJob = struct {
+    weights: []const f32,
+    vec: []const f32,
+    row_start: usize,
+    rows: usize,
+    cols: usize,
+    k: usize,
+    top_idx: [16]usize = undefined,
+    top_scores: [16]f32 = undefined,
+    stats: TopKSoftmaxStats = .{ .max = -std.math.inf(f32), .exp_sum = 0.0 },
+
+    fn poolRun(ctx: *anyopaque) void {
+        const job: *RouterTopKJob = @ptrCast(@alignCast(ctx));
+        job.run();
+    }
+
+    fn run(job: *RouterTopKJob) void {
+        var local_idx: [16]usize = undefined;
+        var local_scores: [16]f32 = undefined;
+        job.stats = topKMatvecF32(
+            job.weights[job.row_start * job.cols ..],
+            job.vec,
+            job.rows,
+            job.cols,
+            local_idx[0..job.k],
+            local_scores[0..job.k],
+        );
+        for (0..job.k) |i| {
+            job.top_idx[i] = job.row_start + local_idx[i];
+            job.top_scores[i] = local_scores[i];
+        }
+    }
+};
+
+fn insertTopKIndex(out: []usize, selected_scores: []f32, filled: *usize, idx: usize, score: f32) void {
+    if (filled.* < out.len) {
+        var pos = filled.*;
+        filled.* += 1;
+        while (pos > 0 and score > selected_scores[pos - 1]) : (pos -= 1) {
+            selected_scores[pos] = selected_scores[pos - 1];
+            out[pos] = out[pos - 1];
+        }
+        selected_scores[pos] = score;
+        out[pos] = idx;
+    } else if (score > selected_scores[out.len - 1]) {
+        var pos = out.len - 1;
+        while (pos > 0 and score > selected_scores[pos - 1]) : (pos -= 1) {
+            selected_scores[pos] = selected_scores[pos - 1];
+            out[pos] = out[pos - 1];
+        }
+        selected_scores[pos] = score;
+        out[pos] = idx;
+    }
+}
+
+fn topKMatvecF32Par(
+    weights: []const f32,
+    vec: []const f32,
+    rows: usize,
+    cols: usize,
+    out: []usize,
+    selected_scores: []f32,
+    pool: *math.ThreadPool,
+) TopKSoftmaxStats {
+    std.debug.assert(out.len > 0 and out.len <= rows and out.len <= 16);
+    std.debug.assert(selected_scores.len == out.len);
+
+    const min_rows_per_job: usize = 16;
+    const nt = @min(pool.threads.len, (rows + min_rows_per_job - 1) / min_rows_per_job);
+    if (nt <= 1) return topKMatvecF32(weights, vec, rows, cols, out, selected_scores);
+
+    var jobs: [64]RouterTopKJob = undefined;
+    const base = rows / nt;
+    const extra = rows % nt;
+    var row: usize = 0;
+    for (0..nt) |t| {
+        const n_rows = base + if (t < extra) @as(usize, 1) else @as(usize, 0);
+        jobs[t] = .{
+            .weights = weights,
+            .vec = vec,
+            .row_start = row,
+            .rows = n_rows,
+            .cols = cols,
+            .k = out.len,
+        };
+        pool.submit(RouterTopKJob.poolRun, &jobs[t]);
+        row += n_rows;
+    }
+    pool.wait();
+
+    var max: f32 = -std.math.inf(f32);
+    var exp_sum: f32 = 0.0;
+    var filled: usize = 0;
+    for (jobs[0..nt]) |*job| {
+        if (job.stats.max > max) {
+            exp_sum = exp_sum * @exp(max - job.stats.max) + job.stats.exp_sum;
+            max = job.stats.max;
+        } else {
+            exp_sum += job.stats.exp_sum * @exp(job.stats.max - max);
+        }
+
+        for (0..out.len) |i| {
+            insertTopKIndex(out, selected_scores, &filled, job.top_idx[i], job.top_scores[i]);
         }
     }
 
@@ -756,7 +865,42 @@ test "topKMatvecF32: matches materialized logits path" {
     }
 }
 
+test "topKMatvecF32Par: matches serial top-k and denominator" {
+    const allocator = std.testing.allocator;
+    const pool = try math.ThreadPool.init(allocator, 4, std.testing.io);
+    defer pool.deinit(allocator);
+
+    const rows = 37;
+    const cols = 33;
+    var weights: [rows * cols]f32 = undefined;
+    var vec: [cols]f32 = undefined;
+    for (&weights, 0..) |*v, i| {
+        const n: i32 = @intCast((i * 17 + 11) % 23);
+        v.* = @as(f32, @floatFromInt(n - 9)) * 0.125;
+    }
+    for (&vec, 0..) |*v, i| {
+        const n: i32 = @intCast((i * 13 + 7) % 19);
+        v.* = @as(f32, @floatFromInt(n - 8)) * 0.2;
+    }
+
+    var ref_idx: [8]usize = undefined;
+    var got_idx: [8]usize = undefined;
+    var ref_scores: [8]f32 = undefined;
+    var got_scores: [8]f32 = undefined;
+    const ref_stats = topKMatvecF32(&weights, &vec, rows, cols, &ref_idx, &ref_scores);
+    const got_stats = topKMatvecF32Par(&weights, &vec, rows, cols, &got_idx, &got_scores, pool);
+
+    try std.testing.expectEqual(ref_stats.max, got_stats.max);
+    try std.testing.expectApproxEqRel(ref_stats.exp_sum, got_stats.exp_sum, 1e-6);
+    try std.testing.expectEqualSlices(usize, &ref_idx, &got_idx);
+    for (ref_scores, got_scores) |r, g| try std.testing.expectApproxEqAbs(r, g, 1e-6);
+}
+
 test "routerTopKSoftmax: streams aligned F32 router weights" {
+    const allocator = std.testing.allocator;
+    const pool = try math.ThreadPool.init(allocator, 4, std.testing.io);
+    defer pool.deinit(allocator);
+
     const rows = 5;
     const cols = 4;
     const weights = [_]f32{
@@ -782,7 +926,7 @@ test "routerTopKSoftmax: streams aligned F32 router weights" {
     };
     var got_scores = [_]f32{ -999.0, -999.0, -999.0, -999.0, -999.0 };
     var got_idx: [2]usize = undefined;
-    routerTopKSoftmax(&got_scores, &got_idx, router_w, &vec, &scratch);
+    routerTopKSoftmax(&got_scores, &got_idx, router_w, &vec, &scratch, pool);
 
     for (got_idx, ref_idx) |g, r| {
         try std.testing.expectEqual(r, g);
