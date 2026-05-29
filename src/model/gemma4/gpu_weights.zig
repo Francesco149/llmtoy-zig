@@ -245,6 +245,13 @@ pub const GpuWeights = struct {
     attention_reuse_cmds: ?[]?vk.VkCommandBuffer,
     dense_full_reuse_cmds: ?[]?vk.VkCommandBuffer,
     final_logits_cmd: ?vk.VkCommandBuffer,
+    attention_async_enabled: bool,
+    attention_fused_small_enabled: bool,
+    dense_down_q8_1_enabled: bool,
+    expert_reuse_dsets_enabled: bool,
+    expert_down_sum_id_enabled: bool,
+    expert_reuse_cmd_override: ?bool,
+    expert_async_enabled: bool,
     // One in-flight async submit whose transient descriptor sets must stay
     // alive until its fence signals. Currently used by the MoE expert batch,
     // but intentionally not named after MoE so attention/dense graph work can
@@ -555,6 +562,13 @@ pub const GpuWeights = struct {
             .attention_reuse_cmds = null,
             .dense_full_reuse_cmds = null,
             .final_logits_cmd = null,
+            .attention_async_enabled = envFlagDefaultTrue("LLMTOY_ATTENTION_ASYNC"),
+            .attention_fused_small_enabled = envFlagDefaultTrue("LLMTOY_ATTENTION_FUSED_SMALL"),
+            .dense_down_q8_1_enabled = envFlagDefaultTrue("LLMTOY_DENSE_DOWN_Q8_1"),
+            .expert_reuse_dsets_enabled = envFlagDefaultTrue("LLMTOY_EXPERT_REUSE_DSETS"),
+            .expert_down_sum_id_enabled = envFlagDefaultFalse("LLMTOY_EXPERT_DOWN_SUM_ID"),
+            .expert_reuse_cmd_override = envFlagOptional("LLMTOY_EXPERT_REUSE_CMD"),
+            .expert_async_enabled = envFlagDefaultTrue("LLMTOY_EXPERT_ASYNC"),
             .pending_gpu_batch = null,
             .final_out_norm_dset = null,
             .final_out_norm_x_vram_dset = null,
@@ -780,7 +794,7 @@ pub const GpuWeights = struct {
         @memset(gw.expert_down_id_dset_type.?, .f32);
         gw.expert_down_sum_id_dsets = try allocator.alloc(?vk.VkDescriptorSet, g4cfg.n_layers);
         @memset(gw.expert_down_sum_id_dsets.?, null);
-        if (envFlagDefaultTrue("LLMTOY_EXPERT_REUSE_CMD")) {
+        if (gw.expert_reuse_cmd_override orelse true) {
             gw.expert_reuse_cmds = try allocator.alloc(?vk.VkCommandBuffer, g4cfg.n_layers);
             @memset(gw.expert_reuse_cmds.?, null);
         }
@@ -1912,12 +1926,7 @@ pub const GpuWeights = struct {
         scale: f32,
         attn_out: ?[]f32,
     ) !void {
-        const async_attention_enabled = if (std.c.getenv("LLMTOY_ATTENTION_ASYNC")) |raw|
-            !std.mem.eql(u8, std.mem.span(raw), "0")
-        else
-            true;
-
-        const async_attention = async_attention_enabled and attn_out == null and self.ctx.profiler == null and self.pending_gpu_batch == null;
+        const async_attention = self.attention_async_enabled and attn_out == null and self.ctx.profiler == null and self.pending_gpu_batch == null;
         const cmd = try self.beginLayerReusableBatch(&self.attention_reuse_cmds, layer);
         try self.recordLayerAttention(cmd, layer, .{
             .n_heads = n_heads,
@@ -1955,11 +1964,7 @@ pub const GpuWeights = struct {
 
         const seq = params.pos + 1;
         const n_q_per_kv = params.n_heads / params.n_kv_heads;
-        const fused_small_enabled = if (std.c.getenv("LLMTOY_ATTENTION_FUSED_SMALL")) |raw|
-            !std.mem.eql(u8, std.mem.span(raw), "0")
-        else
-            true;
-        const use_fused_small = fused_small_enabled and params.win_len <= 1024;
+        const use_fused_small = self.attention_fused_small_enabled and params.win_len <= 1024;
         if (use_fused_small) {
             const p_fused = self.ctx.profileBegin(cmd, "attention.fused_small");
             const fused_dset = try self.attentionFusedSmallSet(layer, q_buf, k_cache, v_cache, attn_buf);
@@ -2224,7 +2229,7 @@ pub const GpuWeights = struct {
         const gelu_dset = try self.pl_gelu_mul.record(cmd, gate_buf, up_buf, w_gate.rows);
         GpuCtx.recordShaderBarrier(cmd);
 
-        const use_down_q8 = envFlagDefaultTrue("LLMTOY_DENSE_DOWN_Q8_1") and down_q8_pl != null and w_down.cols % 32 == 0;
+        const use_down_q8 = self.dense_down_q8_1_enabled and down_q8_pl != null and w_down.cols % 32 == 0;
         var down_quant_dset: ?vk.VkDescriptorSet = null;
         const down_dset = blk: {
             if (use_down_q8) {
@@ -2408,7 +2413,7 @@ pub const GpuWeights = struct {
         self.ctx.profileEnd(cmd, p_gelu);
         GpuCtx.recordShaderBarrier(cmd);
 
-        const use_down_q8 = envFlagDefaultTrue("LLMTOY_DENSE_DOWN_Q8_1") and down_q8_pl != null and w_down.cols % 32 == 0;
+        const use_down_q8 = self.dense_down_q8_1_enabled and down_q8_pl != null and w_down.cols % 32 == 0;
         const p_down = self.ctx.profileBeginFmt(cmd, "dense_ffn.down.L{d:0>2}.{d}x{d}", .{ layer, w_down.rows, w_down.cols });
         const down_dset = blk: {
             if (use_down_q8) {
@@ -2599,30 +2604,22 @@ pub const GpuWeights = struct {
         const pl_dn_id = self.expertDownIdPipelineFor(down_type);
         const down_flat = if (self.expert_down_flat) |dfs| dfs[layer] else null;
         const use_id_dn = use_q8_1_dn and pl_dn_id != null and down_flat != null;
-        const use_down_sum_id = envFlagDefaultFalse("LLMTOY_EXPERT_DOWN_SUM_ID") and use_id_dn and down_type == .iq4_nl;
+        const use_down_sum_id = self.expert_down_sum_id_enabled and use_id_dn and down_type == .iq4_nl;
         const gate_up_flat = if (self.expert_gate_up_flat) |gufs| gufs[layer] else null;
         const use_id_gu = gate_up_type == .q3_k and use_q8_1_dn and gate_up_flat != null;
-        const reuse_id_dsets = envFlagDefaultTrue("LLMTOY_EXPERT_REUSE_DSETS");
+        const reuse_id_dsets = self.expert_reuse_dsets_enabled;
         const reuse_quant_input_dset = reuse_id_dsets and use_id_gu;
         const reuse_gate_up_id_dset = reuse_id_dsets and use_id_gu;
         const reuse_quant_mid_batched_dset = reuse_id_dsets and use_id_gu;
         const reuse_down_id_dset = reuse_id_dsets and use_id_dn;
         const reuse_down_sum_id_dset = reuse_id_dsets and use_down_sum_id;
         const reuse_accum_dset = reuse_id_dsets and (use_id_gu or use_id_dn);
-        const reuse_cmd_env = std.c.getenv("LLMTOY_EXPERT_REUSE_CMD");
-        const reuse_cmd_requested = if (reuse_cmd_env) |raw|
-            !std.mem.eql(u8, std.mem.span(raw), "0")
-        else
-            tail != null;
+        const reuse_cmd_requested = self.expert_reuse_cmd_override orelse (tail != null);
         const reuse_cmd = reuse_cmd_requested and self.expert_reuse_cmds != null and use_id_gu and use_id_dn;
-        const async_moe_env = if (std.c.getenv("LLMTOY_EXPERT_ASYNC")) |raw|
-            !std.mem.eql(u8, std.mem.span(raw), "0")
-        else
-            true;
         // Async MoE is safe for transient descriptor sets now that the sets are
         // attached to the generic pending fence and freed in
         // finishPendingGpuBatch().
-        const async_moe = async_moe_env and
+        const async_moe = self.expert_async_enabled and
             tail == null and
             skip_readback and
             self.ctx.profiler == null and
@@ -3146,6 +3143,11 @@ pub const GpuWeights = struct {
 
     fn envFlagDefaultFalse(name: [:0]const u8) bool {
         const raw = std.c.getenv(name) orelse return false;
+        return !std.mem.eql(u8, std.mem.span(raw), "0");
+    }
+
+    fn envFlagOptional(name: [:0]const u8) ?bool {
+        const raw = std.c.getenv(name) orelse return null;
         return !std.mem.eql(u8, std.mem.span(raw), "0");
     }
 
