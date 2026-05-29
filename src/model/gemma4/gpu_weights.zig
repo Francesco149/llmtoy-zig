@@ -264,6 +264,7 @@ pub const GpuWeights = struct {
     final_lm_head_dset_type: GgmlType,
     final_softcap_dset: ?vk.VkDescriptorSet,
     attn_front_norm_dsets: ?[]?vk.VkDescriptorSet,
+    attn_front_norm_x_vram_dsets: ?[]?vk.VkDescriptorSet,
     attn_front_quant_dset: ?vk.VkDescriptorSet,
     attn_front_q_norm_dsets: ?[]?vk.VkDescriptorSet,
     attn_front_k_norm_dsets: ?[]?vk.VkDescriptorSet,
@@ -577,6 +578,7 @@ pub const GpuWeights = struct {
             .final_lm_head_dset_type = .f32,
             .final_softcap_dset = null,
             .attn_front_norm_dsets = null,
+            .attn_front_norm_x_vram_dsets = null,
             .attn_front_quant_dset = null,
             .attn_front_q_norm_dsets = null,
             .attn_front_k_norm_dsets = null,
@@ -1078,6 +1080,13 @@ pub const GpuWeights = struct {
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_quantize_q8_1.desc_pool, 1, &tmp);
         }
         if (self.attn_front_norm_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
+        if (self.attn_front_norm_x_vram_dsets) |sets| {
             for (sets) |*ds| if (ds.*) |set| {
                 var tmp = set;
                 _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm.desc_pool, 1, &tmp);
@@ -1750,6 +1759,7 @@ pub const GpuWeights = struct {
         rope_theta_swa: f32,
         kv_slot: u32,
         x: []const f32,
+        x_vram_current: bool,
         q_out: ?[]f32,
         k_out: ?[]f32,
         v_out: ?[]f32,
@@ -1766,7 +1776,10 @@ pub const GpuWeights = struct {
         std.debug.assert(wq.cols == x.len);
         std.debug.assert(head_dim % 256 == 0);
 
-        const vec_buf = &self.shared_vec.?;
+        const vec_buf = if (x_vram_current)
+            &(self.x_vram orelse return error.NotOnGpu)
+        else
+            &self.shared_vec.?;
         const xb_buf = &(self.xb_vram orelse return error.NotOnGpu);
         const acts_buf = &self.shared_acts_q8_1.?;
         const q_buf = &(self.q_out_buf orelse return error.NotOnGpu);
@@ -1780,13 +1793,19 @@ pub const GpuWeights = struct {
         const slot_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, nkv) * @sizeOf(f32);
         const slot_offset: vk.VkDeviceSize = @as(vk.VkDeviceSize, kv_slot) * slot_bytes;
 
-        try vec_buf.upload(std.mem.sliceAsBytes(x));
+        if (!x_vram_current) {
+            try vec_buf.upload(std.mem.sliceAsBytes(x));
+        }
 
         const cmd = try self.beginLayerReusableBatch(&self.attn_front_reuse_cmds, layer);
 
         // ── 1. attn_norm(x) → xb_vram
         const p_norm = self.ctx.profileBegin(cmd, "attn_front.rmsnorm");
-        const norm_dset = try self.attnFrontRmsnormSet(layer, vec_buf, attn_norm_buf, xb_buf);
+        const norm_sets = if (x_vram_current)
+            &self.attn_front_norm_x_vram_dsets
+        else
+            &self.attn_front_norm_dsets;
+        const norm_dset = try self.attnFrontRmsnormSet(norm_sets, layer, vec_buf, attn_norm_buf, xb_buf);
         self.recordLayerRmsnormWithSet(cmd, layer, norm_dset, @intCast(x.len), eps, false);
         self.ctx.profileEnd(cmd, p_norm);
         GpuCtx.recordShaderBarrier(cmd);
@@ -3249,16 +3268,17 @@ pub const GpuWeights = struct {
 
     fn attnFrontRmsnormSet(
         self: *GpuWeights,
+        sets_opt: *?[]?vk.VkDescriptorSet,
         layer: usize,
         x_buf: *const GpuBuffer,
         w_buf: *const GpuBuffer,
         y_buf: *const GpuBuffer,
     ) !vk.VkDescriptorSet {
-        if (self.attn_front_norm_dsets == null) {
-            self.attn_front_norm_dsets = try self.allocator.alloc(?vk.VkDescriptorSet, self.layers.len);
-            @memset(self.attn_front_norm_dsets.?, null);
+        if (sets_opt.* == null) {
+            sets_opt.* = try self.allocator.alloc(?vk.VkDescriptorSet, self.layers.len);
+            @memset(sets_opt.*.?, null);
         }
-        const sets = self.attn_front_norm_dsets.?;
+        const sets = sets_opt.*.?;
         if (sets[layer] == null)
             sets[layer] = try self.pl_rmsnorm.allocSet(x_buf, w_buf, y_buf);
         return sets[layer].?;

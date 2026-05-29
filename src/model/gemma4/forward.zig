@@ -138,6 +138,7 @@ pub fn forwardOne(
         false;
     const final_logits_gpu_possible = if (gpu) |g| g.canRunFinalLogitsQ8_1(w.lm_head.type_) else false;
     var final_logits_input: gpu_w_.FinalLogitsInput = .cpu;
+    var residual_current_in_gpu_vram = false;
 
     for (0..cfg.n_layers) |l| {
         const lw = &w.layers[l];
@@ -216,7 +217,7 @@ pub fn forwardOne(
             const k_readback: ?[]f32 = if (attn_cpu_kv_shadow) k_cur else null;
             const v_readback: ?[]f32 = if (attn_cpu_kv_shadow) v_cur else null;
             const attn_dst: ?[]f32 = if (can_full_fused) null else attn_concat[0..nq_l];
-            try g.runLayerAttnQ8_1KvVram(l, cfg.eps, lw.wq.type_, wq_q8_pl, lw.wk.type_, wk_q8_pl, if (lw.wv) |wv| wv.type_ else null, wv_q8_pl, @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd), @intCast(pos), is_swa, cfg.rope_theta_swa, @intCast(kv_slot_l), x, null, k_readback, v_readback, .{
+            try g.runLayerAttnQ8_1KvVram(l, cfg.eps, lw.wq.type_, wq_q8_pl, lw.wk.type_, wk_q8_pl, if (lw.wv) |wv| wv.type_ else null, wv_q8_pl, @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd), @intCast(pos), is_swa, cfg.rope_theta_swa, @intCast(kv_slot_l), x, residual_current_in_gpu_vram, null, k_readback, v_readback, .{
                 .n_heads = @intCast(cfg.n_heads),
                 .n_kv_heads = @intCast(n_kv_l),
                 .head_dim = @intCast(hd),
@@ -437,11 +438,13 @@ pub fn forwardOne(
         if (expert_gpu_ok) |_| {
             if (use_moe_vram_tail) {
                 moe_residual_done_on_gpu = true;
+                residual_current_in_gpu_vram = x_current_in_gpu_vram;
                 if (leave_final_x_on_gpu) {
                     final_logits_input = if (x_current_in_gpu_vram) .x_vram else .shared_vec;
                 }
             }
         } else |_| {
+            residual_current_in_gpu_vram = false;
             if (dense_current_in_gpu_out_buf) {
                 try gpu.?.downloadDenseFfnOut(ffn_buf);
             }
@@ -465,6 +468,7 @@ pub fn forwardOne(
         }
 
         if (!moe_residual_done_on_gpu) {
+            residual_current_in_gpu_vram = false;
             math.rmsnorm(moe_buf, moe_buf, lw.post_ffw_norm_2, cfg.eps);
 
             // ── Combine and second residual ───────────────────────────────────
