@@ -1789,6 +1789,14 @@ MoE dispatch follow-up:
   while preserving the existing single pending-batch lifetime rule. Correctness:
   `nix develop --command zig build -Doptimize=ReleaseFast` and
   `nix develop --command zig build test` pass.
+- The opt-in IQ4_NL expert down-sum shader now maps active expert slots across
+  eight subgroup lanes per output row and uses a 32-lane clustered reduction so
+  AMD wave64 subgroups do not mix adjacent slots. Correctness:
+  `nix develop --command zig build test --summary all` reports 142/142 tests
+  passed. Focused layer-10 `bench-moe --iters 64 --skip-readback` measured the
+  new `LLMTOY_EXPERT_DOWN_SUM_ID=1` path at `51.96 us` for `moe.down_sum`,
+  down from `54.29 us` before this shader reshaping, but still slower than the
+  default `moe.down` + `moe.accum` pair (`38.78 + 4.05 us`). Keep it opt-in.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

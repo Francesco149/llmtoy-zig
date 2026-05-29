@@ -9,8 +9,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16: require
 #extension GL_KHR_shader_subgroup_basic                   : require
 #extension GL_KHR_shader_subgroup_arithmetic              : require
+#extension GL_KHR_shader_subgroup_clustered               : require
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 
 struct block_iq4_nl {
     float16_t d;
@@ -30,6 +31,8 @@ layout(std430, set = 0, binding = 4) writeonly buffer D { float         out_vec[
 
 layout(push_constant) uniform PC { uint rows; uint cols; uint n_active; } pc;
 
+shared float slot_sums[8];
+
 const int IQ4_NL_TABLE[16] = int[16](
     -127, -104, -83, -65, -49, -35, -22, -10,
        1,   13,  25,  38,  53,  69,  89, 113
@@ -44,13 +47,13 @@ void main() {
     const uint row = gl_WorkGroupID.x;
     if (row >= pc.rows) return;
     const uint tid = gl_LocalInvocationID.x;
+    const uint slot_lane = gl_LocalInvocationID.y;
 
     const uint n_sub = pc.cols / 32u;
     const uint x4_per_vec = (pc.cols + 127u) / 128u;
 
-    float total = 0.0;
-
-    for (uint slot = 0u; slot < pc.n_active; ++slot) {
+    float slot_total = 0.0;
+    for (uint slot = slot_lane; slot < pc.n_active; slot += 8u) {
         const uint expert = ids[slot];
         const uint row_blk_off = (expert * pc.rows + row) * n_sub;
         float acc = 0.0;
@@ -75,11 +78,20 @@ void main() {
             acc += float(weights[blk_ib].d) * float(acts[x4_idx].ds[x4_sub].x) * float(block_sum);
         }
 
-        acc = subgroupAdd(acc);
-        if (tid == 0u) total += acc * scales[slot];
+        acc = subgroupClusteredAdd(acc, 32);
+        if (tid == 0u) slot_total += acc * scales[slot];
     }
 
     if (tid == 0u) {
+        slot_sums[slot_lane] = slot_total;
+    }
+    barrier();
+
+    if (tid == 0u && slot_lane == 0u) {
+        float total = 0.0;
+        [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+            total += slot_sums[i];
+        }
         out_vec[row] = total;
     }
 }
