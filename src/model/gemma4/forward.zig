@@ -200,8 +200,11 @@ pub fn forwardOne(
         const kv_cap_l = kv.cap[l];
         const kv_slot_l = pos % kv_cap_l;
         const can_q8_1_kv_vram = can_q8_1_qkv and (if (gpu) |g| g.k_vram != null else false);
+        const seq = pos + 1;
+        const win_len = if (is_swa) @min(seq, cfg.sliding_window) else seq;
 
         var gpu_did_norms_and_rope = false;
+        var gpu_did_attention = false;
         if (can_q8_1_kv_vram) {
             const g = gpu.?;
             const wq_q8_pl = g.q8_1PipelineFor(lw.wq.type_).?;
@@ -212,8 +215,19 @@ pub fn forwardOne(
                 null;
             const k_readback: ?[]f32 = if (attn_cpu_kv_shadow) k_cur else null;
             const v_readback: ?[]f32 = if (attn_cpu_kv_shadow) v_cur else null;
-            try g.runLayerAttnQ8_1KvVram(l, cfg.eps, lw.wq.type_, wq_q8_pl, lw.wk.type_, wk_q8_pl, if (lw.wv) |wv| wv.type_ else null, wv_q8_pl, @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd), @intCast(pos), is_swa, cfg.rope_theta_swa, @intCast(kv_slot_l), x, null, k_readback, v_readback);
+            const attn_dst: ?[]f32 = if (can_full_fused) null else attn_concat[0..nq_l];
+            try g.runLayerAttnQ8_1KvVram(l, cfg.eps, lw.wq.type_, wq_q8_pl, lw.wk.type_, wk_q8_pl, if (lw.wv) |wv| wv.type_ else null, wv_q8_pl, @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd), @intCast(pos), is_swa, cfg.rope_theta_swa, @intCast(kv_slot_l), x, null, k_readback, v_readback, .{
+                .n_heads = @intCast(cfg.n_heads),
+                .n_kv_heads = @intCast(n_kv_l),
+                .head_dim = @intCast(hd),
+                .pos = @intCast(pos),
+                .win_len = @intCast(win_len),
+                .cap = @intCast(kv_cap_l),
+                .scale = 1.0,
+                .attn_out = attn_dst,
+            });
             gpu_did_norms_and_rope = true;
+            gpu_did_attention = true;
         } else if (can_q8_1_qkv) {
             const g = gpu.?;
             const wq_q8_pl = g.q8_1PipelineFor(lw.wq.type_).?;
@@ -273,8 +287,6 @@ pub fn forwardOne(
         }
 
         // Determine attended positions.
-        const seq = pos + 1;
-        const win_len = if (is_swa) @min(seq, cfg.sliding_window) else seq;
         // For SWA: attend positions [pos - win_len + 1 .. pos].
         const start = if (seq > win_len) seq - win_len else 0;
         _ = start; // used implicitly via kv_slot math below
@@ -285,7 +297,9 @@ pub fn forwardOne(
         // full-fused wo+dense-FFN path reads it directly. Only download to
         // attn_concat when the non-full-fused wo fallback needs it on CPU.
         const use_gpu_attn = gpu_did_norms_and_rope;
-        if (use_gpu_attn) {
+        if (gpu_did_attention) {
+            // Attention was appended to the QKV/KV-cache command buffer above.
+        } else if (use_gpu_attn) {
             const dst: ?[]f32 = if (can_full_fused) null else attn_concat[0..nq_l];
             try gpu.?.runLayerAttention(l, @intCast(cfg.n_heads), @intCast(n_kv_l), @intCast(hd), @intCast(pos), @intCast(win_len), @intCast(kv_cap_l), 1.0, dst);
         } else {

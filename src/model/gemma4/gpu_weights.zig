@@ -104,6 +104,17 @@ pub const FinalLogitsInput = enum {
     x_vram,
 };
 
+pub const AttentionParams = struct {
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    pos: u32,
+    win_len: u32,
+    cap: u32,
+    scale: f32,
+    attn_out: ?[]f32,
+};
+
 pub const GpuWeights = struct {
     ctx: GpuCtx,
     pl_f32: MatvecPipeline,
@@ -1728,6 +1739,7 @@ pub const GpuWeights = struct {
         q_out: ?[]f32,
         k_out: ?[]f32,
         v_out: ?[]f32,
+        attention: ?AttentionParams,
     ) !void {
         const lw = &self.layers[layer];
         const wq = lw.wq orelse return error.NotOnGpu;
@@ -1855,12 +1867,22 @@ pub const GpuWeights = struct {
         const p_v_copy = self.ctx.profileBegin(cmd, "attn_front.v_cache_copy");
         GpuCtx.recordCopyRegion(cmd, v_buf.handle, v_cache.handle, 0, slot_offset, slot_bytes);
         self.ctx.profileEnd(cmd, p_v_copy);
+        if (attention) |ap| {
+            GpuCtx.recordTransferToShaderBarrier(cmd);
+            try self.recordLayerAttention(cmd, layer, ap);
+        }
 
         try self.ctx.submitReusableBatch(cmd);
 
         if (q_out) |q| try self.downloadSmallDeviceBuffer(q_buf, std.mem.sliceAsBytes(q));
         if (k_out) |k| try self.downloadSmallDeviceBuffer(k_buf, std.mem.sliceAsBytes(k));
         if (v_out) |v| try self.downloadSmallDeviceBuffer(v_buf, std.mem.sliceAsBytes(v));
+        if (attention) |ap| {
+            if (ap.attn_out) |o| {
+                const attn_buf = &(self.attn_in_buf orelse return error.NotOnGpu);
+                try attn_buf.download(std.mem.sliceAsBytes(o));
+            }
+        }
     }
 
     // 7l.2/3 — GPU attention compute. Replaces the per-head CPU sdpAttn loop.
@@ -1890,19 +1912,6 @@ pub const GpuWeights = struct {
         scale: f32,
         attn_out: ?[]f32,
     ) !void {
-        const q_buf = &(self.q_out_buf orelse return error.NotOnGpu);
-        const k_cache = &((self.k_vram orelse return error.NotOnGpu)[layer]);
-        const v_cache = &((self.v_vram orelse return error.NotOnGpu)[layer]);
-        const scores_buf = &(self.scores_vram orelse return error.NotOnGpu);
-        const attn_buf = &(self.attn_in_buf orelse return error.NotOnGpu);
-
-        const seq = pos + 1;
-        const n_q_per_kv = n_heads / n_kv_heads;
-        const fused_small_enabled = if (std.c.getenv("LLMTOY_ATTENTION_FUSED_SMALL")) |raw|
-            !std.mem.eql(u8, std.mem.span(raw), "0")
-        else
-            true;
-        const use_fused_small = fused_small_enabled and win_len <= 1024;
         const async_attention_enabled = if (std.c.getenv("LLMTOY_ATTENTION_ASYNC")) |raw|
             !std.mem.eql(u8, std.mem.span(raw), "0")
         else
@@ -1910,30 +1919,62 @@ pub const GpuWeights = struct {
 
         const async_attention = async_attention_enabled and attn_out == null and self.ctx.profiler == null and self.pending_gpu_batch == null;
         const cmd = try self.beginLayerReusableBatch(&self.attention_reuse_cmds, layer);
-        if (use_fused_small) {
-            const p_fused = self.ctx.profileBegin(cmd, "attention.fused_small");
-            const fused_dset = try self.attentionFusedSmallSet(layer, q_buf, k_cache, v_cache, attn_buf);
-            self.pl_attn_fused_small.recordWithSet(cmd, fused_dset, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
-            self.ctx.profileEnd(cmd, p_fused);
-        } else {
-            const p_qk = self.ctx.profileBegin(cmd, "attention.qk_softmax");
-            const qk_dset = try self.attentionQkSet(layer, q_buf, k_cache, scores_buf);
-            self.pl_attn_qk.recordWithSet(cmd, qk_dset, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap, scale);
-            self.ctx.profileEnd(cmd, p_qk);
-            GpuCtx.recordShaderBarrier(cmd);
-            const p_av = self.ctx.profileBegin(cmd, "attention.av");
-            const av_dset = try self.attentionAvSet(layer, scores_buf, v_cache, attn_buf);
-            self.pl_attn_av.recordWithSet(cmd, av_dset, n_heads, seq, win_len, head_dim, n_kv_heads, n_q_per_kv, cap);
-            self.ctx.profileEnd(cmd, p_av);
-        }
+        try self.recordLayerAttention(cmd, layer, .{
+            .n_heads = n_heads,
+            .n_kv_heads = n_kv_heads,
+            .head_dim = head_dim,
+            .pos = pos,
+            .win_len = win_len,
+            .cap = cap,
+            .scale = scale,
+            .attn_out = attn_out,
+        });
 
         if (async_attention) {
             self.pending_gpu_batch = try self.ctx.submitReusableBatchAsync(cmd);
         } else {
             try self.ctx.submitReusableBatch(cmd);
             if (attn_out) |o| {
+                const attn_buf = &(self.attn_in_buf orelse return error.NotOnGpu);
                 try attn_buf.download(std.mem.sliceAsBytes(o));
             }
+        }
+    }
+
+    fn recordLayerAttention(
+        self: *GpuWeights,
+        cmd: vk.VkCommandBuffer,
+        layer: usize,
+        params: AttentionParams,
+    ) !void {
+        const q_buf = &(self.q_out_buf orelse return error.NotOnGpu);
+        const k_cache = &((self.k_vram orelse return error.NotOnGpu)[layer]);
+        const v_cache = &((self.v_vram orelse return error.NotOnGpu)[layer]);
+        const scores_buf = &(self.scores_vram orelse return error.NotOnGpu);
+        const attn_buf = &(self.attn_in_buf orelse return error.NotOnGpu);
+
+        const seq = params.pos + 1;
+        const n_q_per_kv = params.n_heads / params.n_kv_heads;
+        const fused_small_enabled = if (std.c.getenv("LLMTOY_ATTENTION_FUSED_SMALL")) |raw|
+            !std.mem.eql(u8, std.mem.span(raw), "0")
+        else
+            true;
+        const use_fused_small = fused_small_enabled and params.win_len <= 1024;
+        if (use_fused_small) {
+            const p_fused = self.ctx.profileBegin(cmd, "attention.fused_small");
+            const fused_dset = try self.attentionFusedSmallSet(layer, q_buf, k_cache, v_cache, attn_buf);
+            self.pl_attn_fused_small.recordWithSet(cmd, fused_dset, params.n_heads, seq, params.win_len, params.head_dim, params.n_kv_heads, n_q_per_kv, params.cap, params.scale);
+            self.ctx.profileEnd(cmd, p_fused);
+        } else {
+            const p_qk = self.ctx.profileBegin(cmd, "attention.qk_softmax");
+            const qk_dset = try self.attentionQkSet(layer, q_buf, k_cache, scores_buf);
+            self.pl_attn_qk.recordWithSet(cmd, qk_dset, params.n_heads, seq, params.win_len, params.head_dim, params.n_kv_heads, n_q_per_kv, params.cap, params.scale);
+            self.ctx.profileEnd(cmd, p_qk);
+            GpuCtx.recordShaderBarrier(cmd);
+            const p_av = self.ctx.profileBegin(cmd, "attention.av");
+            const av_dset = try self.attentionAvSet(layer, scores_buf, v_cache, attn_buf);
+            self.pl_attn_av.recordWithSet(cmd, av_dset, params.n_heads, seq, params.win_len, params.head_dim, params.n_kv_heads, n_q_per_kv, params.cap);
+            self.ctx.profileEnd(cmd, p_av);
         }
     }
 
