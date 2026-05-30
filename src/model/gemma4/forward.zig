@@ -364,7 +364,7 @@ pub fn forwardOne(
         if (can_full_fused) {
             const g = gpu.?;
             const dense_readback: ?[]f32 = if (use_moe_vram_tail) null else ffn_buf;
-            try g.runLayerAttnResidualDenseFfnQ8_1(l, cfg.eps, lw.wo.type_, wo_q8_pl.?, lw.w_gate.type_, gate_q8_pl.?, lw.w_up.type_, up_q8_pl.?, lw.w_down.type_, g.pipelineFor(lw.w_down.type_), g.q8_1PipelineFor(lw.w_down.type_), x, attn_concat[0..nq_l], dense_readback, use_gpu_attn);
+            try g.runLayerAttnResidualDenseFfnQ8_1(l, cfg.eps, lw.wo.type_, wo_q8_pl.?, lw.w_gate.type_, gate_q8_pl.?, lw.w_up.type_, up_q8_pl.?, lw.w_down.type_, g.pipelineFor(lw.w_down.type_), g.q8_1PipelineFor(lw.w_down.type_), x, attn_concat[0..nq_l], dense_readback, residual_current_in_gpu_vram, use_gpu_attn);
             // x updated with post-attn residual; dense_ffn_out_buf has post_ffw_norm_1.
             x_current_in_gpu_shared_vec = false;
             x_current_in_gpu_vram = true;

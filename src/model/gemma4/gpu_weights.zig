@@ -2311,8 +2311,9 @@ pub const GpuWeights = struct {
     // Requirements:
     //   - wo, w_gate, w_up have Q8_1 pipelines; w_down uses Q8_1 when
     //     available, otherwise the regular f32-activation pipeline.
-    //   - Uploads x and attn_concat to shared_vec / attn_in_buf internally;
-    //     caller just passes the slices.
+    //   - Uploads x and attn_concat to shared_vec / attn_in_buf internally,
+    //     unless x is already current in x_vram or GPU attention already wrote
+    //     attn_in_buf.
     //   - On return, ffn_out holds post_ffw_norm_1(...) and x (input slice)
     //     has been overwritten with the post-attention residual.
     pub fn runLayerAttnResidualDenseFfnQ8_1(
@@ -2331,6 +2332,7 @@ pub const GpuWeights = struct {
         x: []f32, // in: unnormalized residual; out: x + post_attn_norm(wo(attn_concat))
         attn_concat: []const f32, // CPU sdpAttn output, length = nq
         ffn_out: ?[]f32, // post_ffw_norm_1 result (d_model)
+        x_vram_current: bool, // previous MoE tail left x_vram equal to x
         skip_attn_upload: bool, // 7l.2/3: GPU attention already wrote attn_in_buf
     ) !void {
         const lw = &self.layers[layer];
@@ -2362,14 +2364,18 @@ pub const GpuWeights = struct {
         const ffn_buf = &(self.ffn_vram orelse return error.NotOnGpu);
         const out_buf = &(self.dense_ffn_out_buf orelse return error.NotOnGpu);
 
-        try stage_buf.upload(std.mem.sliceAsBytes(x));
+        if (!x_vram_current) {
+            try stage_buf.upload(std.mem.sliceAsBytes(x));
+        }
         if (!skip_attn_upload) {
             try attn_in_buf.upload(std.mem.sliceAsBytes(attn_concat));
         }
 
         const cmd = try self.beginLayerReusableBatch(&self.dense_full_reuse_cmds, layer);
-        GpuCtx.recordCopy(cmd, stage_buf.handle, x_buf.handle, x.len * @sizeOf(f32));
-        GpuCtx.recordTransferToShaderBarrier(cmd);
+        if (!x_vram_current) {
+            GpuCtx.recordCopy(cmd, stage_buf.handle, x_buf.handle, x.len * @sizeOf(f32));
+            GpuCtx.recordTransferToShaderBarrier(cmd);
+        }
 
         // wo: quantize attn_concat, then Q8_1 matvec into attn_vram.
         const p_wo_quant = self.ctx.profileBegin(cmd, "post_attn.wo_quantize");
