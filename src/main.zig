@@ -1879,10 +1879,11 @@ fn cmdGenerate(
         const t_prefill_start = clk.now(io);
         printSetupTiming(t_load_start, t_prefill_start);
         std.debug.print("prefilling {} tokens (threads={})...\n", .{ prompt_ids.len, n_threads });
-        var last_logits: []f32 = undefined;
+        var last_logits: []f32 = &.{};
         for (prompt_ids, 0..) |tok, pos| {
-            if (pos > 0) gpa.free(last_logits);
-            last_logits = try g4_fwd.forwardOne(tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr, null, opts.gpu_layer_range);
+            if (last_logits.len > 0) gpa.free(last_logits);
+            const need_logits = pos + 1 == prompt_ids.len;
+            last_logits = try g4_fwd.forwardOne(tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr, null, opts.gpu_layer_range, need_logits);
         }
         const t_prefill = clk.now(io);
         printTokenTiming("prefill", prompt_ids.len, t_prefill_start, t_prefill);
@@ -1904,7 +1905,7 @@ fn cmdGenerate(
             const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
             try out.writeAll(tok_buf[0..tok_len]);
             try out.flush();
-            last_logits = try g4_fwd.forwardOne(next_tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr, null, opts.gpu_layer_range);
+            last_logits = try g4_fwd.forwardOne(next_tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr, null, opts.gpu_layer_range, true);
             pos += 1;
         }
         if (last_logits.len > 0) gpa.free(last_logits);
@@ -2094,13 +2095,13 @@ fn cmdCompare(
     std.debug.print("running CPU forward pass (token={})...\n", .{cmp_token});
     var kv_cpu = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
     defer kv_cpu.deinit();
-    const cpu_logits = try g4_fwd.forwardOne(cmp_token, 0, &kv_cpu, &weights, g4cfg, pool, gpa, null, cpu_taps, null);
+    const cpu_logits = try g4_fwd.forwardOne(cmp_token, 0, &kv_cpu, &weights, g4cfg, pool, gpa, null, cpu_taps, null, true);
     defer gpa.free(cpu_logits);
 
     std.debug.print("running GPU forward pass...\n", .{});
     var kv_gpu = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
     defer kv_gpu.deinit();
-    const gpu_logits = try g4_fwd.forwardOne(cmp_token, 0, &kv_gpu, &weights, g4cfg, pool, gpa, gpu_ptr, gpu_taps, opts.gpu_layer_range);
+    const gpu_logits = try g4_fwd.forwardOne(cmp_token, 0, &kv_gpu, &weights, g4cfg, pool, gpa, gpu_ptr, gpu_taps, opts.gpu_layer_range, true);
     defer gpa.free(gpu_logits);
 
     // ── per-layer residual comparison ─────────────────────────────────────────

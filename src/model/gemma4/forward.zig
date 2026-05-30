@@ -45,6 +45,7 @@ pub fn forwardOne(
     gpu: ?*GpuWeights,
     layer_taps: ?[][]f32,
     gpu_layer_range: ?[2]usize,
+    compute_logits: bool,
 ) ![]f32 {
     const d = cfg.d_model;
     const n_threads = pool.threads.len;
@@ -412,7 +413,7 @@ pub fn forwardOne(
         // for all non-skipped layers.
         @memset(moe_buf, 0.0);
         var moe_residual_done_on_gpu = false;
-        const leave_final_x_on_gpu = final_logits_gpu_possible and
+        const leave_final_x_on_gpu = (final_logits_gpu_possible or !compute_logits) and
             layer_taps == null and
             l + 1 == cfg.n_layers and
             use_moe_vram_tail and
@@ -488,6 +489,7 @@ pub fn forwardOne(
     }
 
     // ── Final logits ─────────────────────────────────────────────────────────
+    if (!compute_logits) return &.{};
 
     const logits = try allocator.alloc(f32, cfg.vocab_size);
     const final_logits_on_gpu = if (gpu) |g| blk: {
