@@ -1363,6 +1363,11 @@ pub const ExpertGateUpIdPipeline = struct {
         return initFromSpv(ctx, &shaders.expert_gate_up_id_q3_k_q8_1_r2, 2);
     }
 
+    pub fn initQ3KQ8_1R4(ctx: *const GpuContext) !ExpertGateUpIdPipeline {
+        comptime std.debug.assert(shaders.expert_gate_up_id_q3_k_q8_1_r4.len % 4 == 0);
+        return initFromSpv(ctx, &shaders.expert_gate_up_id_q3_k_q8_1_r4, 4);
+    }
+
     fn initFromSpv(ctx: *const GpuContext, spv: []align(4) const u8, rows_per_workgroup: u32) !ExpertGateUpIdPipeline {
         const built = try buildSimplePipeline(ctx, spv, 4, @sizeOf(ExpertGateUpIdPushConst), 64);
         return .{
@@ -3891,6 +3896,8 @@ test "gpu expert-id gate-up Q3_K x Q8_1 fuzz" {
     defer pipeline.deinit();
     var pipeline_r2 = try ExpertGateUpIdPipeline.initQ3KQ8_1R2(&gpu);
     defer pipeline_r2.deinit();
+    var pipeline_r4 = try ExpertGateUpIdPipeline.initQ3KQ8_1R4(&gpu);
+    defer pipeline_r4.deinit();
 
     var weights_buf = try GpuBuffer.initHostCoherent(&gpu, flat_bytes, @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     defer weights_buf.deinit();
@@ -3952,6 +3959,33 @@ test "gpu expert-id gate-up Q3_K x Q8_1 fuzz" {
         const rel_r2 = max_abs_r2 / (max_ref_r2 + 1e-6);
         std.debug.print("expert-id Q3_K×Q8_1 GU r2 fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs_r2, rel_r2 });
         try std.testing.expect(rel_r2 < 1e-4);
+    }
+
+    {
+        const zeroes = try al.alloc(f32, active * rows);
+        defer al.free(zeroes);
+        @memset(zeroes, 0.0);
+        try out_buf.upload(std.mem.sliceAsBytes(zeroes));
+
+        const cmd_r4 = try gpu.beginBatch();
+        var ds_r4 = try pipeline_r4.record(cmd_r4, &weights_buf, &acts_buf, &ids_buf, &out_buf, @intCast(rows), @intCast(cols), @intCast(active));
+        try gpu.submitBatch(cmd_r4);
+        _ = vk.vkFreeDescriptorSets(gpu.device, pipeline_r4.desc_pool, 1, &ds_r4);
+
+        const gpu_out_r4 = try al.alloc(f32, active * rows);
+        defer al.free(gpu_out_r4);
+        try out_buf.download(std.mem.sliceAsBytes(gpu_out_r4));
+
+        var max_abs_r4: f32 = 0.0;
+        var max_ref_r4: f32 = 0.0;
+        for (cpu_out, gpu_out_r4) |c, g| {
+            const d = @abs(c - g);
+            if (d > max_abs_r4) max_abs_r4 = d;
+            if (@abs(c) > max_ref_r4) max_ref_r4 = @abs(c);
+        }
+        const rel_r4 = max_abs_r4 / (max_ref_r4 + 1e-6);
+        std.debug.print("expert-id Q3_K×Q8_1 GU r4 fuzz active={} rows={} cols={} max|D|={d:.6} rel={e:.3}\n", .{ active, rows, cols, max_abs_r4, rel_r4 });
+        try std.testing.expect(rel_r4 < 1e-4);
     }
 }
 

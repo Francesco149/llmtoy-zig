@@ -1255,6 +1255,8 @@ fn benchExpertGateUpIdShape(
     defer pipeline.deinit();
     var pipeline_r2 = try gpu_matvec.ExpertGateUpIdPipeline.initQ3KQ8_1R2(&gpu_weights.ctx);
     defer pipeline_r2.deinit();
+    var pipeline_r4 = try gpu_matvec.ExpertGateUpIdPipeline.initQ3KQ8_1R4(&gpu_weights.ctx);
+    defer pipeline_r4.deinit();
 
     const flat_session_opt = try gpu_matvec.MatvecSession.initFromRaw(
         &gpu_weights.ctx,
@@ -1299,6 +1301,7 @@ fn benchExpertGateUpIdShape(
 
     try warmExpertGateUpId(&gpu_weights.ctx, &pipeline, &flat_session.mat_buf, &act_q8_buf, &ids_buf, &out_buf, @intCast(cfg.d_expert), @intCast(cfg.d_model), @intCast(top_idx.len), "moe.gate_up_id");
     try warmExpertGateUpId(&gpu_weights.ctx, &pipeline_r2, &flat_session.mat_buf, &act_q8_buf, &ids_buf, &out_buf, @intCast(cfg.d_expert), @intCast(cfg.d_model), @intCast(top_idx.len), "moe.gate_up_id.r2");
+    try warmExpertGateUpId(&gpu_weights.ctx, &pipeline_r4, &flat_session.mat_buf, &act_q8_buf, &ids_buf, &out_buf, @intCast(cfg.d_expert), @intCast(cfg.d_model), @intCast(top_idx.len), "moe.gate_up_id.r4");
 
     const before = gpu_weights.ctx.profileStats("moe.gate_up_id");
     const clk = std.Io.Clock.real;
@@ -1353,6 +1356,33 @@ fn benchExpertGateUpIdShape(
 
     try out.print("expert-id gate-up shape r2: type={s} active={} wall_us={d:.2} gpu_us={d:.2} host_us={d:.2}\n", .{
         lw.gate_up_exps.type_.label(), top_idx.len, wall_r2_us, gpu_r2_us, @max(0.0, wall_r2_us - gpu_r2_us),
+    });
+
+    const before_r4 = gpu_weights.ctx.profileStats("moe.gate_up_id.r4");
+    const t4 = clk.now(io);
+    for (0..iters) |_| {
+        const cmd = try gpu_weights.ctx.beginBatch();
+        const p_gu = gpu_weights.ctx.profileBegin(cmd, "moe.gate_up_id.r4");
+        const ds = try pipeline_r4.record(cmd, &flat_session.mat_buf, &act_q8_buf, &ids_buf, &out_buf, @intCast(cfg.d_expert), @intCast(cfg.d_model), @intCast(top_idx.len));
+        gpu_weights.ctx.profileEnd(cmd, p_gu);
+        try gpu_weights.ctx.submitBatch(cmd);
+        var ds_mut = ds;
+        _ = vk.vkFreeDescriptorSets(gpu_weights.ctx.device, pipeline_r4.desc_pool, 1, &ds_mut);
+    }
+    const t5 = clk.now(io);
+    const after_r4 = gpu_weights.ctx.profileStats("moe.gate_up_id.r4");
+
+    const wall_r4_ns = t4.durationTo(t5).nanoseconds;
+    const wall_r4_us = @as(f64, @floatFromInt(wall_r4_ns)) / @as(f64, @floatFromInt(iters)) / 1000.0;
+    const count_r4_delta = after_r4.count - before_r4.count;
+    const gpu_r4_ns = after_r4.total_ns - before_r4.total_ns;
+    const gpu_r4_us = if (count_r4_delta == 0)
+        0.0
+    else
+        @as(f64, @floatFromInt(gpu_r4_ns)) / @as(f64, @floatFromInt(count_r4_delta)) / 1000.0;
+
+    try out.print("expert-id gate-up shape r4: type={s} active={} wall_us={d:.2} gpu_us={d:.2} host_us={d:.2}\n", .{
+        lw.gate_up_exps.type_.label(), top_idx.len, wall_r4_us, gpu_r4_us, @max(0.0, wall_r4_us - gpu_r4_us),
     });
 }
 

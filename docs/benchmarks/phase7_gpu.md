@@ -1797,6 +1797,14 @@ MoE dispatch follow-up:
   new `LLMTOY_EXPERT_DOWN_SUM_ID=1` path at `51.96 us` for `moe.down_sum`,
   down from `54.29 us` before this shader reshaping, but still slower than the
   default `moe.down` + `moe.accum` pair (`38.78 + 4.05 us`). Keep it opt-in.
+- Added a bench-only four-row selected-expert Q3_K gate/up probe. It preserves
+  the r2 shader's independent 32-lane clustered reductions while packing four
+  output rows into each 128-thread workgroup. Correctness:
+  `zig build test --summary all` reports 144/144 tests passed, including the
+  r4 fuzz check (`rel=7.601e-7`). Focused layer-10
+  `LLMTOY_GPU_PROFILE=1 bench-moe --iters 64 --layer 10 --skip-readback`
+  measured r4 at `48.37 us` GPU versus production r2 at `47.23 us`. Keep r4
+  bench-only and leave production on r2.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
