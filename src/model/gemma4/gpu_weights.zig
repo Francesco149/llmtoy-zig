@@ -181,8 +181,8 @@ pub const GpuWeights = struct {
     // the fused dense FFN chain.  d_model floats.
     dense_ffn_out_buf: ?GpuBuffer,
     // Phase 7j step 2 — wo absorbed into the dense FFN submit.
-    //   attn_in_buf: HOST_COHERENT upload buffer for attn_concat (caller
-    //                writes after CPU sdpAttn finishes).  Sized to max_nq.
+    //   attn_in_buf: device-local wo input buffer. GPU attention writes it
+    //                directly; CPU fallback uploads through stage_buf.
     //   attn_vram:   wo output (rows = d_model), modified in place by
     //                post_attention_norm, then read by elem_add.
     attn_in_buf: ?GpuBuffer,
@@ -721,17 +721,16 @@ pub const GpuWeights = struct {
         std.debug.print("  dense FFN VRAM: gate={} KiB up={} KiB ffn={} KiB out={} KiB\n", .{ dffn_bytes / 1024, dffn_bytes / 1024, g4cfg.d_model * @sizeOf(f32) / 1024, g4cfg.d_model * @sizeOf(f32) / 1024 });
 
         // wo input/output buffers for the combined attn-residual + dense FFN
-        // submit.  attn_in_buf is HOST_COHERENT because the caller uploads
-        // attn_concat right before the submit; attn_vram lives in VRAM so the
-        // post_attention_norm + elem_add chain runs without PCIe traffic.
+        // submit. Both are device-local on the normal GPU-attention path.
+        // CPU fallback uploads attn_concat through stage_buf.
         var max_nq: u32 = 0;
         for (gw.layers) |l| if (l.wo) |s| if (s.cols > max_nq) {
             max_nq = s.cols;
         };
         if (max_nq == 0) max_nq = @intCast(g4cfg.d_model);
-        gw.attn_in_buf = try GpuBuffer.initHostCoherent(&gw.ctx, max_nq * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.attn_in_buf = try GpuBuffer.initDeviceLocal(&gw.ctx, max_nq * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         gw.attn_vram = try GpuBuffer.initDeviceLocal(&gw.ctx, g4cfg.d_model * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        std.debug.print("  wo fusion bufs: attn_in={} KiB (host) attn_vram={} KiB (VRAM)\n", .{ max_nq * @sizeOf(f32) / 1024, g4cfg.d_model * @sizeOf(f32) / 1024 });
+        std.debug.print("  wo fusion bufs: attn_in={} KiB (VRAM) attn_vram={} KiB (VRAM)\n", .{ max_nq * @sizeOf(f32) / 1024, g4cfg.d_model * @sizeOf(f32) / 1024 });
 
         // Per-projection output buffers for batched QKV and gate+up dispatch.
         // Sized per-projection so all three (or two) can be in-flight simultaneously.
@@ -1913,7 +1912,7 @@ pub const GpuWeights = struct {
         if (attention) |ap| {
             if (ap.attn_out) |o| {
                 const attn_buf = &(self.attn_in_buf orelse return error.NotOnGpu);
-                try attn_buf.download(std.mem.sliceAsBytes(o));
+                try self.downloadSmallDeviceBuffer(attn_buf, std.mem.sliceAsBytes(o));
             }
         }
     }
@@ -1927,7 +1926,7 @@ pub const GpuWeights = struct {
     //   - V from v_vram[layer] (per-layer VRAM cache).
     //
     // Writes:
-    //   - attn_in_buf (host-coherent, sized max_nq). After this submit, the
+    //   - attn_in_buf (device-local, sized max_nq). After this submit, the
     //     wo input is already on the GPU side; runLayerAttnResidualDenseFfnQ8_1
     //     should skip its own upload (caller passes skip_attn_upload=true).
     //
@@ -1964,7 +1963,7 @@ pub const GpuWeights = struct {
             try self.ctx.submitReusableBatch(cmd);
             if (attn_out) |o| {
                 const attn_buf = &(self.attn_in_buf orelse return error.NotOnGpu);
-                try attn_buf.download(std.mem.sliceAsBytes(o));
+                try self.downloadSmallDeviceBuffer(attn_buf, std.mem.sliceAsBytes(o));
             }
         }
     }
@@ -2368,13 +2367,18 @@ pub const GpuWeights = struct {
             try stage_buf.upload(std.mem.sliceAsBytes(x));
         }
         if (!skip_attn_upload) {
-            try attn_in_buf.upload(std.mem.sliceAsBytes(attn_concat));
+            try self.uploadSmallDeviceBuffer(attn_in_buf, std.mem.sliceAsBytes(attn_concat));
         }
 
         const cmd = try self.beginLayerReusableBatch(&self.dense_full_reuse_cmds, layer);
         if (!x_vram_current) {
             GpuCtx.recordCopy(cmd, stage_buf.handle, x_buf.handle, x.len * @sizeOf(f32));
             GpuCtx.recordTransferToShaderBarrier(cmd);
+        }
+        if (skip_attn_upload) {
+            // GPU attention wrote attn_in_buf in the previous submit. Make that
+            // device-local compute write visible before wo quantization reads it.
+            GpuCtx.recordShaderBarrier(cmd);
         }
 
         // wo: quantize attn_concat, then Q8_1 matvec into attn_vram.

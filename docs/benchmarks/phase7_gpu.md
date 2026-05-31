@@ -1805,6 +1805,15 @@ MoE dispatch follow-up:
   `LLMTOY_GPU_PROFILE=1 bench-moe --iters 64 --layer 10 --skip-readback`
   measured r4 at `48.37 us` GPU versus production r2 at `47.23 us`. Keep r4
   bench-only and leave production on r2.
+- The attention output buffer now remains in device-local VRAM between GPU
+  attention and output-projection quantization. CPU fallback uploads and debug
+  readbacks use the staging buffer. Correctness: `zig build test --summary all`
+  reports 144/144 tests passed. A stash A/B compare confirmed that the existing
+  final-logit top-two swap is unchanged by this move. On the same short
+  22-token profile, `post_attn.wo_quantize` fell from `2.61 us` to `1.06 us`
+  average, total dispatch from `208.451 ms` to `207.119 ms`, and batch span
+  from `233.576 ms` to `230.218 ms`. This is a narrow buffer-placement
+  cleanup, not a throughput milestone.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
