@@ -82,6 +82,8 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(expert_down_id_iq4_nl_q8_1_iacc_spv, "expert_down_id_iq4_nl_q8_1_iacc.spv");
     const expert_down_sum_id_iq4_nl_q8_1_spv = compileShader(b, "src/gpu/shaders/expert_down_sum_id_iq4_nl_q8_1.glsl");
     _ = wf.addCopyFile(expert_down_sum_id_iq4_nl_q8_1_spv, "expert_down_sum_id_iq4_nl_q8_1.spv");
+    const moe_router_topk_spv = compileShader(b, "src/gpu/shaders/moe_router_topk.glsl");
+    _ = wf.addCopyFile(moe_router_topk_spv, "moe_router_topk.spv");
     const rmsnorm_spv = compileShader(b, "src/gpu/shaders/rmsnorm.glsl");
     _ = wf.addCopyFile(rmsnorm_spv, "rmsnorm.spv");
     const rmsnorm_128_spv = compileShader(b, "src/gpu/shaders/rmsnorm_128.glsl");
@@ -158,6 +160,7 @@ pub fn build(b: *std.Build) void {
         \\pub const expert_down_id_iq4_nl_q8_1_b16 align(4) = @embedFile("expert_down_id_iq4_nl_q8_1_b16.spv").*;
         \\pub const expert_down_id_iq4_nl_q8_1_iacc align(4) = @embedFile("expert_down_id_iq4_nl_q8_1_iacc.spv").*;
         \\pub const expert_down_sum_id_iq4_nl_q8_1 align(4) = @embedFile("expert_down_sum_id_iq4_nl_q8_1.spv").*;
+        \\pub const moe_router_topk      align(4) = @embedFile("moe_router_topk.spv").*;
         \\pub const rmsnorm             align(4) = @embedFile("rmsnorm.spv").*;
         \\pub const rmsnorm_128         align(4) = @embedFile("rmsnorm_128.spv").*;
         \\pub const add_rmsnorm         align(4) = @embedFile("add_rmsnorm.spv").*;

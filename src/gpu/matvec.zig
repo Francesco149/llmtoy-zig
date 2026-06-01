@@ -2252,10 +2252,10 @@ fn buildSimplePipeline(
 } {
     const dev = ctx.device;
 
-    // Variable-size descriptor binding list. Expert-id kernels need five
-    // buffers: weights, activations, ids, scales, output.
-    std.debug.assert(n_bindings >= 1 and n_bindings <= 5);
-    var bindings_buf: [5]vk.VkDescriptorSetLayoutBinding = undefined;
+    // Variable-size descriptor binding list. The fused MoE router is the
+    // largest simple pipeline: nine fixed storage buffers.
+    std.debug.assert(n_bindings >= 1 and n_bindings <= 9);
+    var bindings_buf: [9]vk.VkDescriptorSetLayoutBinding = undefined;
     var b: u32 = 0;
     while (b < n_bindings) : (b += 1) bindings_buf[b] = mkStorageBuf(b);
     const dsl_ci = vk.VkDescriptorSetLayoutCreateInfo{
@@ -2613,6 +2613,106 @@ pub const LogitSoftcapPipeline = struct {
     }
 
     pub fn deinit(self: *LogitSoftcapPipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
+const MoeRouterTopKPushConst = extern struct {
+    d_model: u32,
+    n_experts: u32,
+    n_active: u32,
+    eps: f32,
+};
+
+pub const MoeRouterTopKPipeline = struct {
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !MoeRouterTopKPipeline {
+        comptime std.debug.assert(shaders.moe_router_topk.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.moe_router_topk, 9, @sizeOf(MoeRouterTopKPushConst), 64);
+        return .{
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn allocSet(
+        self: *const MoeRouterTopKPipeline,
+        x_buf: *const GpuBuffer,
+        norm_w_buf: *const GpuBuffer,
+        router_scale_buf: *const GpuBuffer,
+        router_w_buf: *const GpuBuffer,
+        down_scale_buf: *const GpuBuffer,
+        moe_in_buf: *const GpuBuffer,
+        ids_buf: *const GpuBuffer,
+        scales_buf: *const GpuBuffer,
+        accum_scales_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [9]vk.VkDescriptorBufferInfo{
+            .{ .buffer = x_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = norm_w_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = router_scale_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = router_w_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = down_scale_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = moe_in_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = ids_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = scales_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = accum_scales_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        var writes: [9]vk.VkWriteDescriptorSet = undefined;
+        for (&writes, &buf_infos, 0..) |*write, *info, binding| {
+            write.* = mkWrite(dset, @intCast(binding), info);
+        }
+        vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+        return dset;
+    }
+
+    pub fn recordWithSet(
+        self: *const MoeRouterTopKPipeline,
+        cmd: vk.VkCommandBuffer,
+        dset: vk.VkDescriptorSet,
+        d_model: u32,
+        n_experts: u32,
+        n_active: u32,
+        eps: f32,
+    ) void {
+        std.debug.assert(d_model <= 4096);
+        std.debug.assert(n_experts <= 128);
+        std.debug.assert(n_active <= 16);
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
+        const pc = MoeRouterTopKPushConst{
+            .d_model = d_model,
+            .n_experts = n_experts,
+            .n_active = n_active,
+            .eps = eps,
+        };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(MoeRouterTopKPushConst), &pc);
+        vk.vkCmdDispatch(cmd, 1, 1, 1);
+    }
+
+    pub fn deinit(self: *MoeRouterTopKPipeline) void {
         vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
         vk.vkDestroyPipeline(self.device, self.pipeline, null);
         vk.vkDestroyPipelineLayout(self.device, self.layout, null);
@@ -3477,6 +3577,82 @@ test "gpu matvec f32 correctness" {
     try std.testing.expectApproxEqAbs(out[1], 2.0, 1e-5);
     try std.testing.expectApproxEqAbs(out[2], 3.0, 1e-5);
     try std.testing.expectApproxEqAbs(out[3], 4.0, 1e-5);
+}
+
+test "gpu MoE router produces normalized input and stable top-k scales" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    var pipeline = try MoeRouterTopKPipeline.init(&gpu);
+    defer pipeline.deinit();
+
+    const d_model: u32 = 8;
+    const n_experts: u32 = 4;
+    const n_active: u32 = 2;
+    var x = [_]f32{1.0} ** d_model;
+    var norm_w = [_]f32{2.0} ** d_model;
+    var router_scale = [_]f32{@sqrt(8.0)} ** d_model;
+    var router_w = [_]f32{0.0} ** (d_model * n_experts);
+    for (0..d_model) |i| {
+        router_w[d_model + i] = 1.0;
+        router_w[2 * d_model + i] = 0.5;
+        router_w[3 * d_model + i] = 1.0;
+    }
+    var down_scale = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+
+    var x_buf = try GpuBuffer.initHostCoherent(&gpu, @sizeOf(@TypeOf(x)), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer x_buf.deinit();
+    var norm_w_buf = try GpuBuffer.initHostCoherent(&gpu, @sizeOf(@TypeOf(norm_w)), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer norm_w_buf.deinit();
+    var router_scale_buf = try GpuBuffer.initHostCoherent(&gpu, @sizeOf(@TypeOf(router_scale)), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer router_scale_buf.deinit();
+    var router_w_buf = try GpuBuffer.initHostCoherent(&gpu, @sizeOf(@TypeOf(router_w)), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer router_w_buf.deinit();
+    var down_scale_buf = try GpuBuffer.initHostCoherent(&gpu, @sizeOf(@TypeOf(down_scale)), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer down_scale_buf.deinit();
+    var moe_in_buf = try GpuBuffer.initHostCoherent(&gpu, @sizeOf(@TypeOf(x)), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer moe_in_buf.deinit();
+    var ids_buf = try GpuBuffer.initHostCoherent(&gpu, n_active * @sizeOf(u32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer ids_buf.deinit();
+    var scales_buf = try GpuBuffer.initHostCoherent(&gpu, n_active * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer scales_buf.deinit();
+    var accum_scales_buf = try GpuBuffer.initHostCoherent(&gpu, n_active * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer accum_scales_buf.deinit();
+    try x_buf.upload(std.mem.sliceAsBytes(&x));
+    try norm_w_buf.upload(std.mem.sliceAsBytes(&norm_w));
+    try router_scale_buf.upload(std.mem.sliceAsBytes(&router_scale));
+    try router_w_buf.upload(std.mem.sliceAsBytes(&router_w));
+    try down_scale_buf.upload(std.mem.sliceAsBytes(&down_scale));
+
+    const cmd = try gpu.beginBatch();
+    const dset = try pipeline.allocSet(&x_buf, &norm_w_buf, &router_scale_buf, &router_w_buf, &down_scale_buf, &moe_in_buf, &ids_buf, &scales_buf, &accum_scales_buf);
+    defer {
+        var tmp = dset;
+        _ = vk.vkFreeDescriptorSets(gpu.device, pipeline.desc_pool, 1, &tmp);
+    }
+    pipeline.recordWithSet(cmd, dset, d_model, n_experts, n_active, 0.0);
+    try gpu.submitBatch(cmd);
+
+    var moe_in: [d_model]f32 = undefined;
+    var ids: [n_active]u32 = undefined;
+    var scales: [n_active]f32 = undefined;
+    var accum_scales: [n_active]f32 = undefined;
+    try moe_in_buf.download(std.mem.sliceAsBytes(&moe_in));
+    try ids_buf.download(std.mem.sliceAsBytes(&ids));
+    try scales_buf.download(std.mem.sliceAsBytes(&scales));
+    try accum_scales_buf.download(std.mem.sliceAsBytes(&accum_scales));
+
+    for (moe_in) |v| try std.testing.expectApproxEqAbs(@as(f32, 2.0), v, 1e-6);
+    try std.testing.expectEqual(@as(u32, 1), ids[0]);
+    try std.testing.expectEqual(@as(u32, 3), ids[1]);
+    const denom = 2.0 * @exp(@as(f32, 8.0)) + @exp(@as(f32, 4.0)) + 1.0;
+    try std.testing.expectApproxEqAbs(2.0 * @exp(@as(f32, 8.0)) / denom, scales[0], 1e-6);
+    try std.testing.expectApproxEqAbs(4.0 * @exp(@as(f32, 8.0)) / denom, scales[1], 1e-6);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 1.0 }, &accum_scales);
 }
 
 test "gpu argmax returns lowest maximum index" {
