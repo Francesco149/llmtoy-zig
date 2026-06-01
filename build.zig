@@ -92,6 +92,10 @@ pub fn build(b: *std.Build) void {
     _ = wf.addCopyFile(add_rmsnorm_128_spv, "add_rmsnorm_128.spv");
     const rmsnorm_perhead_spv = compileShader(b, "src/gpu/shaders/rmsnorm_perhead.glsl");
     _ = wf.addCopyFile(rmsnorm_perhead_spv, "rmsnorm_perhead.spv");
+    const rmsnorm_perhead_rope_theta_spv = compileShader(b, "src/gpu/shaders/rmsnorm_perhead_rope_theta.glsl");
+    _ = wf.addCopyFile(rmsnorm_perhead_rope_theta_spv, "rmsnorm_perhead_rope_theta.spv");
+    const rmsnorm_perhead_rope_table_spv = compileShader(b, "src/gpu/shaders/rmsnorm_perhead_rope_table.glsl");
+    _ = wf.addCopyFile(rmsnorm_perhead_rope_table_spv, "rmsnorm_perhead_rope_table.spv");
     const elem_add_spv = compileShader(b, "src/gpu/shaders/elem_add.glsl");
     _ = wf.addCopyFile(elem_add_spv, "elem_add.spv");
     const elem_scale_spv = compileShader(b, "src/gpu/shaders/elem_scale.glsl");
@@ -159,6 +163,8 @@ pub fn build(b: *std.Build) void {
         \\pub const add_rmsnorm         align(4) = @embedFile("add_rmsnorm.spv").*;
         \\pub const add_rmsnorm_128     align(4) = @embedFile("add_rmsnorm_128.spv").*;
         \\pub const rmsnorm_perhead     align(4) = @embedFile("rmsnorm_perhead.spv").*;
+        \\pub const rmsnorm_perhead_rope_theta align(4) = @embedFile("rmsnorm_perhead_rope_theta.spv").*;
+        \\pub const rmsnorm_perhead_rope_table align(4) = @embedFile("rmsnorm_perhead_rope_table.spv").*;
         \\pub const elem_add            align(4) = @embedFile("elem_add.spv").*;
         \\pub const elem_scale          align(4) = @embedFile("elem_scale.spv").*;
         \\pub const elem_add_scale      align(4) = @embedFile("elem_add_scale.spv").*;

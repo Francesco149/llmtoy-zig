@@ -2161,6 +2161,75 @@ pub const RmsnormPerHeadPipeline = struct {
     }
 };
 
+// ── RmsnormPerHeadRope pipelines ─────────────────────────────────────────────
+//
+// llama.cpp fuses RMSNorm + multiply + RoPE when the graph edge allows it.
+// Gemma4 attention has that exact shape for Q and K, so these variants keep
+// the normalized head in shared memory and write only the rotated result.
+
+const RmsnormPerHeadRopeTablePushConst = extern struct { head_dim: u32, eps: f32, pos: u32 };
+const RmsnormPerHeadRopeThetaPushConst = extern struct { head_dim: u32, eps: f32, pos: u32, theta: f32 };
+
+pub const RmsnormPerHeadRopeTablePipeline = struct {
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !RmsnormPerHeadRopeTablePipeline {
+        comptime std.debug.assert(shaders.rmsnorm_perhead_rope_table.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.rmsnorm_perhead_rope_table, 4, @sizeOf(RmsnormPerHeadRopeTablePushConst), 128);
+        return .{ .pipeline = built.pipeline, .layout = built.layout, .dset_layout = built.dset_layout, .desc_pool = built.desc_pool, .device = ctx.device };
+    }
+
+    pub fn allocSet(self: *const RmsnormPerHeadRopeTablePipeline, x: *const GpuBuffer, w: *const GpuBuffer, freqs: *const GpuBuffer, y: *const GpuBuffer) !vk.VkDescriptorSet {
+        return allocSimpleSet(self.device, self.desc_pool, self.dset_layout, &.{ x, w, freqs, y });
+    }
+
+    pub fn recordWithSet(self: *const RmsnormPerHeadRopeTablePipeline, cmd: vk.VkCommandBuffer, dset: vk.VkDescriptorSet, n_heads: u32, head_dim: u32, eps: f32, pos: u32) void {
+        std.debug.assert(head_dim <= 512 and head_dim % 256 == 0);
+        bindSimple(cmd, self.pipeline, self.layout, dset);
+        const pc = RmsnormPerHeadRopeTablePushConst{ .head_dim = head_dim, .eps = eps, .pos = pos };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(@TypeOf(pc)), &pc);
+        vk.vkCmdDispatch(cmd, n_heads, 1, 1);
+    }
+
+    pub fn deinit(self: *RmsnormPerHeadRopeTablePipeline) void {
+        deinitSimplePipeline(self.device, self.desc_pool, self.pipeline, self.layout, self.dset_layout);
+    }
+};
+
+pub const RmsnormPerHeadRopeThetaPipeline = struct {
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !RmsnormPerHeadRopeThetaPipeline {
+        comptime std.debug.assert(shaders.rmsnorm_perhead_rope_theta.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.rmsnorm_perhead_rope_theta, 3, @sizeOf(RmsnormPerHeadRopeThetaPushConst), 128);
+        return .{ .pipeline = built.pipeline, .layout = built.layout, .dset_layout = built.dset_layout, .desc_pool = built.desc_pool, .device = ctx.device };
+    }
+
+    pub fn allocSet(self: *const RmsnormPerHeadRopeThetaPipeline, x: *const GpuBuffer, w: *const GpuBuffer, y: *const GpuBuffer) !vk.VkDescriptorSet {
+        return allocSimpleSet(self.device, self.desc_pool, self.dset_layout, &.{ x, w, y });
+    }
+
+    pub fn recordWithSet(self: *const RmsnormPerHeadRopeThetaPipeline, cmd: vk.VkCommandBuffer, dset: vk.VkDescriptorSet, n_heads: u32, head_dim: u32, eps: f32, pos: u32, theta: f32) void {
+        std.debug.assert(head_dim <= 512 and head_dim % 256 == 0);
+        bindSimple(cmd, self.pipeline, self.layout, dset);
+        const pc = RmsnormPerHeadRopeThetaPushConst{ .head_dim = head_dim, .eps = eps, .pos = pos, .theta = theta };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(@TypeOf(pc)), &pc);
+        vk.vkCmdDispatch(cmd, n_heads, 1, 1);
+    }
+
+    pub fn deinit(self: *RmsnormPerHeadRopeThetaPipeline) void {
+        deinitSimplePipeline(self.device, self.desc_pool, self.pipeline, self.layout, self.dset_layout);
+    }
+};
+
 // ── ElemAddPipeline ───────────────────────────────────────────────────────────
 //
 // In-place elementwise add: a[i] += b[i]. 2 bindings (a read-write, b read-only),
@@ -2276,6 +2345,46 @@ fn buildSimplePipeline(
         .dset_layout = dset_layout,
         .desc_pool = desc_pool,
     };
+}
+
+fn allocSimpleSet(
+    device: vk.VkDevice,
+    desc_pool: vk.VkDescriptorPool,
+    dset_layout: vk.VkDescriptorSetLayout,
+    buffers: []const *const GpuBuffer,
+) !vk.VkDescriptorSet {
+    std.debug.assert(buffers.len >= 1 and buffers.len <= 5);
+    const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .pNext = null,
+        .descriptorPool = desc_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &dset_layout,
+    };
+    var dset: vk.VkDescriptorSet = null;
+    if (vk.vkAllocateDescriptorSets(device, &alloc_ci, &dset) != vk.VK_SUCCESS)
+        return error.VkDescriptorSetAllocFailed;
+
+    var infos: [5]vk.VkDescriptorBufferInfo = undefined;
+    var writes: [5]vk.VkWriteDescriptorSet = undefined;
+    for (buffers, 0..) |buf, i| {
+        infos[i] = .{ .buffer = buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE };
+        writes[i] = mkWrite(dset, @intCast(i), &infos[i]);
+    }
+    vk.vkUpdateDescriptorSets(device, @intCast(buffers.len), &writes, 0, null);
+    return dset;
+}
+
+fn bindSimple(cmd: vk.VkCommandBuffer, pipeline: vk.VkPipeline, layout: vk.VkPipelineLayout, dset: vk.VkDescriptorSet) void {
+    vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &dset, 0, null);
+}
+
+fn deinitSimplePipeline(device: vk.VkDevice, desc_pool: vk.VkDescriptorPool, pipeline: vk.VkPipeline, layout: vk.VkPipelineLayout, dset_layout: vk.VkDescriptorSetLayout) void {
+    vk.vkDestroyDescriptorPool(device, desc_pool, null);
+    vk.vkDestroyPipeline(device, pipeline, null);
+    vk.vkDestroyPipelineLayout(device, layout, null);
+    vk.vkDestroyDescriptorSetLayout(device, dset_layout, null);
 }
 
 pub const ElemAddPipeline = struct {
@@ -5797,6 +5906,95 @@ test "gpu rmsnorm_perhead n_heads=4 hd=512 (global K-norm)" {
 }
 test "gpu rmsnorm_perhead n_heads=4 hd=256 no weight (V rmsnormRaw)" {
     try fuzzRmsnormPerHead(4, 256, 103, false, false);
+}
+
+fn fuzzRmsnormPerHeadRope(use_table: bool, n_heads: u32, head_dim: u32, seed: u64) !void {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    const rope_mod = @import("../ops/rope.zig");
+    const al = std.testing.allocator;
+    const total = @as(usize, n_heads) * @as(usize, head_dim);
+    const pos: usize = 13;
+    const theta: f32 = 10000.0;
+    const eps: f32 = 1e-6;
+    const x = try al.alloc(f32, total);
+    defer al.free(x);
+    const w = try al.alloc(f32, head_dim);
+    defer al.free(w);
+    const freqs = try al.alloc(f32, head_dim / 2);
+    defer al.free(freqs);
+    const cpu_out = try al.alloc(f32, total);
+    defer al.free(cpu_out);
+    const gpu_out = try al.alloc(f32, total);
+    defer al.free(gpu_out);
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    for (x) |*v| v.* = (r.float(f32) - 0.5) * 4.0;
+    for (w) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+    for (freqs, 0..) |*f, i|
+        f.* = 1.0 / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(head_dim)));
+
+    for (0..n_heads) |h| {
+        const head = cpu_out[h * head_dim ..][0..head_dim];
+        const src = x[h * head_dim ..][0..head_dim];
+        var ss: f32 = 0.0;
+        for (src) |v| ss += v * v;
+        const rms_inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(head_dim)) + eps);
+        for (head, src, w) |*o, v, weight| o.* = v * rms_inv * (1.0 + weight);
+        if (use_table)
+            rope_mod.applyRopeFreqsNeox(head, freqs, pos)
+        else
+            rope_mod.applyRopeNeox(head, pos, theta);
+    }
+
+    const usage: vk.VkBufferUsageFlags = @intCast(vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    var x_buf = try GpuBuffer.initHostCoherent(&gpu, total * @sizeOf(f32), usage);
+    defer x_buf.deinit();
+    var w_buf = try GpuBuffer.initHostCoherent(&gpu, w.len * @sizeOf(f32), usage);
+    defer w_buf.deinit();
+    var freqs_buf = try GpuBuffer.initHostCoherent(&gpu, freqs.len * @sizeOf(f32), usage);
+    defer freqs_buf.deinit();
+    try x_buf.upload(std.mem.sliceAsBytes(x));
+    try w_buf.upload(std.mem.sliceAsBytes(w));
+    try freqs_buf.upload(std.mem.sliceAsBytes(freqs));
+
+    var table_pl = try RmsnormPerHeadRopeTablePipeline.init(&gpu);
+    defer table_pl.deinit();
+    var theta_pl = try RmsnormPerHeadRopeThetaPipeline.init(&gpu);
+    defer theta_pl.deinit();
+    const cmd = try gpu.beginBatch();
+    if (use_table) {
+        const dset = try table_pl.allocSet(&x_buf, &w_buf, &freqs_buf, &x_buf);
+        table_pl.recordWithSet(cmd, dset, n_heads, head_dim, eps, @intCast(pos));
+    } else {
+        const dset = try theta_pl.allocSet(&x_buf, &w_buf, &x_buf);
+        theta_pl.recordWithSet(cmd, dset, n_heads, head_dim, eps, @intCast(pos), theta);
+    }
+    try gpu.submitBatch(cmd);
+    try x_buf.download(std.mem.sliceAsBytes(gpu_out));
+
+    var max_abs: f32 = 0.0;
+    var max_ref: f32 = 0.0;
+    for (cpu_out, gpu_out) |c, g| {
+        max_abs = @max(max_abs, @abs(c - g));
+        max_ref = @max(max_ref, @abs(c));
+    }
+    const rel = max_abs / (max_ref + 1e-6);
+    std.debug.print("rmsnorm_perhead_rope fuzz table={} nh={} hd={} rel={e:.3}\n", .{ use_table, n_heads, head_dim, rel });
+    try std.testing.expect(rel < 1e-5);
+}
+
+test "gpu rmsnorm_perhead_rope theta SWA shape fuzz" {
+    try fuzzRmsnormPerHeadRope(false, 16, 256, 107);
+}
+test "gpu rmsnorm_perhead_rope table global shape fuzz" {
+    try fuzzRmsnormPerHeadRope(true, 4, 512, 109);
 }
 
 // ── attn_qk_softmax + attn_av fuzz tests ──────────────────────────────────────

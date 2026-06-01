@@ -29,6 +29,8 @@ const QuantizeQ8_1BatchedPipeline = mv_mod.QuantizeQ8_1BatchedPipeline;
 const RmsnormPipeline = mv_mod.RmsnormPipeline;
 const AddRmsnormPipeline = mv_mod.AddRmsnormPipeline;
 const RmsnormPerHeadPipeline = mv_mod.RmsnormPerHeadPipeline;
+const RmsnormPerHeadRopeTablePipeline = mv_mod.RmsnormPerHeadRopeTablePipeline;
+const RmsnormPerHeadRopeThetaPipeline = mv_mod.RmsnormPerHeadRopeThetaPipeline;
 const ElemAddPipeline = mv_mod.ElemAddPipeline;
 const ElemScalePipeline = mv_mod.ElemScalePipeline;
 const ElemAddScalePipeline = mv_mod.ElemAddScalePipeline;
@@ -147,6 +149,8 @@ pub const GpuWeights = struct {
     pl_rmsnorm: RmsnormPipeline,
     pl_add_rmsnorm: AddRmsnormPipeline,
     pl_rmsnorm_perhead: RmsnormPerHeadPipeline,
+    pl_rmsnorm_perhead_rope_table: RmsnormPerHeadRopeTablePipeline,
+    pl_rmsnorm_perhead_rope_theta: RmsnormPerHeadRopeThetaPipeline,
     pl_elem_add: ElemAddPipeline,
     pl_elem_scale: ElemScalePipeline,
     pl_elem_add_scale: ElemAddScalePipeline,
@@ -277,6 +281,10 @@ pub const GpuWeights = struct {
     attn_front_quant_dset: ?vk.VkDescriptorSet,
     attn_front_q_norm_dsets: ?[]?vk.VkDescriptorSet,
     attn_front_k_norm_dsets: ?[]?vk.VkDescriptorSet,
+    attn_front_q_norm_rope_table_dsets: ?[]?vk.VkDescriptorSet,
+    attn_front_k_norm_rope_table_dsets: ?[]?vk.VkDescriptorSet,
+    attn_front_q_norm_rope_theta_dsets: ?[]?vk.VkDescriptorSet,
+    attn_front_k_norm_rope_theta_dsets: ?[]?vk.VkDescriptorSet,
     attn_front_v_norm_dset: ?vk.VkDescriptorSet,
     attn_front_rope_table_q_dset: ?vk.VkDescriptorSet,
     attn_front_rope_table_k_dset: ?vk.VkDescriptorSet,
@@ -439,6 +447,10 @@ pub const GpuWeights = struct {
         errdefer pl_add_rmsnorm.deinit();
         var pl_rmsnorm_perhead = try RmsnormPerHeadPipeline.init(&ctx);
         errdefer pl_rmsnorm_perhead.deinit();
+        var pl_rmsnorm_perhead_rope_table = try RmsnormPerHeadRopeTablePipeline.init(&ctx);
+        errdefer pl_rmsnorm_perhead_rope_table.deinit();
+        var pl_rmsnorm_perhead_rope_theta = try RmsnormPerHeadRopeThetaPipeline.init(&ctx);
+        errdefer pl_rmsnorm_perhead_rope_theta.deinit();
         var pl_elem_add = try ElemAddPipeline.init(&ctx);
         errdefer pl_elem_add.deinit();
         var pl_elem_scale = try ElemScalePipeline.init(&ctx);
@@ -514,6 +526,8 @@ pub const GpuWeights = struct {
             .pl_rmsnorm = pl_rmsnorm,
             .pl_add_rmsnorm = pl_add_rmsnorm,
             .pl_rmsnorm_perhead = pl_rmsnorm_perhead,
+            .pl_rmsnorm_perhead_rope_table = pl_rmsnorm_perhead_rope_table,
+            .pl_rmsnorm_perhead_rope_theta = pl_rmsnorm_perhead_rope_theta,
             .pl_elem_add = pl_elem_add,
             .pl_elem_scale = pl_elem_scale,
             .pl_elem_add_scale = pl_elem_add_scale,
@@ -599,6 +613,10 @@ pub const GpuWeights = struct {
             .attn_front_quant_dset = null,
             .attn_front_q_norm_dsets = null,
             .attn_front_k_norm_dsets = null,
+            .attn_front_q_norm_rope_table_dsets = null,
+            .attn_front_k_norm_rope_table_dsets = null,
+            .attn_front_q_norm_rope_theta_dsets = null,
+            .attn_front_k_norm_rope_theta_dsets = null,
             .attn_front_v_norm_dset = null,
             .attn_front_rope_table_q_dset = null,
             .attn_front_rope_table_k_dset = null,
@@ -1089,6 +1107,14 @@ pub const GpuWeights = struct {
             var tmp = set;
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_rmsnorm_perhead.desc_pool, 1, &tmp);
         }
+        self.freeSimpleDsetArray(self.attn_front_k_norm_rope_theta_dsets, self.pl_rmsnorm_perhead_rope_theta.desc_pool);
+        if (self.attn_front_k_norm_rope_theta_dsets) |sets| self.allocator.free(sets);
+        self.freeSimpleDsetArray(self.attn_front_q_norm_rope_theta_dsets, self.pl_rmsnorm_perhead_rope_theta.desc_pool);
+        if (self.attn_front_q_norm_rope_theta_dsets) |sets| self.allocator.free(sets);
+        self.freeSimpleDsetArray(self.attn_front_k_norm_rope_table_dsets, self.pl_rmsnorm_perhead_rope_table.desc_pool);
+        if (self.attn_front_k_norm_rope_table_dsets) |sets| self.allocator.free(sets);
+        self.freeSimpleDsetArray(self.attn_front_q_norm_rope_table_dsets, self.pl_rmsnorm_perhead_rope_table.desc_pool);
+        if (self.attn_front_q_norm_rope_table_dsets) |sets| self.allocator.free(sets);
         if (self.attn_front_k_norm_dsets) |sets| {
             for (sets) |*ds| if (ds.*) |set| {
                 var tmp = set;
@@ -1375,6 +1401,8 @@ pub const GpuWeights = struct {
         self.pl_elem_add_scale.deinit();
         self.pl_elem_scale.deinit();
         self.pl_elem_add.deinit();
+        self.pl_rmsnorm_perhead_rope_theta.deinit();
+        self.pl_rmsnorm_perhead_rope_table.deinit();
         self.pl_rmsnorm_perhead.deinit();
         self.pl_add_rmsnorm.deinit();
         self.pl_rmsnorm.deinit();
@@ -1905,54 +1933,38 @@ pub const GpuWeights = struct {
             GpuCtx.recordTransferToShaderBarrier(cmd);
         }
 
-        // ── 4. Per-head normalization in-place
-        //   Q: rmsnorm with q_norm,    Gemma (1+w) convention
-        //   K: rmsnorm with k_norm,    Gemma (1+w) convention
-        //   V: rmsnormRaw (no weight). v_buf is bound to the W slot too —
-        //      the shader doesn't read it when use_weight==0, so any valid
-        //      buffer works.
-        const p_qn = self.ctx.profileBegin(cmd, "attn_front.q_norm");
-        const qn_dset = try self.attnFrontPerHeadSet(&self.attn_front_q_norm_dsets, layer, q_buf, q_norm_buf, q_buf);
-        self.pl_rmsnorm_perhead.recordWithSet(cmd, qn_dset, n_heads, head_dim, eps, true, true);
-        self.ctx.profileEnd(cmd, p_qn);
-        const p_kn = self.ctx.profileBegin(cmd, "attn_front.k_norm");
-        const kn_dset = try self.attnFrontPerHeadSet(&self.attn_front_k_norm_dsets, layer, k_buf, k_norm_buf, k_buf);
-        self.pl_rmsnorm_perhead.recordWithSet(cmd, kn_dset, n_kv_heads, head_dim, eps, true, true);
-        self.ctx.profileEnd(cmd, p_kn);
+        // ── 4. Per-head normalization and RoPE
+        // Q/K fuse RMSNorm + Gemma (1+w) weighting + NeoX rotation, following
+        // llama.cpp's RMSNorm+mul+RoPE graph fusion. V still needs only the
+        // unweighted rmsnormRaw operation.
+        if (is_swa) {
+            const p_qn = self.ctx.profileBegin(cmd, "attn_front.q_norm_rope_theta");
+            const qn_dset = try self.attnFrontNormRopeThetaSet(&self.attn_front_q_norm_rope_theta_dsets, layer, q_buf, q_norm_buf);
+            self.pl_rmsnorm_perhead_rope_theta.recordWithSet(cmd, qn_dset, n_heads, head_dim, eps, pos, rope_theta_swa);
+            self.ctx.profileEnd(cmd, p_qn);
+            const p_kn = self.ctx.profileBegin(cmd, "attn_front.k_norm_rope_theta");
+            const kn_dset = try self.attnFrontNormRopeThetaSet(&self.attn_front_k_norm_rope_theta_dsets, layer, k_buf, k_norm_buf);
+            self.pl_rmsnorm_perhead_rope_theta.recordWithSet(cmd, kn_dset, n_kv_heads, head_dim, eps, pos, rope_theta_swa);
+            self.ctx.profileEnd(cmd, p_kn);
+        } else {
+            const p_qn = self.ctx.profileBegin(cmd, "attn_front.q_norm_rope_table");
+            const qn_dset = try self.attnFrontNormRopeTableSet(&self.attn_front_q_norm_rope_table_dsets, layer, q_buf, q_norm_buf, rope_freqs_buf);
+            self.pl_rmsnorm_perhead_rope_table.recordWithSet(cmd, qn_dset, n_heads, head_dim, eps, pos);
+            self.ctx.profileEnd(cmd, p_qn);
+            const p_kn = self.ctx.profileBegin(cmd, "attn_front.k_norm_rope_table");
+            const kn_dset = try self.attnFrontNormRopeTableSet(&self.attn_front_k_norm_rope_table_dsets, layer, k_buf, k_norm_buf, rope_freqs_buf);
+            self.pl_rmsnorm_perhead_rope_table.recordWithSet(cmd, kn_dset, n_kv_heads, head_dim, eps, pos);
+            self.ctx.profileEnd(cmd, p_kn);
+        }
         const p_vn = self.ctx.profileBegin(cmd, "attn_front.v_norm");
         if (self.attn_front_v_norm_dset == null)
             self.attn_front_v_norm_dset = try self.pl_rmsnorm_perhead.allocSet(v_buf, v_buf, v_buf);
         self.pl_rmsnorm_perhead.recordWithSet(cmd, self.attn_front_v_norm_dset.?, n_kv_heads, head_dim, eps, false, false);
         self.ctx.profileEnd(cmd, p_vn);
         GpuCtx.recordShaderBarrier(cmd);
-
-        // ── 5. RoPE on Q and K (V isn't rotated)
-        if (is_swa) {
-            const p_rope_q = self.ctx.profileBegin(cmd, "attn_front.rope_q_theta");
-            if (self.attn_front_rope_theta_q_dset == null)
-                self.attn_front_rope_theta_q_dset = try self.pl_rope_theta.allocSet(q_buf);
-            self.pl_rope_theta.recordWithSet(cmd, self.attn_front_rope_theta_q_dset.?, pos, head_dim, rope_theta_swa, n_heads);
-            self.ctx.profileEnd(cmd, p_rope_q);
-            const p_rope_k = self.ctx.profileBegin(cmd, "attn_front.rope_k_theta");
-            if (self.attn_front_rope_theta_k_dset == null)
-                self.attn_front_rope_theta_k_dset = try self.pl_rope_theta.allocSet(k_buf);
-            self.pl_rope_theta.recordWithSet(cmd, self.attn_front_rope_theta_k_dset.?, pos, head_dim, rope_theta_swa, n_kv_heads);
-            self.ctx.profileEnd(cmd, p_rope_k);
-        } else {
-            const p_rope_q = self.ctx.profileBegin(cmd, "attn_front.rope_q_table");
-            if (self.attn_front_rope_table_q_dset == null)
-                self.attn_front_rope_table_q_dset = try self.pl_rope_table.allocSet(q_buf, rope_freqs_buf);
-            self.pl_rope_table.recordWithSet(cmd, self.attn_front_rope_table_q_dset.?, pos, head_dim, n_heads);
-            self.ctx.profileEnd(cmd, p_rope_q);
-            const p_rope_k = self.ctx.profileBegin(cmd, "attn_front.rope_k_table");
-            if (self.attn_front_rope_table_k_dset == null)
-                self.attn_front_rope_table_k_dset = try self.pl_rope_table.allocSet(k_buf, rope_freqs_buf);
-            self.pl_rope_table.recordWithSet(cmd, self.attn_front_rope_table_k_dset.?, pos, head_dim, n_kv_heads);
-            self.ctx.profileEnd(cmd, p_rope_k);
-        }
         GpuCtx.recordShaderToTransferBarrier(cmd);
 
-        // ── 6. Append K, V to the per-layer VRAM cache at this slot
+        // ── 5. Append K, V to the per-layer VRAM cache at this slot
         const p_k_copy = self.ctx.profileBegin(cmd, "attn_front.k_cache_copy");
         GpuCtx.recordCopyRegion(cmd, k_buf.handle, k_cache.handle, 0, slot_offset, slot_bytes);
         self.ctx.profileEnd(cmd, p_k_copy);
@@ -3370,6 +3382,49 @@ pub const GpuWeights = struct {
         if (sets[layer] == null)
             sets[layer] = try self.pl_rmsnorm_perhead.allocSet(x_buf, w_buf, y_buf);
         return sets[layer].?;
+    }
+
+    fn attnFrontNormRopeThetaSet(
+        self: *GpuWeights,
+        sets_opt: *?[]?vk.VkDescriptorSet,
+        layer: usize,
+        x_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        if (sets_opt.* == null) {
+            sets_opt.* = try self.allocator.alloc(?vk.VkDescriptorSet, self.layers.len);
+            @memset(sets_opt.*.?, null);
+        }
+        const sets = sets_opt.*.?;
+        if (sets[layer] == null)
+            sets[layer] = try self.pl_rmsnorm_perhead_rope_theta.allocSet(x_buf, w_buf, x_buf);
+        return sets[layer].?;
+    }
+
+    fn attnFrontNormRopeTableSet(
+        self: *GpuWeights,
+        sets_opt: *?[]?vk.VkDescriptorSet,
+        layer: usize,
+        x_buf: *const GpuBuffer,
+        w_buf: *const GpuBuffer,
+        freqs_buf: *const GpuBuffer,
+    ) !vk.VkDescriptorSet {
+        if (sets_opt.* == null) {
+            sets_opt.* = try self.allocator.alloc(?vk.VkDescriptorSet, self.layers.len);
+            @memset(sets_opt.*.?, null);
+        }
+        const sets = sets_opt.*.?;
+        if (sets[layer] == null)
+            sets[layer] = try self.pl_rmsnorm_perhead_rope_table.allocSet(x_buf, w_buf, freqs_buf, x_buf);
+        return sets[layer].?;
+    }
+
+    fn freeSimpleDsetArray(self: *GpuWeights, sets_opt: ?[]?vk.VkDescriptorSet, pool: vk.VkDescriptorPool) void {
+        const sets = sets_opt orelse return;
+        for (sets) |set_opt| {
+            var set = set_opt orelse continue;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, pool, 1, &set);
+        }
     }
 
     fn denseFullRmsnormSet(

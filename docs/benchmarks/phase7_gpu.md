@@ -9,6 +9,32 @@ describe the code as it existed at that point and can be stale as architecture
 documentation. Use `docs/phases/phase7-gpu-vulkan.md` as the current GPU
 architecture and endgame plan.
 
+## Phase 7 attention-front RMSNorm+RoPE fusion
+
+Following llama.cpp's `RMS_NORM_MUL_ROPE` graph fusion, the Gemma4 attention
+front now runs per-head Q/K RMSNorm and NeoX RoPE in one dispatch. Separate
+table and theta kernels cover global and SWA layers. V remains on the standalone
+unweighted per-head RMSNorm kernel.
+
+Validation:
+
+- `nix develop --command zig build -Doptimize=ReleaseFast`
+- `nix develop --command zig build test --summary all`: 148/148 tests passed
+- fused theta fuzz relative error: `1.124e-6`
+- fused table fuzz relative error: `7.954e-7`
+- `llmtoy compare ... "explain MoE" --chat`: all layer argmaxes match; final
+  `1852` vs `237323` mismatch is unchanged from clean pre-change `cda8667`
+
+Profiled short run with `LLMTOY_GPU_PROFILE=1`, same 33-token workload:
+
+| Metric | Before | After |
+|--------|-------:|------:|
+| prefill | 44.49 tok/s | 44.75 tok/s |
+| generation | 41.30 tok/s | 41.98 tok/s |
+| GPU dispatch total | 321.212 ms | 320.024 ms |
+| inter-dispatch gap | 36.350 ms | 33.167 ms |
+| profiled gaps | 28,737 | 26,757 |
+
 ## Phase 7 descriptor cleanup - attention path
 
 The production attention submit now reuses persistent per-layer descriptor sets
