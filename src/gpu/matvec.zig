@@ -2513,7 +2513,16 @@ pub const LogitSoftcapPipeline = struct {
 
 const ArgmaxPushConst = extern struct {
     n: u32,
+    n_groups: u32,
+    pass: u32,
 };
+
+const argmax_workgroup_size: u32 = 256;
+const argmax_max_groups: u32 = 256;
+
+pub fn argmaxScratchBytes() usize {
+    return argmax_max_groups * 2 * @sizeOf(u32);
+}
 
 pub const ArgmaxPipeline = struct {
     pipeline: vk.VkPipeline,
@@ -2524,7 +2533,7 @@ pub const ArgmaxPipeline = struct {
 
     pub fn init(ctx: *const GpuContext) !ArgmaxPipeline {
         comptime std.debug.assert(shaders.argmax.len % 4 == 0);
-        const built = try buildSimplePipeline(ctx, &shaders.argmax, 2, @sizeOf(ArgmaxPushConst), 8);
+        const built = try buildSimplePipeline(ctx, &shaders.argmax, 3, @sizeOf(ArgmaxPushConst), 8);
         return .{
             .pipeline = built.pipeline,
             .layout = built.layout,
@@ -2534,7 +2543,7 @@ pub const ArgmaxPipeline = struct {
         };
     }
 
-    pub fn allocSet(self: *const ArgmaxPipeline, x_buf: *const GpuBuffer, out_buf: *const GpuBuffer) !vk.VkDescriptorSet {
+    pub fn allocSet(self: *const ArgmaxPipeline, x_buf: *const GpuBuffer, scratch_buf: *const GpuBuffer, out_buf: *const GpuBuffer) !vk.VkDescriptorSet {
         const alloc_ci = vk.VkDescriptorSetAllocateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .pNext = null,
@@ -2546,13 +2555,15 @@ pub const ArgmaxPipeline = struct {
         if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
             return error.VkDescriptorSetAllocFailed;
 
-        const buf_infos = [2]vk.VkDescriptorBufferInfo{
+        const buf_infos = [3]vk.VkDescriptorBufferInfo{
             .{ .buffer = x_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = scratch_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
             .{ .buffer = out_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         };
-        const writes = [2]vk.VkWriteDescriptorSet{
+        const writes = [3]vk.VkWriteDescriptorSet{
             mkWrite(dset, 0, &buf_infos[0]),
             mkWrite(dset, 1, &buf_infos[1]),
+            mkWrite(dset, 2, &buf_infos[2]),
         };
         vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
         return dset;
@@ -2561,8 +2572,13 @@ pub const ArgmaxPipeline = struct {
     pub fn recordWithSet(self: *const ArgmaxPipeline, cmd: vk.VkCommandBuffer, dset: vk.VkDescriptorSet, n: u32) void {
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
         vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
-        const pc = ArgmaxPushConst{ .n = n };
-        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ArgmaxPushConst), &pc);
+        const groups = @min(argmax_max_groups, (n + argmax_workgroup_size - 1) / argmax_workgroup_size);
+        const partial_pc = ArgmaxPushConst{ .n = n, .n_groups = groups, .pass = 0 };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ArgmaxPushConst), &partial_pc);
+        vk.vkCmdDispatch(cmd, groups, 1, 1);
+        GpuContext.recordShaderBarrier(cmd);
+        const final_pc = ArgmaxPushConst{ .n = groups, .n_groups = 1, .pass = 1 };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ArgmaxPushConst), &final_pc);
         vk.vkCmdDispatch(cmd, 1, 1, 1);
     }
 
@@ -3371,9 +3387,11 @@ test "gpu argmax returns lowest maximum index" {
     try in_buf.upload(std.mem.sliceAsBytes(&values));
     var out_buf = try GpuBuffer.initHostCoherent(&gpu, @sizeOf(u32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     defer out_buf.deinit();
+    var scratch_buf = try GpuBuffer.initDeviceLocal(&gpu, argmaxScratchBytes(), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer scratch_buf.deinit();
 
     const cmd = try gpu.beginBatch();
-    const dset = try pipeline.allocSet(&in_buf, &out_buf);
+    const dset = try pipeline.allocSet(&in_buf, &scratch_buf, &out_buf);
     defer {
         var tmp = dset;
         _ = vk.vkFreeDescriptorSets(gpu.device, pipeline.desc_pool, 1, &tmp);
@@ -3384,6 +3402,42 @@ test "gpu argmax returns lowest maximum index" {
     var idx: u32 = undefined;
     try out_buf.download(std.mem.asBytes(&idx));
     try std.testing.expectEqual(@as(u32, 2), idx);
+}
+
+test "gpu argmax reduces partial winners across workgroups" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    var pipeline = try ArgmaxPipeline.init(&gpu);
+    defer pipeline.deinit();
+
+    var values: [1024]f32 = @splat(-4.0);
+    values[17] = 9.0;
+    values[900] = 9.0;
+    var in_buf = try GpuBuffer.initHostCoherent(&gpu, @sizeOf(@TypeOf(values)), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer in_buf.deinit();
+    try in_buf.upload(std.mem.sliceAsBytes(&values));
+    var out_buf = try GpuBuffer.initHostCoherent(&gpu, @sizeOf(u32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer out_buf.deinit();
+    var scratch_buf = try GpuBuffer.initDeviceLocal(&gpu, argmaxScratchBytes(), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer scratch_buf.deinit();
+
+    const cmd = try gpu.beginBatch();
+    const dset = try pipeline.allocSet(&in_buf, &scratch_buf, &out_buf);
+    defer {
+        var tmp = dset;
+        _ = vk.vkFreeDescriptorSets(gpu.device, pipeline.desc_pool, 1, &tmp);
+    }
+    pipeline.recordWithSet(cmd, dset, values.len);
+    try gpu.submitBatch(cmd);
+
+    var idx: u32 = undefined;
+    try out_buf.download(std.mem.asBytes(&idx));
+    try std.testing.expectEqual(@as(u32, 17), idx);
 }
 
 test "gpu matvec Q8_0 correctness" {

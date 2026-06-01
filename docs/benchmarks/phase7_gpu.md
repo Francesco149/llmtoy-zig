@@ -1822,6 +1822,15 @@ MoE dispatch follow-up:
   Correctness: `nix develop --command zig build test` passes, including a
   lowest-index tie-break argmax test. A two-token chat smoke test produced
   `The capital` at `41.93 tok/s`.
+- Greedy GPU argmax now uses a two-pass reduction: 256 workgroups scan the
+  262144-row logits vector into a 2 KiB device-local partial-winner buffer, then
+  one workgroup reduces those partials in the same final-head command buffer.
+  This replaces the original single-workgroup scan without adding a submit or
+  host synchronization. Correctness: `zig build test --summary all` reports
+  `146/146` tests passed, including a cross-workgroup lowest-index tie check.
+  On the same profiled four-token chat decode, `final.argmax` fell from
+  `447.50 us` to `7.68 us` average and generation moved from `40.75` to
+  `41.89 tok/s`.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

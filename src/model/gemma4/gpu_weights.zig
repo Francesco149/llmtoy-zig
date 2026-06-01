@@ -167,6 +167,7 @@ pub const GpuWeights = struct {
     // Device-local LM-head output plus a four-byte host result for greedy
     // decode. Stochastic sampling still uses shared_out for full logits.
     greedy_logits_vram: ?GpuBuffer,
+    argmax_scratch_vram: ?GpuBuffer,
     greedy_token_buf: ?GpuBuffer,
     // Device-local Q8_1-quantized activation, sized to q8_1OutBytes(max_cols).
     // Quantize-shader writes; mul_mat_vec_q*_q8_1 shaders read.  Lives in VRAM
@@ -529,6 +530,7 @@ pub const GpuWeights = struct {
             .shared_vec = null,
             .shared_out = null,
             .greedy_logits_vram = null,
+            .argmax_scratch_vram = null,
             .greedy_token_buf = null,
             .shared_acts_q8_1 = null,
             .x_vram = null,
@@ -710,6 +712,7 @@ pub const GpuWeights = struct {
         gw.shared_vec = try GpuBuffer.initHostCoherent(&gw.ctx, max_cols * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         gw.shared_out = try GpuBuffer.initHostCoherent(&gw.ctx, max_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         gw.greedy_logits_vram = try GpuBuffer.initDeviceLocal(&gw.ctx, max_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.argmax_scratch_vram = try GpuBuffer.initDeviceLocal(&gw.ctx, mv_mod.argmaxScratchBytes(), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         gw.greedy_token_buf = try GpuBuffer.initHostCoherent(&gw.ctx, @sizeOf(u32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         // Q8_1 activation buffer lives in VRAM; quantize-shader writes, matvec reads.
         const q8_1_bytes = mv_mod.q8_1OutBytes(max_cols);
@@ -1344,6 +1347,7 @@ pub const GpuWeights = struct {
         if (self.x_vram) |*b| b.deinit();
         if (self.shared_acts_q8_1) |*b| b.deinit();
         if (self.greedy_token_buf) |*b| b.deinit();
+        if (self.argmax_scratch_vram) |*b| b.deinit();
         if (self.greedy_logits_vram) |*b| b.deinit();
         if (self.shared_out) |*b| b.deinit();
         if (self.shared_vec) |*b| b.deinit();
@@ -1615,7 +1619,7 @@ pub const GpuWeights = struct {
             GpuCtx.recordShaderBarrier(cmd);
             const p_argmax = self.ctx.profileBegin(cmd, "final.argmax");
             if (self.final_argmax_dset == null)
-                self.final_argmax_dset = try self.pl_argmax.allocSet(out_buf, &self.greedy_token_buf.?);
+                self.final_argmax_dset = try self.pl_argmax.allocSet(out_buf, &self.argmax_scratch_vram.?, &self.greedy_token_buf.?);
             self.pl_argmax.recordWithSet(cmd, self.final_argmax_dset.?, sess.rows);
             self.ctx.profileEnd(cmd, p_argmax);
         } else if (logit_softcap != 0.0) {
