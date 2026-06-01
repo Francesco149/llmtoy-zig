@@ -265,6 +265,8 @@ Work on these in order unless a fresh profile changes the evidence.
 Do not repeat these without new evidence:
 
 - naive Q4_K row packing via `local_size_y` did not beat the current shader
+- reducing fused-small attention from 256 to 128 threads nearly doubled the
+  kernel time; the AV phase benefits from one lane per SWA head element
 - Q6_K packed-decode cleanup without the broader llama.cpp shape was not a win
 - Q6_K MMVQ b64 variants were at best a narrow isolated lm_head win, not enough
   to route production

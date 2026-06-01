@@ -35,6 +35,18 @@ Profiled short run with `LLMTOY_GPU_PROFILE=1`, same 33-token workload:
 | inter-dispatch gap | 36.350 ms | 33.167 ms |
 | profiled gaps | 28,737 | 26,757 |
 
+Follow-up negative probe: reducing `attention.fused_small` from 256 to 128
+threads passed the fuzz suite but nearly doubled attention time:
+
+| Metric | 256 threads | 128 threads |
+|--------|------------:|------------:|
+| `attention.fused_small` | 21.85 us | 40.42 us |
+| GPU dispatch total | 320.024 ms | 338.719 ms |
+| generation | 41.98 tok/s | 39.22 tok/s |
+
+Keep the 256-thread production workgroup. The AV phase benefits from one lane
+per SWA head element more than short-window QK benefits from fewer subgroups.
+
 ## Phase 7 descriptor cleanup - attention path
 
 The production attention submit now reuses persistent per-layer descriptor sets
