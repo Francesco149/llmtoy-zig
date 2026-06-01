@@ -342,6 +342,12 @@ pub fn forwardOne(
         }
 
         const use_moe_vram_tail = moe_vram_tail_enabled and l < moe_vram_tail_limit and l != moe_vram_tail_skip;
+        const use_gpu_router = use_moe_vram_tail and
+            can_full_fused and
+            layer_taps == null and
+            gpu != null and
+            gpu_here and
+            gpu.?.canRunExpertGpuRouter(l, lw.gate_up_exps.type_, lw.down_exps.type_);
 
         // ── Dense FFN path ────────────────────────────────────────────────────
         //
@@ -365,7 +371,7 @@ pub fn forwardOne(
         if (can_full_fused) {
             const g = gpu.?;
             const dense_readback: ?[]f32 = if (use_moe_vram_tail) null else ffn_buf;
-            try g.runLayerAttnResidualDenseFfnQ8_1(l, cfg.eps, lw.wo.type_, wo_q8_pl.?, lw.w_gate.type_, gate_q8_pl.?, lw.w_up.type_, up_q8_pl.?, lw.w_down.type_, g.pipelineFor(lw.w_down.type_), g.q8_1PipelineFor(lw.w_down.type_), x, attn_concat[0..nq_l], dense_readback, residual_current_in_gpu_vram, use_gpu_attn);
+            try g.runLayerAttnResidualDenseFfnQ8_1(l, cfg.eps, lw.wo.type_, wo_q8_pl.?, lw.w_gate.type_, gate_q8_pl.?, lw.w_up.type_, up_q8_pl.?, lw.w_down.type_, g.pipelineFor(lw.w_down.type_), g.q8_1PipelineFor(lw.w_down.type_), x, attn_concat[0..nq_l], dense_readback, residual_current_in_gpu_vram, use_gpu_attn, !use_gpu_router);
             // x updated with post-attn residual; dense_ffn_out_buf has post_ffw_norm_1.
             x_current_in_gpu_shared_vec = false;
             x_current_in_gpu_vram = true;
@@ -394,20 +400,22 @@ pub fn forwardOne(
 
         // ── MoE FFN path ──────────────────────────────────────────────────────
 
-        // Expert input and router input share the same residual RMS.
-        const inv_sqrt_d = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
-        math.rmsnormWeightedAndRawScaled(
-            moe_in,
-            router_in,
-            x,
-            lw.pre_ffw_norm_2,
-            lw.router_scale,
-            inv_sqrt_d,
-            cfg.eps,
-        );
+        if (!use_gpu_router) {
+            // Expert input and router input share the same residual RMS.
+            const inv_sqrt_d = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
+            math.rmsnormWeightedAndRawScaled(
+                moe_in,
+                router_in,
+                x,
+                lw.pre_ffw_norm_2,
+                lw.router_scale,
+                inv_sqrt_d,
+                cfg.eps,
+            );
 
-        // Router logits → top-k indices plus selected softmax probabilities.
-        routerTopKSoftmax(router_out, top_idx, lw.router_w, router_in, scratch, pool);
+            // Router logits → top-k indices plus selected softmax probabilities.
+            routerTopKSoftmax(router_out, top_idx, lw.router_w, router_in, scratch, pool);
+        }
 
         // Run each selected expert. The default path keeps the accumulated MoE
         // vector device-resident and finishes the FFN/MoE residual tail on GPU
@@ -432,8 +440,8 @@ pub fn forwardOne(
                 .x_buf_current = x_current_in_gpu_shared_vec,
                 .x_vram_current = x_current_in_gpu_vram,
                 .dense_buf_current = dense_current_in_gpu_out_buf,
-                .download_x = !leave_final_x_on_gpu,
-            } else null)
+                .download_x = !leave_final_x_on_gpu and !use_gpu_router,
+            } else null, if (use_gpu_router) .{ .eps = cfg.eps } else null)
         else
             error.ExpertNotOnGpu;
 
@@ -441,11 +449,12 @@ pub fn forwardOne(
             if (use_moe_vram_tail) {
                 moe_residual_done_on_gpu = true;
                 residual_current_in_gpu_vram = x_current_in_gpu_vram;
-                if (leave_final_x_on_gpu) {
+                if (leave_final_x_on_gpu or use_gpu_router) {
                     final_logits_input = if (x_current_in_gpu_vram) .x_vram else .shared_vec;
                 }
             }
         } else |_| {
+            if (use_gpu_router) return error.ExpertNotOnGpu;
             residual_current_in_gpu_vram = false;
             if (dense_current_in_gpu_out_buf) {
                 try gpu.?.downloadDenseFfnOut(ffn_buf);

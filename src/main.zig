@@ -1173,7 +1173,7 @@ fn cmdBenchMoe(
         .x_vram_current = false,
         .dense_buf_current = true,
     } else null;
-    try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, opts.skip_readback, tail_params);
+    try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, opts.skip_readback, tail_params, null);
 
     const labels = [_][]const u8{
         "moe.quantize_input",
@@ -1197,7 +1197,7 @@ fn cmdBenchMoe(
     const t0 = clk.now(io);
     for (0..opts.iters) |_| {
         @memset(moe_buf, 0.0);
-        try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, opts.skip_readback, tail_params);
+        try gpu_weights.runExpertBatch(layer, top_idx, lw.gate_up_exps.type_, lw.down_exps.type_, lw.down_exps_scale, moe_in, router_out, moe_buf, opts.skip_readback, tail_params, null);
     }
     const t1 = clk.now(io);
 
@@ -2024,10 +2024,11 @@ fn envFlagEnabled(name: [:0]const u8, default: bool) bool {
 }
 
 fn printGemma4GpuRuntimeOptions() void {
-    std.debug.print("  Gemma4 GPU options: attn_cpu_kv_shadow={} attention_async={} expert_reuse_cmd={}\n", .{
+    std.debug.print("  Gemma4 GPU options: attn_cpu_kv_shadow={} attention_async={} expert_reuse_cmd={} expert_gpu_router={}\n", .{
         envFlagEnabled("LLMTOY_ATTN_CPU_KV_SHADOW", false),
         envFlagEnabled("LLMTOY_ATTENTION_ASYNC", true),
         envFlagEnabled("LLMTOY_EXPERT_REUSE_CMD", true),
+        envFlagEnabled("LLMTOY_EXPERT_GPU_ROUTER", false),
     });
 }
 

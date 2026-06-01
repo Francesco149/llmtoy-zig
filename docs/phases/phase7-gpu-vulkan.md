@@ -274,6 +274,9 @@ Do not repeat these without new evidence:
   target decode shapes
 - IQ4_NL expert-down b16 and integer-accumulation variants were slower than the
   default expert-down shader
+- the single-workgroup GPU MoE router bridge is structurally useful but much
+  slower than CPU routing; keep `LLMTOY_EXPERT_GPU_ROUTER=1` probe-only until
+  the router matvec is parallelized across workgroups
 - a broad async submit attempt needs stable `GpuContext` lifetime plus
   per-submit deferred descriptor-set frees before it can be safe
 

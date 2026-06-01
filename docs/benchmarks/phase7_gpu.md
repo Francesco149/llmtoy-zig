@@ -1869,6 +1869,22 @@ MoE dispatch follow-up:
   On the same profiled four-token chat decode, `final.argmax` fell from
   `447.50 us` to `7.68 us` average and generation moved from `40.75` to
   `41.89 tok/s`.
+- Added an opt-in `LLMTOY_EXPERT_GPU_ROUTER=1` bridge modeled after llama.cpp's
+  fused Vulkan top-k MoE direction. It uploads each layer's F32 router weights
+  only when enabled, keeps the running residual in VRAM, and writes normalized
+  expert input, selected IDs, and selected weights directly into the existing
+  expert-ID buffers. The first shape deliberately uses one 128-thread
+  workgroup for the whole router so it can fuse RMSNorm, scaling, router
+  matvec, stable top-k, and selected softmax weights in one dispatch.
+  Correctness scaffolding: `zig build test --summary all` reports `149/149`
+  tests passed, including a stable-tie GPU router test. Profiled four-token
+  chat A/B on `what is 1+1?`: default CPU routing measured `41.33 tok/s`
+  decode and `227.612 ms` timestamped dispatch; the opt-in GPU router measured
+  `33.08 tok/s` and `596.436 ms`. `moe.router_topk` alone cost `440.662 ms`
+  across 720 calls (`612.03 us` average, `73.9%` of dispatch time), and
+  deterministic generated text diverged from the default route. Keep the
+  bridge opt-in. A useful follow-up needs a parallel router matvec and explicit
+  parity checks before production promotion.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

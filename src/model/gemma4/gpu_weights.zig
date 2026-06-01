@@ -36,6 +36,7 @@ const ElemScalePipeline = mv_mod.ElemScalePipeline;
 const ElemAddScalePipeline = mv_mod.ElemAddScalePipeline;
 const LogitSoftcapPipeline = mv_mod.LogitSoftcapPipeline;
 const ArgmaxPipeline = mv_mod.ArgmaxPipeline;
+const MoeRouterTopKPipeline = mv_mod.MoeRouterTopKPipeline;
 const GeluMulPipeline = mv_mod.GeluMulPipeline;
 const RopeNeoxTablePipeline = mv_mod.RopeNeoxTablePipeline;
 const RopeNeoxThetaPipeline = mv_mod.RopeNeoxThetaPipeline;
@@ -69,6 +70,9 @@ pub const GpuLayerWeights = struct {
     post_ffw_norm_1_buf: ?GpuBuffer,
     post_ffw_norm_2_buf: ?GpuBuffer,
     post_ffw_norm_buf: ?GpuBuffer,
+    router_w_buf: ?GpuBuffer,
+    router_scale_buf: ?GpuBuffer,
+    down_exps_scale_buf: ?GpuBuffer,
 
     pub fn deinitAll(self: *GpuLayerWeights) void {
         if (self.wq) |*s| s.deinit();
@@ -87,6 +91,9 @@ pub const GpuLayerWeights = struct {
         if (self.post_ffw_norm_1_buf) |*b| b.deinit();
         if (self.post_ffw_norm_2_buf) |*b| b.deinit();
         if (self.post_ffw_norm_buf) |*b| b.deinit();
+        if (self.router_w_buf) |*b| b.deinit();
+        if (self.router_scale_buf) |*b| b.deinit();
+        if (self.down_exps_scale_buf) |*b| b.deinit();
     }
 };
 
@@ -105,6 +112,10 @@ pub const FinalLogitsInput = enum {
     cpu,
     shared_vec,
     x_vram,
+};
+
+pub const GpuRouterParams = struct {
+    eps: f32,
 };
 
 pub const AttentionParams = struct {
@@ -156,6 +167,7 @@ pub const GpuWeights = struct {
     pl_elem_add_scale: ElemAddScalePipeline,
     pl_logit_softcap: LogitSoftcapPipeline,
     pl_argmax: ArgmaxPipeline,
+    pl_moe_router_topk: MoeRouterTopKPipeline,
     pl_gelu_mul: GeluMulPipeline,
     pl_rope_table: RopeNeoxTablePipeline,
     pl_rope_theta: RopeNeoxThetaPipeline,
@@ -245,6 +257,7 @@ pub const GpuWeights = struct {
     expert_ids_slice: ?[]u32,
     moe_stage_slice: ?[]f32,
     expert_quant_input_dset: ?vk.VkDescriptorSet,
+    expert_router_dsets: ?[]?vk.VkDescriptorSet,
     expert_quant_mid_batched_dset: ?vk.VkDescriptorSet,
     expert_accum_dset: ?vk.VkDescriptorSet,
     expert_gate_up_id_dsets: ?[]?vk.VkDescriptorSet,
@@ -263,6 +276,7 @@ pub const GpuWeights = struct {
     expert_down_sum_id_enabled: bool,
     expert_reuse_cmd_override: ?bool,
     expert_async_enabled: bool,
+    expert_gpu_router_enabled: bool,
     // One in-flight async submit whose transient descriptor sets must stay
     // alive until its fence signals. Currently used by the MoE expert batch,
     // but intentionally not named after MoE so attention/dense graph work can
@@ -461,6 +475,8 @@ pub const GpuWeights = struct {
         errdefer pl_logit_softcap.deinit();
         var pl_argmax = try ArgmaxPipeline.init(&ctx);
         errdefer pl_argmax.deinit();
+        var pl_moe_router_topk = try MoeRouterTopKPipeline.init(&ctx);
+        errdefer pl_moe_router_topk.deinit();
         var pl_gelu_mul = try GeluMulPipeline.init(&ctx);
         errdefer pl_gelu_mul.deinit();
         var pl_rope_table = try RopeNeoxTablePipeline.init(&ctx);
@@ -494,6 +510,9 @@ pub const GpuWeights = struct {
             .post_ffw_norm_1_buf = null,
             .post_ffw_norm_2_buf = null,
             .post_ffw_norm_buf = null,
+            .router_w_buf = null,
+            .router_scale_buf = null,
+            .down_exps_scale_buf = null,
         };
 
         var gw = GpuWeights{
@@ -533,6 +552,7 @@ pub const GpuWeights = struct {
             .pl_elem_add_scale = pl_elem_add_scale,
             .pl_logit_softcap = pl_logit_softcap,
             .pl_argmax = pl_argmax,
+            .pl_moe_router_topk = pl_moe_router_topk,
             .pl_gelu_mul = pl_gelu_mul,
             .pl_rope_table = pl_rope_table,
             .pl_rope_theta = pl_rope_theta,
@@ -581,6 +601,7 @@ pub const GpuWeights = struct {
             .expert_ids_slice = null,
             .moe_stage_slice = null,
             .expert_quant_input_dset = null,
+            .expert_router_dsets = null,
             .expert_quant_mid_batched_dset = null,
             .expert_accum_dset = null,
             .expert_gate_up_id_dsets = null,
@@ -599,6 +620,7 @@ pub const GpuWeights = struct {
             .expert_down_sum_id_enabled = envFlagDefaultFalse("LLMTOY_EXPERT_DOWN_SUM_ID"),
             .expert_reuse_cmd_override = envFlagOptional("LLMTOY_EXPERT_REUSE_CMD"),
             .expert_async_enabled = envFlagDefaultTrue("LLMTOY_EXPERT_ASYNC"),
+            .expert_gpu_router_enabled = envFlagDefaultFalse("LLMTOY_EXPERT_GPU_ROUTER"),
             .pending_gpu_batch = null,
             .final_out_norm_dset = null,
             .final_out_norm_x_vram_dset = null,
@@ -695,6 +717,11 @@ pub const GpuWeights = struct {
             glw.post_ffw_norm_1_buf = try uploadF32(&ctx, lwx.post_ffw_norm_1);
             glw.post_ffw_norm_2_buf = try uploadF32(&ctx, lwx.post_ffw_norm_2);
             glw.post_ffw_norm_buf = try uploadF32(&ctx, lwx.post_ffw_norm);
+            if (gw.expert_gpu_router_enabled) {
+                glw.router_w_buf = try uploadBytes(&ctx, lwx.router_w.data);
+                glw.router_scale_buf = try uploadF32(&ctx, lwx.router_scale);
+                glw.down_exps_scale_buf = try uploadF32(&ctx, lwx.down_exps_scale);
+            }
             const vram_used = vramUsedMB();
             const gtt_used = gttUsedMB();
             const mem_avail = availableMemoryMB();
@@ -833,6 +860,8 @@ pub const GpuWeights = struct {
         @memset(gw.expert_down_id_dset_type.?, .f32);
         gw.expert_down_sum_id_dsets = try allocator.alloc(?vk.VkDescriptorSet, g4cfg.n_layers);
         @memset(gw.expert_down_sum_id_dsets.?, null);
+        gw.expert_router_dsets = try allocator.alloc(?vk.VkDescriptorSet, g4cfg.n_layers);
+        @memset(gw.expert_router_dsets.?, null);
         if (gw.expert_reuse_cmd_override orelse true) {
             gw.expert_reuse_cmds = try allocator.alloc(?vk.VkCommandBuffer, g4cfg.n_layers);
             @memset(gw.expert_reuse_cmds.?, null);
@@ -1292,6 +1321,13 @@ pub const GpuWeights = struct {
             };
             self.allocator.free(sets);
         }
+        if (self.expert_router_dsets) |sets| {
+            for (sets) |*ds| if (ds.*) |set| {
+                var tmp = set;
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_moe_router_topk.desc_pool, 1, &tmp);
+            };
+            self.allocator.free(sets);
+        }
         if (self.expert_accum_dset) |set| {
             var tmp = set;
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_accum.desc_pool, 1, &tmp);
@@ -1398,6 +1434,7 @@ pub const GpuWeights = struct {
         self.pl_gelu_mul.deinit();
         self.pl_logit_softcap.deinit();
         self.pl_argmax.deinit();
+        self.pl_moe_router_topk.deinit();
         self.pl_elem_add_scale.deinit();
         self.pl_elem_scale.deinit();
         self.pl_elem_add.deinit();
@@ -2405,6 +2442,7 @@ pub const GpuWeights = struct {
         ffn_out: ?[]f32, // post_ffw_norm_1 result (d_model)
         x_vram_current: bool, // previous MoE tail left x_vram equal to x
         skip_attn_upload: bool, // 7l.2/3: GPU attention already wrote attn_in_buf
+        download_x: bool, // CPU router/debug fallback still needs the residual
     ) !void {
         const lw = &self.layers[layer];
         const wo = lw.wo orelse return error.NotOnGpu;
@@ -2537,8 +2575,10 @@ pub const GpuWeights = struct {
         const post_ffw_dset = try self.denseFullRmsnormSet(&self.dense_full_post_ffw_dsets, layer, ffn_buf, post_ffw_norm_1_buf, out_buf);
         self.recordLayerRmsnormWithSet(cmd, layer, post_ffw_dset, @intCast(w_down.rows), eps, false);
         self.ctx.profileEnd(cmd, p_post_ffw);
-        GpuCtx.recordShaderToTransferBarrier(cmd);
-        GpuCtx.recordCopy(cmd, x_buf.handle, stage_buf.handle, x.len * @sizeOf(f32));
+        if (download_x) {
+            GpuCtx.recordShaderToTransferBarrier(cmd);
+            GpuCtx.recordCopy(cmd, x_buf.handle, stage_buf.handle, x.len * @sizeOf(f32));
+        }
 
         _ = down_dset;
         try self.ctx.submitReusableBatch(cmd);
@@ -2546,7 +2586,7 @@ pub const GpuWeights = struct {
         if (ffn_out) |out| {
             try self.downloadSmallDeviceBuffer(out_buf, std.mem.sliceAsBytes(out));
         }
-        try stage_buf.download(std.mem.sliceAsBytes(x));
+        if (download_x) try stage_buf.download(std.mem.sliceAsBytes(x));
     }
 
     pub fn downloadDenseFfnOut(self: *GpuWeights, out: []f32) !void {
@@ -2662,9 +2702,21 @@ pub const GpuWeights = struct {
     //   Phase 1: n fused gate-gelu-up dispatches, write device-local mid_bufs
     //   Phase 2: n down dispatches, write sub-ranges of device-local expert_all_out_buf
     //   Phase 3: 1 accum dispatch, reads all_out + scales, writes device-local moe_gpu_buf
-    // CPU writes moe_in and scales. Legacy/debug callers can request a staging
-    // readback; the opt-in VRAM-tail forward path consumes moe_gpu_buf directly.
+    // CPU writes moe_in and scales on the production path. The opt-in VRAM
+    // router probe records a fused router first and feeds its output directly
+    // into the expert-ID dispatches.
     // Returns error.ExpertNotOnGpu if any session is missing; caller falls back to CPU.
+    pub fn canRunExpertGpuRouter(self: *const GpuWeights, layer: usize, gate_up_type: GgmlType, down_type: GgmlType) bool {
+        const gate_up_flat = if (self.expert_gate_up_flat) |gufs| gufs[layer] else null;
+        const down_flat = if (self.expert_down_flat) |dfs| dfs[layer] else null;
+        return self.expert_gpu_router_enabled and
+            gate_up_type == .q3_k and
+            self.q8_1PipelineFor(down_type) != null and
+            self.expertDownIdPipelineFor(down_type) != null and
+            gate_up_flat != null and
+            down_flat != null;
+    }
+
     pub fn runExpertBatch(
         self: *GpuWeights,
         layer: usize,
@@ -2677,10 +2729,11 @@ pub const GpuWeights = struct {
         moe_buf: []f32,
         skip_readback: bool,
         tail: ?MoeTailParams,
+        gpu_router: ?GpuRouterParams,
     ) !void {
         try self.finishPendingGpuBatch();
 
-        const n = top_idx.len;
+        const n = if (gpu_router != null) self.n_experts_used else top_idx.len;
         const eg_sessions = self.expert_gate orelse return error.ExpertNotOnGpu;
         const eu_sessions = self.expert_up orelse return error.ExpertNotOnGpu;
         const ed_sessions = self.expert_down orelse return error.ExpertNotOnGpu;
@@ -2708,6 +2761,8 @@ pub const GpuWeights = struct {
         const use_down_sum_id = self.expert_down_sum_id_enabled and use_id_dn and down_type == .iq4_nl;
         const gate_up_flat = if (self.expert_gate_up_flat) |gufs| gufs[layer] else null;
         const use_id_gu = gate_up_type == .q3_k and use_q8_1_dn and gate_up_flat != null;
+        if (gpu_router != null and (!use_id_gu or !use_id_dn))
+            return error.ExpertNotOnGpu;
         const reuse_id_dsets = self.expert_reuse_dsets_enabled;
         const reuse_quant_input_dset = reuse_id_dsets and use_id_gu;
         const reuse_gate_up_id_dset = reuse_id_dsets and use_id_gu;
@@ -2752,8 +2807,9 @@ pub const GpuWeights = struct {
         // `in_buf`. moe_in.len gives us the column count for the quantize call.
         const gu_in_buf = if (use_q8_1_gu) acts_q8_1 else in_buf;
 
-        // Write inputs and per-expert scales to HOST_COHERENT buffers.
-        @memcpy(in_slice, moe_in);
+        // Write inputs and per-expert scales to HOST_COHERENT buffers on the
+        // CPU fallback route. The fused GPU router writes the same buffers.
+        if (gpu_router == null) @memcpy(in_slice, moe_in);
         if (tail) |tp| {
             if (!tp.x_buf_current and !tp.x_vram_current) {
                 try self.shared_vec.?.upload(std.mem.sliceAsBytes(tp.x));
@@ -2762,11 +2818,13 @@ pub const GpuWeights = struct {
                 try self.uploadSmallDeviceBuffer(&(self.dense_ffn_out_buf orelse return error.ExpertNotOnGpu), std.mem.sliceAsBytes(tp.dense_ffn));
             }
         }
-        for (0..n) |k| {
-            const eidx = top_idx[k];
-            scales_slice[k] = down_exps_scale[eidx] * router_out[eidx];
-            accum_scales_slice[k] = if (use_id_dn) 1.0 else scales_slice[k];
-            ids_slice[k] = @intCast(eidx);
+        if (gpu_router == null) {
+            for (0..n) |k| {
+                const eidx = top_idx[k];
+                scales_slice[k] = down_exps_scale[eidx] * router_out[eidx];
+                accum_scales_slice[k] = if (use_id_dn) 1.0 else scales_slice[k];
+                ids_slice[k] = @intCast(eidx);
+            }
         }
         var reused_cmd = false;
         const cmd = blk: {
@@ -2785,6 +2843,29 @@ pub const GpuWeights = struct {
         var quant_dset: ?vk.VkDescriptorSet = null;
         var gate_up_id_dset: ?vk.VkDescriptorSet = null;
         var quant_mid_id_dset: ?vk.VkDescriptorSet = null;
+
+        if (gpu_router) |rp| {
+            const lw = &self.layers[layer];
+            const x_buf = &(self.x_vram orelse return error.ExpertNotOnGpu);
+            const router_sets = self.expert_router_dsets orelse return error.ExpertNotOnGpu;
+            if (router_sets[layer] == null) {
+                router_sets[layer] = try self.pl_moe_router_topk.allocSet(
+                    x_buf,
+                    &(lw.pre_ffw_norm_2_buf orelse return error.ExpertNotOnGpu),
+                    &(lw.router_scale_buf orelse return error.ExpertNotOnGpu),
+                    &(lw.router_w_buf orelse return error.ExpertNotOnGpu),
+                    &(lw.down_exps_scale_buf orelse return error.ExpertNotOnGpu),
+                    in_buf,
+                    ids_buf,
+                    scales_buf,
+                    accum_scales_buf,
+                );
+            }
+            const p_router = self.ctx.profileBegin(cmd, "moe.router_topk");
+            self.pl_moe_router_topk.recordWithSet(cmd, router_sets[layer].?, @intCast(moe_in.len), @intCast(self.n_experts), @intCast(n), rp.eps);
+            self.ctx.profileEnd(cmd, p_router);
+            GpuCtx.recordShaderBarrier(cmd);
+        }
 
         // Optional Phase 0: f32 moe_in → Q8_1 in shared_acts_q8_1 once.
         if (use_q8_1_gu) {
@@ -3625,10 +3706,14 @@ fn schedUpload(
 // Upload an f32 slice to a fresh device-local buffer. One submit per call —
 // only used at init time for the small (≤ 12 KiB) norm weights.
 fn uploadF32(ctx: *const GpuCtx, src: []const f32) !GpuBuffer {
-    const size = src.len * @sizeOf(f32);
+    return uploadBytes(ctx, std.mem.sliceAsBytes(src));
+}
+
+fn uploadBytes(ctx: *const GpuCtx, src: []const u8) !GpuBuffer {
+    const size = src.len;
     var staging = try GpuBuffer.initStaging(ctx, size);
     defer staging.deinit();
-    try staging.upload(std.mem.sliceAsBytes(src));
+    try staging.upload(src);
 
     var dst = try GpuBuffer.initDeviceLocal(ctx, size, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     errdefer dst.deinit();
