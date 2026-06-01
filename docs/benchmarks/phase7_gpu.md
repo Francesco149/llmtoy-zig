@@ -1814,6 +1814,14 @@ MoE dispatch follow-up:
   average, total dispatch from `208.451 ms` to `207.119 ms`, and batch span
   from `233.576 ms` to `230.218 ms`. This is a narrow buffer-placement
   cleanup, not a throughput milestone.
+- Deterministic Gemma4 GPU generation now appends a device-side argmax to the
+  final LM-head batch and reads back one token ID instead of the full 262144-row
+  logits vector. The greedy LM-head output stays device-local, and the monotonic
+  Gemma logit softcap is skipped because it cannot change argmax. Full-logit
+  readback remains available for stochastic sampling and compare mode.
+  Correctness: `nix develop --command zig build test` passes, including a
+  lowest-index tie-break argmax test. A two-token chat smoke test produced
+  `The capital` at `41.93 tok/s`.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

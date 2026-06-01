@@ -1910,10 +1910,15 @@ fn cmdGenerate(
         printSetupTiming(t_load_start, t_prefill_start);
         std.debug.print("prefilling {} tokens (threads={})...\n", .{ prompt_ids.len, n_threads });
         var last_logits: []f32 = &.{};
+        var last_greedy_token: u32 = 0;
+        var has_last_greedy_token = false;
+        const use_gpu_greedy = opts.temperature == 0.0 and gpu_ptr != null;
         for (prompt_ids, 0..) |tok, pos| {
             if (last_logits.len > 0) gpa.free(last_logits);
             const need_logits = pos + 1 == prompt_ids.len;
-            last_logits = try g4_fwd.forwardOne(tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr, null, opts.gpu_layer_range, need_logits);
+            const greedy_out: ?*u32 = if (need_logits and use_gpu_greedy) &last_greedy_token else null;
+            last_logits = try g4_fwd.forwardOne(tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr, null, opts.gpu_layer_range, need_logits, greedy_out);
+            has_last_greedy_token = greedy_out != null and last_logits.len == 0;
         }
         const t_prefill = clk.now(io);
         printTokenTiming("prefill", prompt_ids.len, t_prefill_start, t_prefill);
@@ -1921,8 +1926,12 @@ fn cmdGenerate(
         var pos: usize = prompt_ids.len;
         const t_gen_start = clk.now(io);
         while (n_gen < opts.max_tokens) : (n_gen += 1) {
-            const next_tok = try sample_mod.sample(last_logits, params, rng, gpa);
-            gpa.free(last_logits);
+            const next_tok = if (has_last_greedy_token)
+                last_greedy_token
+            else
+                try sample_mod.sample(last_logits, params, rng, gpa);
+            if (last_logits.len > 0) gpa.free(last_logits);
+            has_last_greedy_token = false;
             if (next_tok == vocab.eos_token_id) {
                 last_logits = &.{};
                 break;
@@ -1935,7 +1944,9 @@ fn cmdGenerate(
             const tok_len = bpe.decodeOne(next_tok, &vocab, &tok_buf);
             try out.writeAll(tok_buf[0..tok_len]);
             try out.flush();
-            last_logits = try g4_fwd.forwardOne(next_tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr, null, opts.gpu_layer_range, true);
+            const greedy_out: ?*u32 = if (use_gpu_greedy) &last_greedy_token else null;
+            last_logits = try g4_fwd.forwardOne(next_tok, pos, &kv, &weights, g4cfg, pool, gpa, gpu_ptr, null, opts.gpu_layer_range, true, greedy_out);
+            has_last_greedy_token = greedy_out != null and last_logits.len == 0;
             pos += 1;
         }
         if (last_logits.len > 0) gpa.free(last_logits);
@@ -2125,13 +2136,13 @@ fn cmdCompare(
     std.debug.print("running CPU forward pass (token={})...\n", .{cmp_token});
     var kv_cpu = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
     defer kv_cpu.deinit();
-    const cpu_logits = try g4_fwd.forwardOne(cmp_token, 0, &kv_cpu, &weights, g4cfg, pool, gpa, null, cpu_taps, null, true);
+    const cpu_logits = try g4_fwd.forwardOne(cmp_token, 0, &kv_cpu, &weights, g4cfg, pool, gpa, null, cpu_taps, null, true, null);
     defer gpa.free(cpu_logits);
 
     std.debug.print("running GPU forward pass...\n", .{});
     var kv_gpu = try g4_kv.Gemma4KvCache.init(g4cfg, max_seq, gpa);
     defer kv_gpu.deinit();
-    const gpu_logits = try g4_fwd.forwardOne(cmp_token, 0, &kv_gpu, &weights, g4cfg, pool, gpa, gpu_ptr, gpu_taps, opts.gpu_layer_range, true);
+    const gpu_logits = try g4_fwd.forwardOne(cmp_token, 0, &kv_gpu, &weights, g4cfg, pool, gpa, gpu_ptr, gpu_taps, opts.gpu_layer_range, true, null);
     defer gpa.free(gpu_logits);
 
     // ── per-layer residual comparison ─────────────────────────────────────────

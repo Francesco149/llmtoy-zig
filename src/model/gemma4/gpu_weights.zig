@@ -33,6 +33,7 @@ const ElemAddPipeline = mv_mod.ElemAddPipeline;
 const ElemScalePipeline = mv_mod.ElemScalePipeline;
 const ElemAddScalePipeline = mv_mod.ElemAddScalePipeline;
 const LogitSoftcapPipeline = mv_mod.LogitSoftcapPipeline;
+const ArgmaxPipeline = mv_mod.ArgmaxPipeline;
 const GeluMulPipeline = mv_mod.GeluMulPipeline;
 const RopeNeoxTablePipeline = mv_mod.RopeNeoxTablePipeline;
 const RopeNeoxThetaPipeline = mv_mod.RopeNeoxThetaPipeline;
@@ -150,6 +151,7 @@ pub const GpuWeights = struct {
     pl_elem_scale: ElemScalePipeline,
     pl_elem_add_scale: ElemAddScalePipeline,
     pl_logit_softcap: LogitSoftcapPipeline,
+    pl_argmax: ArgmaxPipeline,
     pl_gelu_mul: GeluMulPipeline,
     pl_rope_table: RopeNeoxTablePipeline,
     pl_rope_theta: RopeNeoxThetaPipeline,
@@ -162,6 +164,10 @@ pub const GpuWeights = struct {
     // sessions. Eliminates 420+ individual per-session HOST_COHERENT allocations.
     shared_vec: ?GpuBuffer,
     shared_out: ?GpuBuffer,
+    // Device-local LM-head output plus a four-byte host result for greedy
+    // decode. Stochastic sampling still uses shared_out for full logits.
+    greedy_logits_vram: ?GpuBuffer,
+    greedy_token_buf: ?GpuBuffer,
     // Device-local Q8_1-quantized activation, sized to q8_1OutBytes(max_cols).
     // Quantize-shader writes; mul_mat_vec_q*_q8_1 shaders read.  Lives in VRAM
     // so neither path crosses PCIe per token.
@@ -262,6 +268,8 @@ pub const GpuWeights = struct {
     final_quant_dset: ?vk.VkDescriptorSet,
     final_lm_head_dset: ?vk.VkDescriptorSet,
     final_lm_head_dset_type: GgmlType,
+    final_greedy_lm_head_dset: ?vk.VkDescriptorSet,
+    final_argmax_dset: ?vk.VkDescriptorSet,
     final_softcap_dset: ?vk.VkDescriptorSet,
     attn_front_norm_dsets: ?[]?vk.VkDescriptorSet,
     attn_front_norm_x_vram_dsets: ?[]?vk.VkDescriptorSet,
@@ -438,6 +446,8 @@ pub const GpuWeights = struct {
         errdefer pl_elem_add_scale.deinit();
         var pl_logit_softcap = try LogitSoftcapPipeline.init(&ctx);
         errdefer pl_logit_softcap.deinit();
+        var pl_argmax = try ArgmaxPipeline.init(&ctx);
+        errdefer pl_argmax.deinit();
         var pl_gelu_mul = try GeluMulPipeline.init(&ctx);
         errdefer pl_gelu_mul.deinit();
         var pl_rope_table = try RopeNeoxTablePipeline.init(&ctx);
@@ -507,6 +517,7 @@ pub const GpuWeights = struct {
             .pl_elem_scale = pl_elem_scale,
             .pl_elem_add_scale = pl_elem_add_scale,
             .pl_logit_softcap = pl_logit_softcap,
+            .pl_argmax = pl_argmax,
             .pl_gelu_mul = pl_gelu_mul,
             .pl_rope_table = pl_rope_table,
             .pl_rope_theta = pl_rope_theta,
@@ -517,6 +528,8 @@ pub const GpuWeights = struct {
             .lm_head = null,
             .shared_vec = null,
             .shared_out = null,
+            .greedy_logits_vram = null,
+            .greedy_token_buf = null,
             .shared_acts_q8_1 = null,
             .x_vram = null,
             .xb_vram = null,
@@ -576,6 +589,8 @@ pub const GpuWeights = struct {
             .final_quant_dset = null,
             .final_lm_head_dset = null,
             .final_lm_head_dset_type = .f32,
+            .final_greedy_lm_head_dset = null,
+            .final_argmax_dset = null,
             .final_softcap_dset = null,
             .attn_front_norm_dsets = null,
             .attn_front_norm_x_vram_dsets = null,
@@ -694,6 +709,8 @@ pub const GpuWeights = struct {
         }
         gw.shared_vec = try GpuBuffer.initHostCoherent(&gw.ctx, max_cols * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         gw.shared_out = try GpuBuffer.initHostCoherent(&gw.ctx, max_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.greedy_logits_vram = try GpuBuffer.initDeviceLocal(&gw.ctx, max_rows * @sizeOf(f32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        gw.greedy_token_buf = try GpuBuffer.initHostCoherent(&gw.ctx, @sizeOf(u32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         // Q8_1 activation buffer lives in VRAM; quantize-shader writes, matvec reads.
         const q8_1_bytes = mv_mod.q8_1OutBytes(max_cols);
         gw.shared_acts_q8_1 = try GpuBuffer.initDeviceLocal(&gw.ctx, q8_1_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -1023,6 +1040,15 @@ pub const GpuWeights = struct {
             var tmp = set;
             _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_logit_softcap.desc_pool, 1, &tmp);
         }
+        if (self.final_argmax_dset) |set| {
+            var tmp = set;
+            _ = vk.vkFreeDescriptorSets(self.ctx.device, self.pl_argmax.desc_pool, 1, &tmp);
+        }
+        if (self.final_greedy_lm_head_dset) |set| {
+            var tmp = set;
+            if (self.q8_1PipelineFor(self.final_lm_head_dset_type)) |pl|
+                _ = vk.vkFreeDescriptorSets(self.ctx.device, pl.desc_pool, 1, &tmp);
+        }
         if (self.final_lm_head_dset) |set| {
             var tmp = set;
             if (self.q8_1PipelineFor(self.final_lm_head_dset_type)) |pl|
@@ -1317,6 +1343,8 @@ pub const GpuWeights = struct {
         if (self.xb_vram) |*b| b.deinit();
         if (self.x_vram) |*b| b.deinit();
         if (self.shared_acts_q8_1) |*b| b.deinit();
+        if (self.greedy_token_buf) |*b| b.deinit();
+        if (self.greedy_logits_vram) |*b| b.deinit();
         if (self.shared_out) |*b| b.deinit();
         if (self.shared_vec) |*b| b.deinit();
         if (self.lm_head) |*s| s.deinit();
@@ -1339,6 +1367,7 @@ pub const GpuWeights = struct {
         self.pl_rope_table.deinit();
         self.pl_gelu_mul.deinit();
         self.pl_logit_softcap.deinit();
+        self.pl_argmax.deinit();
         self.pl_elem_add_scale.deinit();
         self.pl_elem_scale.deinit();
         self.pl_elem_add.deinit();
@@ -1508,13 +1537,15 @@ pub const GpuWeights = struct {
         head_type: GgmlType,
         x: []const f32,
         input: FinalLogitsInput,
-        logits: []f32,
+        logits: ?[]f32,
+        greedy_token: ?*u32,
     ) !void {
         const sess = &(self.lm_head orelse return error.NotOnGpu);
         const norm_buf = &(self.out_norm_buf orelse return error.NotOnGpu);
         const pl = self.q8_1PipelineFor(head_type) orelse return error.NotOnGpu;
         std.debug.assert(sess.cols == x.len);
-        std.debug.assert(sess.rows == logits.len);
+        std.debug.assert((logits == null) != (greedy_token == null));
+        if (logits) |values| std.debug.assert(sess.rows == values.len);
         std.debug.assert(sess.cols % 256 == 0);
 
         const vec_buf = switch (input) {
@@ -1523,7 +1554,10 @@ pub const GpuWeights = struct {
         };
         const xb_buf = &(self.xb_vram orelse return error.NotOnGpu);
         const acts_buf = &self.shared_acts_q8_1.?;
-        const out_buf = &self.shared_out.?;
+        const out_buf = if (greedy_token != null)
+            &(self.greedy_logits_vram orelse return error.NotOnGpu)
+        else
+            &self.shared_out.?;
 
         if (input == .cpu) {
             try vec_buf.upload(std.mem.sliceAsBytes(x));
@@ -1557,16 +1591,34 @@ pub const GpuWeights = struct {
         var mv_label_buf: [72]u8 = undefined;
         const mv_label = std.fmt.bufPrint(&mv_label_buf, "matvec_q8_1.single.{}x{}", .{ sess.rows, sess.cols }) catch "matvec_q8_1.single";
         const p_mv = self.ctx.profileBegin(cmd, mv_label);
-        if (self.final_lm_head_dset == null) {
-            self.final_lm_head_dset = try pl.allocDescriptorSet();
-            pl.updateDescriptorSet(self.final_lm_head_dset.?, &sess.mat_buf, acts_buf, out_buf);
+        const lm_head_dset = if (greedy_token != null) blk: {
+            if (self.final_greedy_lm_head_dset == null) {
+                self.final_greedy_lm_head_dset = try pl.allocDescriptorSet();
+                pl.updateDescriptorSet(self.final_greedy_lm_head_dset.?, &sess.mat_buf, acts_buf, out_buf);
+            }
+            break :blk self.final_greedy_lm_head_dset.?;
+        } else blk: {
+            if (self.final_lm_head_dset == null) {
+                self.final_lm_head_dset = try pl.allocDescriptorSet();
+                pl.updateDescriptorSet(self.final_lm_head_dset.?, &sess.mat_buf, acts_buf, out_buf);
+            }
+            break :blk self.final_lm_head_dset.?;
+        };
+        if (self.final_lm_head_dset_type == .f32) {
             self.final_lm_head_dset_type = head_type;
         } else {
             std.debug.assert(self.final_lm_head_dset_type == head_type);
         }
-        pl.recordDescriptor(cmd, self.final_lm_head_dset.?, sess.rows, sess.cols);
+        pl.recordDescriptor(cmd, lm_head_dset, sess.rows, sess.cols);
         self.ctx.profileEnd(cmd, p_mv);
-        if (logit_softcap != 0.0) {
+        if (greedy_token != null) {
+            GpuCtx.recordShaderBarrier(cmd);
+            const p_argmax = self.ctx.profileBegin(cmd, "final.argmax");
+            if (self.final_argmax_dset == null)
+                self.final_argmax_dset = try self.pl_argmax.allocSet(out_buf, &self.greedy_token_buf.?);
+            self.pl_argmax.recordWithSet(cmd, self.final_argmax_dset.?, sess.rows);
+            self.ctx.profileEnd(cmd, p_argmax);
+        } else if (logit_softcap != 0.0) {
             GpuCtx.recordShaderBarrier(cmd);
             const p_softcap = self.ctx.profileBegin(cmd, "final.logit_softcap");
             if (self.final_softcap_dset == null)
@@ -1577,7 +1629,11 @@ pub const GpuWeights = struct {
 
         try self.ctx.submitReusableBatch(cmd);
 
-        try out_buf.download(std.mem.sliceAsBytes(logits));
+        if (logits) |values| {
+            try out_buf.download(std.mem.sliceAsBytes(values));
+        } else if (greedy_token) |token| {
+            try self.greedy_token_buf.?.download(std.mem.asBytes(token));
+        }
     }
 
     // QKV variant of runQ8_1Mv: one upload, one quantize, then 2–3 matvecs all

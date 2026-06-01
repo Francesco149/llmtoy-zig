@@ -46,6 +46,7 @@ pub fn forwardOne(
     layer_taps: ?[][]f32,
     gpu_layer_range: ?[2]usize,
     compute_logits: bool,
+    greedy_token: ?*u32,
 ) ![]f32 {
     const d = cfg.d_model;
     const n_threads = pool.threads.len;
@@ -491,9 +492,18 @@ pub fn forwardOne(
     // ── Final logits ─────────────────────────────────────────────────────────
     if (!compute_logits) return &.{};
 
+    if (greedy_token) |out_token| {
+        if (gpu) |g| {
+            if (g.canRunFinalLogitsQ8_1(w.lm_head.type_)) {
+                try g.runFinalLogitsQ8_1(cfg.eps, cfg.logit_softcap, w.lm_head.type_, x, final_logits_input, null, out_token);
+                return &.{};
+            }
+        }
+    }
+
     const logits = try allocator.alloc(f32, cfg.vocab_size);
     const final_logits_on_gpu = if (gpu) |g| blk: {
-        g.runFinalLogitsQ8_1(cfg.eps, cfg.logit_softcap, w.lm_head.type_, x, final_logits_input, logits) catch |err| switch (err) {
+        g.runFinalLogitsQ8_1(cfg.eps, cfg.logit_softcap, w.lm_head.type_, x, final_logits_input, logits, null) catch |err| switch (err) {
             error.NotOnGpu => if (final_logits_input == .cpu) break :blk false else return err,
             else => return err,
         };

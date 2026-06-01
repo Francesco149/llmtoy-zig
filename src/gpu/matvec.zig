@@ -2511,6 +2511,69 @@ pub const LogitSoftcapPipeline = struct {
     }
 };
 
+const ArgmaxPushConst = extern struct {
+    n: u32,
+};
+
+pub const ArgmaxPipeline = struct {
+    pipeline: vk.VkPipeline,
+    layout: vk.VkPipelineLayout,
+    dset_layout: vk.VkDescriptorSetLayout,
+    desc_pool: vk.VkDescriptorPool,
+    device: vk.VkDevice,
+
+    pub fn init(ctx: *const GpuContext) !ArgmaxPipeline {
+        comptime std.debug.assert(shaders.argmax.len % 4 == 0);
+        const built = try buildSimplePipeline(ctx, &shaders.argmax, 2, @sizeOf(ArgmaxPushConst), 8);
+        return .{
+            .pipeline = built.pipeline,
+            .layout = built.layout,
+            .dset_layout = built.dset_layout,
+            .desc_pool = built.desc_pool,
+            .device = ctx.device,
+        };
+    }
+
+    pub fn allocSet(self: *const ArgmaxPipeline, x_buf: *const GpuBuffer, out_buf: *const GpuBuffer) !vk.VkDescriptorSet {
+        const alloc_ci = vk.VkDescriptorSetAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = null,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.dset_layout,
+        };
+        var dset: vk.VkDescriptorSet = null;
+        if (vk.vkAllocateDescriptorSets(self.device, &alloc_ci, &dset) != vk.VK_SUCCESS)
+            return error.VkDescriptorSetAllocFailed;
+
+        const buf_infos = [2]vk.VkDescriptorBufferInfo{
+            .{ .buffer = x_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = out_buf.handle, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const writes = [2]vk.VkWriteDescriptorSet{
+            mkWrite(dset, 0, &buf_infos[0]),
+            mkWrite(dset, 1, &buf_infos[1]),
+        };
+        vk.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+        return dset;
+    }
+
+    pub fn recordWithSet(self: *const ArgmaxPipeline, cmd: vk.VkCommandBuffer, dset: vk.VkDescriptorSet, n: u32) void {
+        vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline);
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.layout, 0, 1, &dset, 0, null);
+        const pc = ArgmaxPushConst{ .n = n };
+        vk.vkCmdPushConstants(cmd, self.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(ArgmaxPushConst), &pc);
+        vk.vkCmdDispatch(cmd, 1, 1, 1);
+    }
+
+    pub fn deinit(self: *ArgmaxPipeline) void {
+        vk.vkDestroyDescriptorPool(self.device, self.desc_pool, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.layout, null);
+        vk.vkDestroyDescriptorSetLayout(self.device, self.dset_layout, null);
+    }
+};
+
 pub const ElemAddScalePipeline = struct {
     pipeline: vk.VkPipeline,
     layout: vk.VkPipelineLayout,
@@ -3289,6 +3352,38 @@ test "gpu matvec f32 correctness" {
     try std.testing.expectApproxEqAbs(out[1], 2.0, 1e-5);
     try std.testing.expectApproxEqAbs(out[2], 3.0, 1e-5);
     try std.testing.expectApproxEqAbs(out[3], 4.0, 1e-5);
+}
+
+test "gpu argmax returns lowest maximum index" {
+    const ctx = GpuContext.init() catch |e| {
+        std.debug.print("gpu init failed: {}\n", .{e});
+        return;
+    };
+    var gpu = ctx;
+    defer gpu.deinit();
+
+    var pipeline = try ArgmaxPipeline.init(&gpu);
+    defer pipeline.deinit();
+
+    var values = [_]f32{ -4.0, 3.0, 9.0, 2.0, 9.0, 1.0 };
+    var in_buf = try GpuBuffer.initHostCoherent(&gpu, @sizeOf(@TypeOf(values)), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer in_buf.deinit();
+    try in_buf.upload(std.mem.sliceAsBytes(&values));
+    var out_buf = try GpuBuffer.initHostCoherent(&gpu, @sizeOf(u32), vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    defer out_buf.deinit();
+
+    const cmd = try gpu.beginBatch();
+    const dset = try pipeline.allocSet(&in_buf, &out_buf);
+    defer {
+        var tmp = dset;
+        _ = vk.vkFreeDescriptorSets(gpu.device, pipeline.desc_pool, 1, &tmp);
+    }
+    pipeline.recordWithSet(cmd, dset, values.len);
+    try gpu.submitBatch(cmd);
+
+    var idx: u32 = undefined;
+    try out_buf.download(std.mem.asBytes(&idx));
+    try std.testing.expectEqual(@as(u32, 2), idx);
 }
 
 test "gpu matvec Q8_0 correctness" {
