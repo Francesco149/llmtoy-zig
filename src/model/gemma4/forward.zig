@@ -420,8 +420,8 @@ pub fn forwardOne(
         // Run each selected expert. The default path keeps the accumulated MoE
         // vector device-resident and finishes the FFN/MoE residual tail on GPU
         // for all non-skipped layers.
-        @memset(moe_buf, 0.0);
         var moe_residual_done_on_gpu = false;
+        if (!use_moe_vram_tail) @memset(moe_buf, 0.0);
         const leave_final_x_on_gpu = (final_logits_gpu_possible or !compute_logits) and
             layer_taps == null and
             l + 1 == cfg.n_layers and
@@ -456,6 +456,7 @@ pub fn forwardOne(
         } else |_| {
             if (use_gpu_router) return error.ExpertNotOnGpu;
             residual_current_in_gpu_vram = false;
+            if (use_moe_vram_tail) @memset(moe_buf, 0.0);
             if (dense_current_in_gpu_out_buf) {
                 try gpu.?.downloadDenseFfnOut(ffn_buf);
             }
