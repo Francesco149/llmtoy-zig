@@ -2319,7 +2319,7 @@ pub const GpuWeights = struct {
     //   - d_ffn (gate/up output) need not be 256-aligned; dense down uses a
     //     Q8_1 re-quantized mid buffer when its weight format supports it.
     pub fn runLayerDenseFfnQ8_1(
-        self: *const GpuWeights,
+        self: *GpuWeights,
         layer: usize,
         eps: f32,
         gate_pl: *const MatvecPipeline, // Q8_1 pipeline for w_gate
@@ -2353,7 +2353,7 @@ pub const GpuWeights = struct {
 
         try vec_buf.upload(std.mem.sliceAsBytes(x));
 
-        const cmd = try self.ctx.beginBatch();
+        const cmd = try self.beginLayerReusableBatch(&self.dense_full_reuse_cmds, layer);
         const norm_dset = try self.recordLayerRmsnorm(cmd, layer, vec_buf, ffn_norm_buf, xb_buf, @intCast(x.len), eps, false);
         GpuCtx.recordShaderBarrier(cmd);
 
@@ -2399,7 +2399,7 @@ pub const GpuWeights = struct {
             norm2_dset,
         );
 
-        try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
+        try self.ctx.submitReusableBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
 
         try self.downloadSmallDeviceBuffer(out_buf, std.mem.sliceAsBytes(ffn_out));
     }
