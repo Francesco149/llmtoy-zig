@@ -41,6 +41,15 @@ Important llama.cpp areas:
 - MMVQ/MMQ matmul shaders under `ggml-vulkan/vulkan-shaders/`
 - Vulkan perf logger and timestamp query handling
 
+Recent cross-check: llama.cpp keeps a reusable command-buffer pool and grows a
+per-context descriptor-set arena, then rewinds descriptor indices between graph
+runs instead of allocating/freeing sets around every dispatch. llmtoy now has
+persistent descriptor sets for the normal decode chains, but older fallback
+helpers still allocate transient descriptor sets and some still use one-shot
+command buffers. Prefer moving those fallbacks onto reusable command buffers
+first; only add persistent descriptor storage where a profile shows the fallback
+is still active in the production route.
+
 ## Vulkan Model
 
 The backend uses a single compute queue. Weights and long-lived scratch buffers
