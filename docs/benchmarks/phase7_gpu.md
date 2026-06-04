@@ -1913,6 +1913,16 @@ MoE dispatch follow-up:
   default r2 measured `moe.fused_gate_up=51.29 us` and `206.398 ms`
   timestamped dispatch; opt-in r4 measured `51.90 us` and `207.165 ms`.
   Keep production default on r2.
+- MoE microbench checkpoint after the reusable descriptor-free submit cleanup:
+  `LLMTOY_GPU_PROFILE=1 bench-moe ... --iters 32 --layer 10 --skip-readback`
+  measured `198.06 us/iter` wall, `94.02 us/iter` GPU phases, and
+  `104.04 us/iter` host/submit overhead. Phase averages were
+  `moe.quantize_input=2.14 us`, `moe.fused_gate_up=47.96 us`,
+  `moe.quantize_mid=1.12 us`, `moe.down=38.76 us`, and `moe.accum=4.05 us`.
+  Standalone shape probes measured r2 gate/up at `47.28 us` GPU and r4 at
+  `47.99 us`, so the production default stays on r2. This lines up with
+  llama.cpp's advantage coming from the broader graph/command shape rather than
+  the local r4 selected-expert variant.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

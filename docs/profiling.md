@@ -122,10 +122,11 @@ nix develop --command env LLMTOY_GPU_PROFILE=1 ./zig-out/bin/llmtoy \
   --iters 64 --layer 0
 ```
 
-Current baseline on the RX 7800 XT:
+Current focused baseline on the RX 7800 XT:
 
-- layer 0 Q3_K/Q5_1 top-8 MoE: 614.08 us wall, 84.97 us GPU phases
-- layer 10 Q3_K/IQ4_NL top-8 MoE: 629.70 us wall, 96.81 us GPU phases
+- layer 10 Q3_K/IQ4_NL top-8 MoE, `--iters 32 --skip-readback` with
+  `LLMTOY_GPU_PROFILE=1`: 198.06 us wall, 94.02 us GPU phases, 104.04 us
+  host/submit overhead
 
 The GPU phase timing is useful for shader comparisons; the wall timing exposes
 the current descriptor/command-recording overhead that llama.cpp avoids with its
@@ -135,11 +136,10 @@ Flat expert gate/up ID is enabled by default for supported layers. Set
 `LLMTOY_EXPERT_GU_ID=0` to force the older per-expert gate/up route. Persistent
 descriptor sets are also enabled by default on the expert-ID path; set
 `LLMTOY_EXPERT_REUSE_DSETS=0` to force transient descriptor allocation/free
-when isolating descriptor churn. Add `LLMTOY_EXPERT_REUSE_CMD=1` to reuse one
-command buffer per fully persistent ID-GU + ID-down layer while still
-re-recording commands each iteration. Command-buffer reuse remains an experiment
-for separating command-buffer allocation from queue submission, wait-idle, and
-readback overhead.
+when isolating descriptor churn. MoE-tail submits reuse one command buffer per
+fully persistent ID-GU + ID-down layer by default; set
+`LLMTOY_EXPERT_REUSE_CMD=0` to force fresh command buffers when isolating
+command-buffer allocation overhead.
 
 Use `--skip-readback` only as a `bench-moe` diagnostic. It skips the final CPU
 read of the GPU-accumulated MoE output and therefore does not produce a valid
