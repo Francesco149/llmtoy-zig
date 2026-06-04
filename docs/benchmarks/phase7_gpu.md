@@ -1907,6 +1907,12 @@ MoE dispatch follow-up:
   versus the prior documented `612.03 us` average. The shader was reverted.
   A useful router follow-up likely needs a multi-dispatch or multi-workgroup
   matvec/reduction design, not subgrouping inside the current single workgroup.
+- Added `LLMTOY_EXPERT_GU_R4=1` to route production expert gate/up through the
+  existing r4 shader for direct generation A/B tests. Same-build two-token
+  profiles on `what is 1+1?` showed r2 still slightly ahead:
+  default r2 measured `moe.fused_gate_up=51.29 us` and `206.398 ms`
+  timestamped dispatch; opt-in r4 measured `51.90 us` and `207.165 ms`.
+  Keep production default on r2.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
