@@ -1885,6 +1885,17 @@ MoE dispatch follow-up:
   deterministic generated text diverged from the default route. Keep the
   bridge opt-in. A useful follow-up needs a parallel router matvec and explicit
   parity checks before production promotion.
+- Endgame checkpoint on 2026-06-04 after cross-referencing llama.cpp's Gemma
+  graph tail (`result_norm -> result_output`): a four-token greedy GPU chat run
+  on APEX I Mini measured `42.07 tok/s` decode and `228.234 ms` timestamped GPU
+  dispatch. The final path is no longer the main bottleneck: final LM-head
+  matvec averaged `1237.04 us`, while `final.out_norm` averaged `9.73 us`,
+  `final.quantize_q8_1` averaged `1.03 us`, and `final.argmax` averaged
+  `7.90 us`. The focused `bench-matvec --target lm_head --reuse-descriptor`
+  run measured the default production Q6_K route at `986.16 us` GPU time,
+  faster than `lm_head.fast` (`1085.16 us`) and all current MMVQ probes on that
+  run. Next decode wins should target the per-layer MoE path (`moe.fused_gate_up`
+  and `moe.down`) or a parallel GPU router, not final norm/head/argmax.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 

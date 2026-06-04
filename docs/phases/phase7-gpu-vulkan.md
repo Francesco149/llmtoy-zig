@@ -270,6 +270,10 @@ Do not repeat these without new evidence:
 - Q6_K packed-decode cleanup without the broader llama.cpp shape was not a win
 - Q6_K MMVQ b64 variants were at best a narrow isolated lm_head win, not enough
   to route production
+- the final Gemma graph tail is not currently the decode bottleneck after
+  device-side greedy argmax: on 2026-06-04, final norm + quantize + argmax were
+  under 20 us/token combined, while the final Q6_K LM head was about 1.24 ms in
+  full decode and under 1.0 ms in the focused reusable-descriptor microbench
 - Q4_K, Q5_0/Q5_1, and Q5_K MMVQ ports were correct but slower on measured
   target decode shapes
 - IQ4_NL expert-down b16 and integer-accumulation variants were slower than the
