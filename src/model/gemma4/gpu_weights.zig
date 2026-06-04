@@ -2785,12 +2785,13 @@ pub const GpuWeights = struct {
         const reuse_cmd = reuse_cmd_requested and self.expert_reuse_cmds != null and use_id_gu and use_id_dn;
         // Async MoE is safe for transient descriptor sets now that the sets are
         // attached to the generic pending fence and freed in
-        // finishPendingGpuBatch().
+        // finishPendingGpuBatch(). If the command-reuse probe is enabled, keep
+        // the same overlap path and let PendingBatch retain ownership of the
+        // reusable command buffer until its fence signals.
         const async_moe = self.expert_async_enabled and
             tail == null and
             skip_readback and
             self.ctx.profiler == null and
-            !reuse_cmd and
             use_id_gu and
             use_id_dn;
 
@@ -3069,7 +3070,10 @@ pub const GpuWeights = struct {
             var async_submit_succeeded = false;
             errdefer if (!async_submit_succeeded)
                 self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
-            self.pending_gpu_batch = try self.ctx.submitBatchAsyncWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
+            self.pending_gpu_batch = if (reused_cmd)
+                try self.ctx.submitReusableBatchAsyncWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count])
+            else
+                try self.ctx.submitBatchAsyncWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
             async_submit_succeeded = true;
         } else {
             try self.collectRunExpertBatchDescriptorFrees(
