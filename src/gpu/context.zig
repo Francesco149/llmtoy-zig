@@ -728,6 +728,15 @@ pub const GpuContext = struct {
         if (self.profiler) |p| p.collectBatch(self.device);
     }
 
+    pub fn submitReusableBatchWithDescriptorFrees(
+        self: *const GpuContext,
+        cmd: vk.VkCommandBuffer,
+        descriptor_frees: []const DeferredDescriptorFree,
+    ) !void {
+        try self.submitReusableBatch(cmd);
+        self.freeDeferredDescriptorSets(descriptor_frees);
+    }
+
     // Open a command buffer for recording multiple buffer copies.
     // Call recordCopy() for each pair, then submitBatchCopy() once.
     // One submission = one GPU power-state wakeup; much faster than copyBuffer per matrix.

@@ -3100,8 +3100,7 @@ pub const GpuWeights = struct {
                 accum_dset,
             );
             if (reused_cmd) {
-                try self.ctx.submitReusableBatch(cmd);
-                self.ctx.freeDeferredDescriptorSets(descriptor_frees[0..descriptor_free_count]);
+                try self.ctx.submitReusableBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
             } else {
                 try self.ctx.submitBatchWithDescriptorFrees(cmd, descriptor_frees[0..descriptor_free_count]);
             }
