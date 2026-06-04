@@ -2024,10 +2024,15 @@ fn envFlagEnabled(name: [:0]const u8, default: bool) bool {
 }
 
 fn printGemma4GpuRuntimeOptions() void {
-    std.debug.print("  Gemma4 GPU options: attn_cpu_kv_shadow={} attention_async={} expert_reuse_cmd={} expert_gpu_router={} expert_gu_r4={}\n", .{
+    std.debug.print("  Gemma4 GPU options: attn_cpu_kv_shadow={} attention_async={} attention_fused_small={} dense_down_q8_1={} expert_async={} expert_reuse_dsets={} expert_reuse_cmd={} expert_down_sum_id={} expert_gpu_router={} expert_gu_r4={}\n", .{
         envFlagEnabled("LLMTOY_ATTN_CPU_KV_SHADOW", false),
         envFlagEnabled("LLMTOY_ATTENTION_ASYNC", true),
+        envFlagEnabled("LLMTOY_ATTENTION_FUSED_SMALL", true),
+        envFlagEnabled("LLMTOY_DENSE_DOWN_Q8_1", true),
+        envFlagEnabled("LLMTOY_EXPERT_ASYNC", true),
+        envFlagEnabled("LLMTOY_EXPERT_REUSE_DSETS", true),
         envFlagEnabled("LLMTOY_EXPERT_REUSE_CMD", true),
+        envFlagEnabled("LLMTOY_EXPERT_DOWN_SUM_ID", false),
         envFlagEnabled("LLMTOY_EXPERT_GPU_ROUTER", false),
         envFlagEnabled("LLMTOY_EXPERT_GU_R4", false),
     });
