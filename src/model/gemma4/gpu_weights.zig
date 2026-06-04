@@ -286,8 +286,9 @@ pub const GpuWeights = struct {
     final_out_norm_x_vram_dset: ?vk.VkDescriptorSet,
     final_quant_dset: ?vk.VkDescriptorSet,
     final_lm_head_dset: ?vk.VkDescriptorSet,
-    final_lm_head_dset_type: GgmlType,
+    final_lm_head_dset_type: ?GgmlType,
     final_greedy_lm_head_dset: ?vk.VkDescriptorSet,
+    final_greedy_lm_head_dset_type: ?GgmlType,
     final_argmax_dset: ?vk.VkDescriptorSet,
     final_softcap_dset: ?vk.VkDescriptorSet,
     attn_front_norm_dsets: ?[]?vk.VkDescriptorSet,
@@ -626,8 +627,9 @@ pub const GpuWeights = struct {
             .final_out_norm_x_vram_dset = null,
             .final_quant_dset = null,
             .final_lm_head_dset = null,
-            .final_lm_head_dset_type = .f32,
+            .final_lm_head_dset_type = null,
             .final_greedy_lm_head_dset = null,
+            .final_greedy_lm_head_dset_type = null,
             .final_argmax_dset = null,
             .final_softcap_dset = null,
             .attn_front_norm_dsets = null,
@@ -1096,13 +1098,17 @@ pub const GpuWeights = struct {
         }
         if (self.final_greedy_lm_head_dset) |set| {
             var tmp = set;
-            if (self.q8_1PipelineFor(self.final_lm_head_dset_type)) |pl|
-                _ = vk.vkFreeDescriptorSets(self.ctx.device, pl.desc_pool, 1, &tmp);
+            if (self.final_greedy_lm_head_dset_type) |t| {
+                if (self.q8_1PipelineFor(t)) |pl|
+                    _ = vk.vkFreeDescriptorSets(self.ctx.device, pl.desc_pool, 1, &tmp);
+            }
         }
         if (self.final_lm_head_dset) |set| {
             var tmp = set;
-            if (self.q8_1PipelineFor(self.final_lm_head_dset_type)) |pl|
-                _ = vk.vkFreeDescriptorSets(self.ctx.device, pl.desc_pool, 1, &tmp);
+            if (self.final_lm_head_dset_type) |t| {
+                if (self.q8_1PipelineFor(t)) |pl|
+                    _ = vk.vkFreeDescriptorSets(self.ctx.device, pl.desc_pool, 1, &tmp);
+            }
         }
         if (self.final_quant_dset) |set| {
             var tmp = set;
@@ -1663,21 +1669,22 @@ pub const GpuWeights = struct {
         const lm_head_dset = if (greedy_token != null) blk: {
             if (self.final_greedy_lm_head_dset == null) {
                 self.final_greedy_lm_head_dset = try pl.allocDescriptorSet();
+                self.final_greedy_lm_head_dset_type = head_type;
                 pl.updateDescriptorSet(self.final_greedy_lm_head_dset.?, &sess.mat_buf, acts_buf, out_buf);
+            } else {
+                std.debug.assert(self.final_greedy_lm_head_dset_type.? == head_type);
             }
             break :blk self.final_greedy_lm_head_dset.?;
         } else blk: {
             if (self.final_lm_head_dset == null) {
                 self.final_lm_head_dset = try pl.allocDescriptorSet();
+                self.final_lm_head_dset_type = head_type;
                 pl.updateDescriptorSet(self.final_lm_head_dset.?, &sess.mat_buf, acts_buf, out_buf);
+            } else {
+                std.debug.assert(self.final_lm_head_dset_type.? == head_type);
             }
             break :blk self.final_lm_head_dset.?;
         };
-        if (self.final_lm_head_dset_type == .f32) {
-            self.final_lm_head_dset_type = head_type;
-        } else {
-            std.debug.assert(self.final_lm_head_dset_type == head_type);
-        }
         pl.recordDescriptor(cmd, lm_head_dset, sess.rows, sess.cols);
         self.ctx.profileEnd(cmd, p_mv);
         if (greedy_token != null) {
