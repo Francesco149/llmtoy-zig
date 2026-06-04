@@ -2790,14 +2790,16 @@ pub const GpuWeights = struct {
             use_id_gu and
             use_id_dn;
 
-        for (top_idx) |eidx| {
-            if (!use_id_gu) {
-                if (eg_sessions[layer * self.n_experts + eidx] == null or
-                    eu_sessions[layer * self.n_experts + eidx] == null)
+        if (gpu_router == null) {
+            for (top_idx) |eidx| {
+                if (!use_id_gu) {
+                    if (eg_sessions[layer * self.n_experts + eidx] == null or
+                        eu_sessions[layer * self.n_experts + eidx] == null)
+                        return error.ExpertNotOnGpu;
+                }
+                if (!use_id_dn and ed_sessions[layer * self.n_experts + eidx] == null)
                     return error.ExpertNotOnGpu;
             }
-            if (!use_id_dn and ed_sessions[layer * self.n_experts + eidx] == null)
-                return error.ExpertNotOnGpu;
         }
 
         // Optional Q8_1-acts pipeline for down. When non-null, each expert's
