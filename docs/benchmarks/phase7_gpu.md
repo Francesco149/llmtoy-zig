@@ -1896,6 +1896,17 @@ MoE dispatch follow-up:
   faster than `lm_head.fast` (`1085.16 us`) and all current MMVQ probes on that
   run. Next decode wins should target the per-layer MoE path (`moe.fused_gate_up`
   and `moe.down`) or a parallel GPU router, not final norm/head/argmax.
+- Router experiment on 2026-06-04: tried a one-dispatch subgroup-dot variant of
+  `moe_router_topk` after cross-referencing llama.cpp's subgroup top-k MoE
+  shader. The variant changed router logits from one serial thread per expert
+  to one subgroup per expert, with lanes split across `d_model`. It was
+  correct under `nix develop --command zig build test`, but a two-token
+  `LLMTOY_EXPERT_GPU_ROUTER=1 LLMTOY_GPU_PROFILE=1 generate "what is 1+1?"
+  --chat --temperature 0 --max-tokens 2 --gpu` run regressed
+  `moe.router_topk` to `801.87 us` average (`529.231 ms` over 660 dispatches)
+  versus the prior documented `612.03 us` average. The shader was reverted.
+  A useful router follow-up likely needs a multi-dispatch or multi-workgroup
+  matvec/reduction design, not subgrouping inside the current single workgroup.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
