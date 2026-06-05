@@ -500,7 +500,10 @@ pub fn forwardOne(
     }
 
     // ── Final logits ─────────────────────────────────────────────────────────
-    if (!compute_logits) return &.{};
+    if (!compute_logits) {
+        if (gpu) |g| try g.finishPendingWork();
+        return &.{};
+    }
 
     if (greedy_token) |out_token| {
         if (gpu) |g| {

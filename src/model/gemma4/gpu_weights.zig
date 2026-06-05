@@ -1477,6 +1477,10 @@ pub const GpuWeights = struct {
         }
     }
 
+    pub fn finishPendingWork(self: *GpuWeights) !void {
+        try self.finishPendingGpuBatch();
+    }
+
     fn beginLayerReusableBatch(
         self: *GpuWeights,
         cmds_opt: *?[]?vk.VkCommandBuffer,
