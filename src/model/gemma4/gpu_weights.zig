@@ -1931,6 +1931,14 @@ pub const GpuWeights = struct {
         if (!x_vram_current) {
             try vec_buf.upload(std.mem.sliceAsBytes(x));
         }
+        const async_attention_front = attention != null and
+            attention.?.attn_out == null and
+            q_out == null and
+            k_out == null and
+            v_out == null and
+            self.attention_async_enabled and
+            self.ctx.profiler == null and
+            self.pending_gpu_batch == null;
 
         const cmd = try self.beginLayerReusableBatch(&self.attn_front_reuse_cmds, layer);
 
@@ -2024,7 +2032,11 @@ pub const GpuWeights = struct {
             try self.recordLayerAttention(cmd, layer, ap);
         }
 
-        try self.ctx.submitReusableBatch(cmd);
+        if (async_attention_front) {
+            self.pending_gpu_batch = try self.ctx.submitReusableBatchAsync(cmd);
+        } else {
+            try self.ctx.submitReusableBatch(cmd);
+        }
 
         if (q_out) |q| try self.downloadSmallDeviceBuffer(q_buf, std.mem.sliceAsBytes(q));
         if (k_out) |k| try self.downloadSmallDeviceBuffer(k_buf, std.mem.sliceAsBytes(k));
