@@ -1933,6 +1933,17 @@ MoE dispatch follow-up:
   `47.99 us`, so the production default stays on r2. This lines up with
   llama.cpp's advantage coming from the broader graph/command shape rather than
   the local r4 selected-expert variant.
+- Async fused attention-front checkpoint on 2026-06-05: cross-referenced
+  llama.cpp Vulkan's reusable command-buffer and descriptor preallocation
+  shape, then let `runLayerAttnQ8_1KvVram` submit asynchronously when it also
+  records attention, has no CPU Q/K/V/attention readbacks, profiling is off,
+  and no other pending GPU batch exists. The following dense submit consumes
+  `attn_in_buf` on the same queue and already records the visibility barrier,
+  while CPU command recording overlaps the attention-front work. Verification:
+  `nix develop --command zig build test` passed, and deterministic GPU generate
+  on `gemma-4-26B-A4B-APEX-I-Mini.gguf` with `what is 1+1?`, `--temperature 0`,
+  `--max-tokens 8`, `--gpu` produced `Got it so far!` at `43.76 tok/s`
+  generation after a quiet-host check.
 
 ## Phase 7g — Fused dense FFN (experiment, reverted)
 
