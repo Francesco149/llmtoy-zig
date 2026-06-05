@@ -1907,6 +1907,16 @@ MoE dispatch follow-up:
   versus the prior documented `612.03 us` average. The shader was reverted.
   A useful router follow-up likely needs a multi-dispatch or multi-workgroup
   matvec/reduction design, not subgrouping inside the current single workgroup.
+- Router experiment on 2026-06-05: widened the opt-in `moe_router_topk`
+  workgroup from 128 to 256 lanes and split each expert dot product across two
+  adjacent lanes with `subgroupClusteredAdd`. This keeps the same one-dispatch
+  buffer contract as the existing `LLMTOY_EXPERT_GPU_ROUTER=1` bridge, but
+  halves each lane's per-expert dot loop. Correctness:
+  `zig build test --summary all` reports `149/149` tests passed. The same
+  two-token profiled chat run measured `moe.router_topk` at `523.43 us`
+  average over 660 dispatches, down from the previous documented `612.03 us`
+  average. The opt-in GPU router still trails CPU routing, so keep
+  `LLMTOY_EXPERT_GPU_ROUTER=1` probe-only.
 - Added `LLMTOY_EXPERT_GU_R4=1` to route production expert gate/up through the
   existing r4 shader for direct generation A/B tests. Same-build two-token
   profiles on `what is 1+1?` showed r2 still slightly ahead:

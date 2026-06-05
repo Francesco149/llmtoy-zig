@@ -1,4 +1,5 @@
 #version 450
+#extension GL_KHR_shader_subgroup_clustered : require
 // Gemma4 decode router:
 //   moe_in    = rmsnorm(x, norm_w)
 //   router_in = x * rms_inv * router_scale / sqrt(d_model)
@@ -7,8 +8,10 @@
 //   scales    = softmax(logits)[ids] * down_scale[ids]
 //
 // One workgroup handles one token. Gemma4 has 128 experts and selects 8.
+// Each router expert dot product is split across two adjacent lanes; lane 0
+// writes the clustered sum for its expert.
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, set = 0, binding = 0) readonly  buffer X          { float x[]; };
 layout(std430, set = 0, binding = 1) readonly  buffer NormW      { float norm_w[]; };
@@ -27,7 +30,7 @@ layout(push_constant) uniform PC {
     float eps;
 } pc;
 
-shared float partials[128];
+shared float partials[256];
 shared float router_in[4096];
 shared float logits[128];
 
@@ -53,13 +56,16 @@ void main() {
     }
     barrier();
 
-    if (tid < pc.n_experts) {
+    const uint dot_expert = tid >> 1u;
+    const uint dot_lane = tid & 1u;
+    if (dot_expert < pc.n_experts) {
         float score = 0.0;
-        const uint base = tid * pc.d_model;
-        for (uint i = 0u; i < pc.d_model; i++) {
+        const uint base = dot_expert * pc.d_model;
+        for (uint i = dot_lane; i < pc.d_model; i += 2u) {
             score += router_w[base + i] * router_in[i];
         }
-        logits[tid] = score;
+        score = subgroupClusteredAdd(score, 2);
+        if (dot_lane == 0u) logits[dot_expert] = score;
     }
     barrier();
 
