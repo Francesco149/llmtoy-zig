@@ -1708,6 +1708,7 @@ pub const GpuWeights = struct {
         }
 
         try self.ctx.submitReusableBatch(cmd);
+        try self.finishPendingGpuBatch();
 
         if (logits) |values| {
             try out_buf.download(std.mem.sliceAsBytes(values));
@@ -2800,8 +2801,9 @@ pub const GpuWeights = struct {
         // finishPendingGpuBatch(). If the command-reuse probe is enabled, keep
         // the same overlap path and let PendingBatch retain ownership of the
         // reusable command buffer until its fence signals.
+        const async_tail_no_download = if (tail) |tp| !tp.download_x else false;
         const async_moe = self.expert_async_enabled and
-            tail == null and
+            (tail == null or async_tail_no_download) and
             skip_readback and
             self.ctx.profiler == null and
             use_id_gu and

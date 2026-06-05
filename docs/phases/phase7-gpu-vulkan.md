@@ -160,6 +160,9 @@ The intended final decode pipeline:
 - prefill uses a separate batched MMQ-style path rather than repeated decode
 - descriptor sets and command buffers are persistent or deferred by submit
   lifetime; no GPU-visible resource is freed before its fence signals
+- final-layer MoE tails that keep `x` GPU-resident may be submitted ahead of
+  the final-logits command; the final-logits queue wait then retires the older
+  fence and deferred descriptor frees
 - benchmarking always includes a local llama.cpp Vulkan reference run for
   parity checks
 
